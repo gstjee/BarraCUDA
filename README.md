@@ -224,9 +224,9 @@ All 1,735 lines of `amdgpu_emit.c` are a testament to reading those pages so you
 
 Found a bug? Want to discuss the finer points of AMDGPU instruction encoding? Need someone to commiserate with about the state of GPU computing?
 
-Open an issue. Or don't. I'm not your mum.
-
 **zanehambly@gmail.com**
+
+Open an issue if theres anything you want to discuss. Or don't. I'm not your mum.
 
 Based in New Zealand, where it's already tomorrow and the GPUs are just as confused as everywhere else.
 
@@ -236,4 +236,3 @@ Apache 2.0. Do whatever you want. If this compiler somehow ends up in production
 
 ---
 
-*Built with C99, stubbornness, and an unreasonable belief that compilers shouldn't need a million lines of infrastructure code.*
