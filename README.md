@@ -74,7 +74,7 @@ make
 
 ## What Works
 
-This isn't a toy. The following CUDA features compile to working GFX11 machine code:
+ The following CUDA features compile to working GFX11 machine code:
 
 ### Core Language
 - `__global__`, `__device__`, `__host__` function qualifiers
@@ -121,7 +121,7 @@ $ ./barracuda --amdgpu-bin vector_add.cu -o vector_add.hsaco
 wrote vector_add.hsaco (528 bytes code, 1 kernels)
 ```
 
-528 bytes. One kernel. Zero LLVM.
+No LLVM required :-) 
 
 ## Architecture
 
