@@ -1,0 +1,106 @@
+BarraCUDA Roadmap — Tiers 1-3
+==============================
+
+Status: Backend COMPLETE (lexer → parser → BIR → mem2reg → AMDGPU isel → regalloc → binary encoding → ELF .hsaco)
+        All instructions validated via llvm-objdump roundtrip. Zero LLVM dependency.
+        1a PREPROCESSOR COMPLETE (1,470 lines). #include, #define, #ifdef, #if, macro expansion, -I, -D.
+
+
+TIER 1 — Can't compile real CUDA without these
+-----------------------------------------------
+
+1a. PREPROCESSOR (new file: src/preproc.c)
+    Need #include, #define/#undef, #ifdef/#ifndef/#if/#elif/#else/#endif, #pragma, macro expansion.
+    Runs BEFORE the lexer on raw text. Output is a single expanded source buffer.
+    Not a full C preprocessor — just enough for CUDA headers and user macros.
+    ~1500-2000 lines estimated. Include path search, macro table, conditional stack.
+
+1b. SEMANTIC ANALYSIS (new file: src/sema.c)
+    Type checking, scope resolution, implicit conversions, overload resolution.
+    Runs AFTER parsing, BEFORE BIR lowering. Walks the AST and annotates types.
+    Currently the compiler trusts the source blindly — wrong types = wrong codegen, no error.
+    This is the hardest piece. Real compilers spend most of their complexity here.
+    ~2000-3000 lines estimated. Symbol table with scopes, type compatibility rules.
+
+1c. VECTOR TYPES (parser + sema + bir_lower + isel)
+    float2/3/4, int2/3/4, make_float4(), .x/.y/.z/.w member access.
+    Parser needs to recognize these as builtin types. Sema needs to type-check them.
+    BIR already has BIR_TYPE_VECTOR. Lowering needs to generate extract/insert element ops.
+    Isel needs to map to VGPR pairs/quads or scalar sequences.
+    ~500 lines across 4 files.
+
+1d. HALF PRECISION (parser + sema + isel)
+    __half type, __float2half(), __half2float(). BIR already supports f16.
+    Parser needs __half keyword. Isel needs v_cvt_f16_f32 / v_cvt_f32_f16 (already in opcode table).
+    ~200 lines. Small but important for ML kernels.
+
+
+TIER 2 — Significant missing features
+--------------------------------------
+
+2a. SHARED MEMORY (bir_lower + isel)
+    __shared__ declarations need to allocate from LDS, not regular globals.
+    bir_lower should emit BIR_SHARED_ALLOC with size. Isel needs to track cumulative LDS offset
+    per kernel and set mfunc.lds_bytes. ds_read/ds_write already work.
+    ~300 lines. Mostly lowering + offset tracking.
+
+2b. OPERATOR OVERLOADING (parser + sema)
+    Parse "operator+" / "operator[]" / "operator()" etc as function declarations.
+    Sema resolves operator calls to the matching overload.
+    ~400 lines in parser, ~300 in sema.
+
+2c. VECTOR MEMBER ACCESS (parser + sema + bir_lower)
+    .x/.y/.z/.w on vector types, plus .xy/.xyz swizzles.
+    Parser already handles member access — sema needs to recognize vector builtins.
+    Lowering emits extract_element / insert_element.
+    ~300 lines.
+
+2d. GOTO FORWARD REFERENCE FIXUP (bir_lower)
+    Current goto lowering can create dangling block references for forward labels.
+    Need a fixup pass after function lowering to patch forward gotos.
+    ~50-100 lines. Small but prevents potential crashes.
+
+
+TIER 3 — Polish / Completeness
+-------------------------------
+
+3a. TEXTURE/SURFACE OPS (parser + bir + isel)
+    texture<T> declarations, tex1Dfetch(), surf2Dread/write.
+    BIR has reserved opcode range. Isel needs image_load/store instructions.
+    ~500 lines. Less common in modern CUDA but still used.
+
+3b. COOPERATIVE GROUPS (parser + bir_lower)
+    cooperative_groups:: namespace, grid_group, thread_block types.
+    Mostly syntactic sugar over existing barrier/sync primitives.
+    ~300 lines.
+
+3c. DYNAMIC PARALLELISM (parser + bir_lower)
+    Device-side kernel<<<>>> launch. Requires runtime support (amdgpu dispatch packet creation).
+    Complex — needs device-side memory allocation and queue manipulation.
+    ~800 lines. Low priority.
+
+3d. SOURCE LOCATION TRACKING (bir.h + bir_lower)
+    Attach source line/col to BIR instructions for error messages.
+    Add a loc field to bir_inst_t, propagate through lowering.
+    ~200 lines. Quality of life.
+
+3e. ERROR RECOVERY (parser)
+    Currently stops on first error. Should skip to next statement/declaration and continue.
+    Sync tokens: semicolons, closing braces, keywords.
+    ~300 lines. Makes the compiler usable for iterative development.
+
+3f. __launch_bounds__ ENFORCEMENT (sema + isel)
+    Parse already works. Sema should validate values. Isel should cap register allocation
+    and set kernel descriptor fields accordingly.
+    ~100 lines.
+
+
+SUGGESTED ORDER
+---------------
+Each of these is a standalone session-sized task:
+
+  1a → 1b → 1c → 1d → 2a → 2b → 2d → 2c → 3e → 3d → 3f → 3a → 3b → 3c
+
+Preprocessor first (unblocks real .cu files), then sema (unblocks everything else),
+then vector types + half (unblocks ML kernels), then shared memory (unblocks perf),
+then operator overloading + gotos + member access, then polish.

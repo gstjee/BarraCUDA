@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+*.exe
+*.hsaco
+
+# Editor cruft
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS noise
+Thumbs.db
+.DS_Store

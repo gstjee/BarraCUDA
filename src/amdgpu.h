@@ -1,0 +1,378 @@
+#ifndef BARRACUDA_AMDGPU_H
+#define BARRACUDA_AMDGPU_H
+
+#include "bir.h"
+
+/*
+ * AMDGPU backend for BarraCUDA.
+ * Targets RDNA 3 (gfx1100), Wave32.
+ * Compiles BIR SSA to AMDGCN machine IR, then emits assembly text
+ * or binary ELF code objects (.hsaco).
+ * Built with the quiet confidence of someone who reads ISA manuals for fun.
+ */
+
+#define BC_ERR_AMDGPU   -6
+
+/* ---- RDNA 3 Target Constants ---- */
+
+#define AMD_MAX_SGPRS       102
+#define AMD_MAX_VGPRS       256
+#define AMD_WAVE_SIZE       32
+
+/* Pre-loaded SGPRs for kernels */
+#define AMD_SGPR_DISPATCH_LO  0   /* s0: dispatch packet ptr lo */
+#define AMD_SGPR_DISPATCH_HI  1   /* s1: dispatch packet ptr hi */
+#define AMD_SGPR_KERNARG_LO   2   /* s2: kernarg segment ptr lo */
+#define AMD_SGPR_KERNARG_HI   3   /* s3: kernarg segment ptr hi */
+#define AMD_SGPR_WORKGROUP_X  4   /* s4: workgroup ID X */
+#define AMD_SGPR_WORKGROUP_Y  5   /* s5: workgroup ID Y */
+#define AMD_SGPR_WORKGROUP_Z  6   /* s6: workgroup ID Z */
+#define AMD_KERN_RESERVED_SGPR 7  /* first allocatable SGPR in kernels */
+
+/* Pre-loaded VGPRs */
+#define AMD_VGPR_THREAD_X     0   /* v0: thread ID X */
+#define AMD_VGPR_THREAD_Y     1   /* v1: thread ID Y */
+#define AMD_VGPR_THREAD_Z     2   /* v2: thread ID Z */
+
+/* Special register IDs (for MOP_SPECIAL) */
+#define AMD_SPEC_VCC        0
+#define AMD_SPEC_EXEC       1
+#define AMD_SPEC_SCC        2
+#define AMD_SPEC_M0         3
+
+/* ELF constants */
+#define EM_AMDGPU                224
+#define ELFOSABI_AMDGPU_HSA      64
+#define EF_AMDGPU_MACH_AMDGCN_GFX1100  0x41
+
+/* ---- Instruction Encoding Formats ---- */
+
+typedef enum {
+    AMD_FMT_SOP1,       /* scalar one-input */
+    AMD_FMT_SOP2,       /* scalar two-input */
+    AMD_FMT_SOPC,       /* scalar compare (sets SCC) */
+    AMD_FMT_SOPK,       /* scalar with 16-bit inline constant */
+    AMD_FMT_SOPP,       /* scalar program (branches, barriers, waitcnt) */
+    AMD_FMT_SMEM,       /* scalar memory */
+    AMD_FMT_VOP1,       /* vector one-input */
+    AMD_FMT_VOP2,       /* vector two-input */
+    AMD_FMT_VOP3,       /* vector three-input (64-bit encoding) */
+    AMD_FMT_VOPC,       /* vector compare (sets VCC) */
+    AMD_FMT_DS,         /* data share (LDS) */
+    AMD_FMT_FLAT_GBL,   /* flat/global memory */
+    AMD_FMT_FLAT_SCR,   /* flat/scratch memory */
+    AMD_FMT_PSEUDO,     /* pseudo-instruction (eliminated before emit) */
+    AMD_FMT_COUNT
+} amd_fmt_t;
+
+/* ---- Machine Opcodes ---- */
+
+typedef enum {
+    /* -- SOP2: scalar two-input -- */
+    AMD_S_ADD_U32,
+    AMD_S_SUB_U32,
+    AMD_S_MUL_I32,
+    AMD_S_AND_B32,
+    AMD_S_OR_B32,
+    AMD_S_XOR_B32,
+    AMD_S_LSHL_B32,
+    AMD_S_LSHR_B32,
+    AMD_S_ASHR_I32,
+    AMD_S_ANDN2_B32,
+    AMD_S_ORN2_B32,
+    AMD_S_BFE_I32,
+    AMD_S_CSELECT_B32,
+
+    /* -- SOP1: scalar one-input -- */
+    AMD_S_MOV_B32,
+    AMD_S_NOT_B32,
+    AMD_S_AND_SAVEEXEC_B32,
+    AMD_S_SETPC_B64,
+    AMD_S_SWAPPC_B64,
+    AMD_S_GETPC_B64,
+
+    /* -- SOPC: scalar compare -- */
+    AMD_S_CMP_EQ_U32,
+    AMD_S_CMP_NE_U32,
+    AMD_S_CMP_LT_U32,
+    AMD_S_CMP_LE_U32,
+    AMD_S_CMP_GT_U32,
+    AMD_S_CMP_GE_U32,
+    AMD_S_CMP_LT_I32,
+    AMD_S_CMP_LE_I32,
+    AMD_S_CMP_GT_I32,
+    AMD_S_CMP_GE_I32,
+    AMD_S_CMP_EQ_I32,
+    AMD_S_CMP_NE_I32,
+
+    /* -- SOPP: scalar program -- */
+    AMD_S_BRANCH,
+    AMD_S_CBRANCH_SCC0,
+    AMD_S_CBRANCH_SCC1,
+    AMD_S_CBRANCH_EXECZ,
+    AMD_S_CBRANCH_EXECNZ,
+    AMD_S_ENDPGM,
+    AMD_S_BARRIER,
+    AMD_S_WAITCNT,
+    AMD_S_NOP,
+
+    /* -- SMEM: scalar memory -- */
+    AMD_S_LOAD_DWORD,
+    AMD_S_LOAD_DWORDX2,
+    AMD_S_LOAD_DWORDX4,
+
+    /* -- VOP2: vector two-input -- */
+    AMD_V_ADD_U32,
+    AMD_V_SUB_U32,
+    AMD_V_MUL_LO_U32,
+    AMD_V_AND_B32,
+    AMD_V_OR_B32,
+    AMD_V_XOR_B32,
+    AMD_V_LSHLREV_B32,
+    AMD_V_LSHRREV_B32,
+    AMD_V_ASHRREV_I32,
+    AMD_V_ADD_F32,
+    AMD_V_SUB_F32,
+    AMD_V_MUL_F32,
+    AMD_V_CNDMASK_B32,
+
+    /* -- VOP1: vector one-input -- */
+    AMD_V_MOV_B32,
+    AMD_V_CVT_F32_I32,
+    AMD_V_CVT_F32_U32,
+    AMD_V_CVT_I32_F32,
+    AMD_V_CVT_U32_F32,
+    AMD_V_CVT_F32_F16,
+    AMD_V_CVT_F16_F32,
+    AMD_V_CVT_F64_F32,
+    AMD_V_CVT_F32_F64,
+    AMD_V_RCP_F32,
+    AMD_V_NOT_B32,
+    AMD_V_READFIRSTLANE_B32,
+
+    /* -- VOP3: vector three-input -- */
+    AMD_V_MAD_U32_U24,
+    AMD_V_BFE_I32,
+    AMD_V_BFE_U32,
+    AMD_V_LSHL_ADD_U32,
+    AMD_V_ADD3_U32,
+
+    /* -- VOPC: vector compare -- */
+    AMD_V_CMP_EQ_U32,
+    AMD_V_CMP_NE_U32,
+    AMD_V_CMP_LT_U32,
+    AMD_V_CMP_LE_U32,
+    AMD_V_CMP_GT_U32,
+    AMD_V_CMP_GE_U32,
+    AMD_V_CMP_LT_I32,
+    AMD_V_CMP_LE_I32,
+    AMD_V_CMP_GT_I32,
+    AMD_V_CMP_GE_I32,
+    AMD_V_CMP_EQ_I32,
+    AMD_V_CMP_NE_I32,
+    AMD_V_CMP_EQ_F32,
+    AMD_V_CMP_NE_F32,
+    AMD_V_CMP_LT_F32,
+    AMD_V_CMP_LE_F32,
+    AMD_V_CMP_GT_F32,
+    AMD_V_CMP_GE_F32,
+    AMD_V_CMP_O_F32,
+    AMD_V_CMP_U_F32,
+    AMD_V_CMP_NLT_F32,
+    AMD_V_CMP_NLE_F32,
+    AMD_V_CMP_NGT_F32,
+    AMD_V_CMP_NGE_F32,
+    AMD_V_CMP_NEQ_F32,
+
+    /* -- DS: data share (LDS) -- */
+    AMD_DS_READ_B32,
+    AMD_DS_WRITE_B32,
+    AMD_DS_ADD_RTN_U32,
+    AMD_DS_SUB_RTN_U32,
+    AMD_DS_AND_RTN_B32,
+    AMD_DS_OR_RTN_B32,
+    AMD_DS_XOR_RTN_B32,
+    AMD_DS_MIN_RTN_I32,
+    AMD_DS_MAX_RTN_I32,
+    AMD_DS_SWIZZLE_B32,
+    AMD_DS_BPERMUTE_B32,
+
+    /* -- FLAT_GBL: global memory -- */
+    AMD_GLOBAL_LOAD_DWORD,
+    AMD_GLOBAL_STORE_DWORD,
+    AMD_GLOBAL_LOAD_DWORDX2,
+    AMD_GLOBAL_STORE_DWORDX2,
+    AMD_GLOBAL_ATOMIC_ADD,
+    AMD_GLOBAL_ATOMIC_SUB,
+    AMD_GLOBAL_ATOMIC_AND,
+    AMD_GLOBAL_ATOMIC_OR,
+    AMD_GLOBAL_ATOMIC_XOR,
+    AMD_GLOBAL_ATOMIC_SMIN,
+    AMD_GLOBAL_ATOMIC_SMAX,
+    AMD_GLOBAL_ATOMIC_SWAP,
+    AMD_GLOBAL_ATOMIC_CMPSWAP,
+
+    /* -- FLAT_SCR: scratch memory -- */
+    AMD_SCRATCH_LOAD_DWORD,
+    AMD_SCRATCH_STORE_DWORD,
+
+    /* -- Pseudo-instructions (eliminated before emit) -- */
+    AMD_PSEUDO_PHI,
+    AMD_PSEUDO_COPY,
+    AMD_PSEUDO_DEF,       /* defines a vreg (for phi elimination temps) */
+
+    AMD_OP_COUNT
+} amd_op_t;
+
+/* ---- Machine Operand ---- */
+
+typedef enum {
+    MOP_NONE,
+    MOP_SGPR,           /* physical SGPR */
+    MOP_VGPR,           /* physical VGPR */
+    MOP_VREG_S,         /* virtual scalar reg (maps to SGPR) */
+    MOP_VREG_V,         /* virtual vector reg (maps to VGPR) */
+    MOP_IMM,            /* 32-bit immediate */
+    MOP_LABEL,          /* machine block index */
+    MOP_SPECIAL         /* VCC, EXEC, SCC, M0 */
+} mop_kind_t;
+
+typedef struct {
+    uint8_t  kind;       /* mop_kind_t */
+    uint8_t  pad;
+    uint16_t reg_num;    /* physical or virtual reg number */
+    int32_t  imm;        /* immediate value or special reg ID */
+} moperand_t;            /* 8 bytes */
+
+/* ---- Machine Instruction ---- */
+
+#define MINST_MAX_OPS 6
+
+typedef struct {
+    uint16_t    op;                      /* amd_op_t */
+    uint8_t     num_defs;                /* outputs (0-2) */
+    uint8_t     num_uses;                /* inputs (0-4) */
+    moperand_t  operands[MINST_MAX_OPS]; /* [0..num_defs-1]=defs, rest=uses */
+    uint16_t    flags;                   /* waitcnt encoding, glc, etc. */
+} minst_t;   /* 56 bytes */
+
+/* Instruction flags */
+#define AMD_FLAG_GLC     0x0001
+#define AMD_FLAG_SLC     0x0002
+#define AMD_FLAG_DLC     0x0004
+
+/* Waitcnt flag values (stored in flags for s_waitcnt) */
+#define AMD_WAIT_VMCNT0       0x0100   /* wait for all VM ops */
+#define AMD_WAIT_LGKMCNT0     0x0200   /* wait for all LDS/GDS/SMEM ops */
+#define AMD_WAIT_ALL          0x0300   /* both */
+
+/* ---- Machine Block / Function ---- */
+
+typedef struct {
+    uint32_t first_inst;
+    uint32_t num_insts;
+    uint32_t bir_block;   /* source BIR block index */
+} mblock_t;  /* 12 bytes */
+
+typedef struct {
+    uint32_t name;             /* string table offset */
+    uint32_t first_block;
+    uint16_t num_blocks;
+    uint16_t num_sgprs;        /* after regalloc */
+    uint16_t num_vgprs;
+    uint16_t lds_bytes;
+    uint32_t scratch_bytes;
+    uint32_t kernarg_bytes;
+    uint16_t is_kernel;        /* 1 for __global__ */
+    uint16_t wavefront_size;   /* 32 */
+    uint16_t first_alloc_sgpr; /* first SGPR available to regalloc (after param pairs) */
+    uint16_t pad0;
+    uint32_t launch_bounds_max; /* 0 = unconstrained. >0 = programmer's optimistic thread count */
+    uint32_t launch_bounds_min; /* 0 = not set */
+} mfunc_t;
+
+/* ---- Kernel Descriptor (64 bytes, AMD spec) ---- */
+
+typedef struct {
+    uint32_t group_segment_fixed_size;
+    uint32_t private_segment_fixed_size;
+    uint32_t kernarg_size;
+    uint32_t reserved0;
+    int64_t  kernel_code_entry_byte_offset;
+    uint8_t  reserved1[20];
+    uint32_t compute_pgm_rsrc3;
+    uint32_t compute_pgm_rsrc1;
+    uint32_t compute_pgm_rsrc2;
+    uint16_t kernel_code_properties;
+    uint8_t  reserved2[6];
+} amd_kernel_descriptor_t;  /* 64 bytes */
+
+/* ---- Module ---- */
+
+#define AMD_MAX_MINSTS    (1 << 18)   /* 256K machine instructions */
+#define AMD_MAX_MBLOCKS   (1 << 16)
+#define AMD_MAX_MFUNCS    (1 << 12)
+#define AMD_MAX_VREGS     (1 << 16)
+#define AMD_CODE_SIZE     (4*1024*1024)
+#define AMD_ASM_SIZE      (4*1024*1024)
+
+typedef struct {
+    const bir_module_t *bir;
+
+    minst_t     minsts[AMD_MAX_MINSTS];
+    uint32_t    num_minsts;
+
+    mblock_t    mblocks[AMD_MAX_MBLOCKS];
+    uint32_t    num_mblocks;
+
+    mfunc_t     mfuncs[AMD_MAX_MFUNCS];
+    uint32_t    num_mfuncs;
+
+    /* Divergence: 1 bit per BIR instruction */
+    uint32_t    divergent[AMD_MAX_MINSTS / 32];
+
+    /* Virtual register tracking */
+    uint32_t    vreg_count;
+    uint16_t    reg_map[AMD_MAX_VREGS];    /* vreg -> phys reg */
+    uint8_t     reg_file[AMD_MAX_VREGS];   /* 0=SGPR, 1=VGPR */
+
+    /* BIR value -> machine vreg mapping */
+    uint32_t    val_vreg[BIR_MAX_INSTS];   /* BIR inst index -> vreg */
+    uint8_t     val_file[BIR_MAX_INSTS];   /* 0=scalar, 1=vector */
+    uint16_t    val_sbase[BIR_MAX_INSTS];  /* SGPR pair base for pointers, 0xFFFF=none */
+
+    /* Output buffers */
+    uint8_t     code[AMD_CODE_SIZE];
+    uint32_t    code_len;
+
+    char        asm_buf[AMD_ASM_SIZE];
+    uint32_t    asm_len;
+} amd_module_t;
+
+/* ---- Encoding Table Entry ---- */
+
+typedef struct {
+    uint8_t  fmt;          /* amd_fmt_t */
+    uint16_t hw_opcode;    /* hardware opcode field */
+    const char *mnemonic;  /* assembly text name */
+} amd_enc_entry_t;
+
+/* ---- Public API ---- */
+
+/* Compile BIR module to AMDGCN machine IR (divergence + isel) */
+int  amdgpu_compile(const bir_module_t *bir, amd_module_t *amd);
+
+/* Post-isel passes: phi elimination + register allocation */
+void amdgpu_phi_elim(amd_module_t *amd);
+void amdgpu_regalloc(amd_module_t *amd);
+
+/* Emit assembly text to stdout or file */
+void amdgpu_emit_asm(const amd_module_t *amd, FILE *out);
+
+/* Emit binary ELF code object (.hsaco) to file */
+int  amdgpu_emit_elf(amd_module_t *amd, const char *path);
+
+/* Encoding table (defined in amdgpu_emit.c) */
+extern const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT];
+
+#endif /* BARRACUDA_AMDGPU_H */

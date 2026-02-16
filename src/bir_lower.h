@@ -1,0 +1,19 @@
+#ifndef BARRACUDA_BIR_LOWER_H
+#define BARRACUDA_BIR_LOWER_H
+
+#include "bir.h"
+#include "parser.h"
+#include "sema.h"
+
+#define BC_ERR_LOWER -5
+
+/*
+ * Lower AST to BIR. Device-side functions only.
+ * Host functions are scanned for kernel launches to trigger template instantiation.
+ * Returns 0 on success, negative on error.
+ * sema may be NULL (fallback: everything treated as signed).
+ */
+int bir_lower(const parser_t *P, uint32_t ast_root, bir_module_t *M,
+              const sema_ctx_t *sema);
+
+#endif /* BARRACUDA_BIR_LOWER_H */

@@ -1,0 +1,2651 @@
+#include "bir_lower.h"
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+/*
+ * AST-to-BIR lowering.
+ *
+ * Strategy:
+ *   - Parameters: direct SSA values (BIR_PARAM)
+ *   - Local variables: alloca + store/load (mem2reg cleans up later)
+ *   - Templates: store definitions, deduce types at call sites, instantiate
+ *   - Device functions only; host scanned for launches
+ *   - CUDA builtins (threadIdx.x etc.) detected as member access patterns
+ */
+
+/* ---- Limits ---- */
+
+#define MAX_SYMS        1024
+#define MAX_STRUCTS     64
+#define MAX_ENUMS       256
+#define MAX_TYPEDEFS    64
+#define MAX_TEMPLATES   32
+#define MAX_SCOPES      64
+#define MAX_LOOPS       32
+
+/* ---- Internal Types ---- */
+
+typedef struct {
+    char        name[128];
+    uint32_t    ref;        /* param: BIR_MAKE_VAL(idx). local: alloca inst idx */
+    uint32_t    type;       /* BIR type index of the value (not pointer) */
+    int         is_alloca;
+} sym_t;
+
+typedef struct {
+    char        name[64];
+    uint32_t    field_types[16];
+    char        field_names[16][64];
+    int         num_fields;
+    uint32_t    bir_type;
+} struct_def_t;
+
+typedef struct {
+    char        name[64];
+    int64_t     value;
+} enum_val_t;
+
+typedef struct {
+    char        name[64];
+    uint32_t    bir_type;
+} typedef_def_t;
+
+typedef struct {
+    uint32_t    ast;        /* AST_TEMPLATE_DECL node index */
+    char        name[64];   /* function name inside */
+} template_def_t;
+
+typedef struct {
+    char        name[64];
+    uint32_t    type;       /* BIR type index */
+    int64_t     ival;       /* for non-type params */
+    int         is_type;    /* 1 = typename, 0 = int param */
+} binding_t;
+
+typedef struct {
+    const parser_t  *P;
+    bir_module_t    *M;
+    const char      *src;
+
+    sym_t           syms[MAX_SYMS];
+    int             nsyms;
+    int             scope_stack[MAX_SCOPES];
+    int             scope_depth;
+
+    struct_def_t    structs[MAX_STRUCTS];
+    int             nstructs;
+    enum_val_t      enums[MAX_ENUMS];
+    int             nenums;
+    typedef_def_t   typedefs[MAX_TYPEDEFS];
+    int             ntypedefs;
+
+    template_def_t  templates[MAX_TEMPLATES];
+    int             ntemplates;
+    binding_t       bindings[8];
+    int             nbindings;
+
+    /* Current function state */
+    uint32_t        cur_func;
+    uint32_t        cur_block;
+    uint32_t        base_inst;
+
+    /* Loop stack */
+    uint32_t        break_tgt[MAX_LOOPS];
+    uint32_t        cont_tgt[MAX_LOOPS];
+    int             loop_depth;
+
+    /* Switch exit block */
+    uint32_t        switch_exit;
+
+    /* Labels for goto/label */
+    struct { char name[64]; uint32_t block; } labels[256];
+    int             nlabels;
+
+    const sema_ctx_t *sema;   /* NULL if sema didn't run */
+
+    uint32_t        cur_node;   /* AST node being lowered — for source loc tracking */
+
+    bc_error_t      errors[BC_MAX_ERRORS];
+    int             nerrors;
+} lower_t;
+
+/* ---- AST Navigation ---- */
+
+static const ast_node_t *ND(const lower_t *L, uint32_t i)
+{
+    return &L->P->nodes[i];
+}
+
+static uint32_t child_at(const lower_t *L, uint32_t node, int n)
+{
+    uint32_t c = ND(L, node)->first_child;
+    for (int i = 0; i < n && c; i++)
+        c = ND(L, c)->next_sibling;
+    return c;
+}
+
+static void get_text(const lower_t *L, uint32_t node, char *buf, int sz)
+{
+    const ast_node_t *n = ND(L, node);
+    int len = (int)n->d.text.len;
+    if (len >= sz) len = sz - 1;
+    memcpy(buf, L->src + n->d.text.offset, len);
+    buf[len] = '\0';
+}
+
+static int text_eq(const lower_t *L, uint32_t node, const char *s)
+{
+    const ast_node_t *n = ND(L, node);
+    int len = (int)n->d.text.len;
+    return (int)strlen(s) == len
+        && memcmp(L->src + n->d.text.offset, s, len) == 0;
+}
+
+static void lower_error(lower_t *L, uint32_t node, const char *msg)
+{
+    if (L->nerrors < BC_MAX_ERRORS) {
+        bc_error_t *e = &L->errors[L->nerrors++];
+        if (node) {
+            const ast_node_t *n = ND(L, node);
+            e->loc.line = n->line;
+            e->loc.col  = n->col;
+        }
+        e->code = BC_ERR_LOWER;
+        snprintf(e->msg, sizeof(e->msg), "%s", msg);
+    }
+}
+
+/* ---- Scope ---- */
+
+static void push_scope(lower_t *L)
+{
+    if (L->scope_depth < MAX_SCOPES)
+        L->scope_stack[L->scope_depth++] = L->nsyms;
+}
+
+static void pop_scope(lower_t *L)
+{
+    if (L->scope_depth > 0)
+        L->nsyms = L->scope_stack[--L->scope_depth];
+}
+
+static void add_sym(lower_t *L, const char *name, uint32_t ref,
+                    uint32_t type, int is_alloca)
+{
+    if (L->nsyms >= MAX_SYMS) return;
+    sym_t *s = &L->syms[L->nsyms++];
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    s->ref = ref;
+    s->type = type;
+    s->is_alloca = is_alloca;
+}
+
+static sym_t *find_sym(lower_t *L, const char *name)
+{
+    for (int i = L->nsyms - 1; i >= 0; i--)
+        if (strcmp(L->syms[i].name, name) == 0)
+            return &L->syms[i];
+    return NULL;
+}
+
+/* ---- Lookups ---- */
+
+static int find_enum(lower_t *L, const char *name, int64_t *val)
+{
+    for (int i = 0; i < L->nenums; i++)
+        if (strcmp(L->enums[i].name, name) == 0) {
+            *val = L->enums[i].value;
+            return 1;
+        }
+    return 0;
+}
+
+static int find_typedef(lower_t *L, const char *name, uint32_t *type)
+{
+    for (int i = 0; i < L->ntypedefs; i++)
+        if (strcmp(L->typedefs[i].name, name) == 0) {
+            *type = L->typedefs[i].bir_type;
+            return 1;
+        }
+    return 0;
+}
+
+static int find_binding(lower_t *L, const char *name, uint32_t *type)
+{
+    for (int i = 0; i < L->nbindings; i++)
+        if (L->bindings[i].is_type
+            && strcmp(L->bindings[i].name, name) == 0) {
+            *type = L->bindings[i].type;
+            return 1;
+        }
+    return 0;
+}
+
+static int find_binding_int(lower_t *L, const char *name, int64_t *val)
+{
+    for (int i = 0; i < L->nbindings; i++)
+        if (!L->bindings[i].is_type
+            && strcmp(L->bindings[i].name, name) == 0) {
+            *val = L->bindings[i].ival;
+            return 1;
+        }
+    return 0;
+}
+
+static template_def_t *find_template(lower_t *L, const char *name)
+{
+    for (int i = 0; i < L->ntemplates; i++)
+        if (strcmp(L->templates[i].name, name) == 0)
+            return &L->templates[i];
+    return NULL;
+}
+
+/* ---- Operator Name Helpers ---- */
+
+static void normalize_op_name(const char *raw, char *out, int outsz)
+{
+    int ri = 0, oi = 0;
+    while (ri < 8 && raw[ri] && oi < outsz - 1)
+        out[oi++] = raw[ri++];
+    while (raw[ri] == ' ' || raw[ri] == '\t') ri++;
+    while (raw[ri] && oi < outsz - 1)
+        out[oi++] = raw[ri++];
+    out[oi] = '\0';
+}
+
+static void op_name_from_tok(int tok, char *out, int outsz)
+{
+    const char *sym;
+    switch (tok) {
+    case TOK_PLUS: sym = "+"; break;
+    case TOK_MINUS: sym = "-"; break;
+    case TOK_STAR: sym = "*"; break;
+    case TOK_SLASH: sym = "/"; break;
+    case TOK_PERCENT: sym = "%"; break;
+    case TOK_AMP: sym = "&"; break;
+    case TOK_PIPE: sym = "|"; break;
+    case TOK_CARET: sym = "^"; break;
+    case TOK_SHL: sym = "<<"; break;
+    case TOK_SHR: sym = ">>"; break;
+    case TOK_EQ: sym = "=="; break;
+    case TOK_NE: sym = "!="; break;
+    case TOK_LT: sym = "<"; break;
+    case TOK_GT: sym = ">"; break;
+    case TOK_LE: sym = "<="; break;
+    case TOK_GE: sym = ">="; break;
+    default: sym = "?"; break;
+    }
+    snprintf(out, outsz, "operator%s", sym);
+}
+
+/* ---- Instruction Emission ---- */
+
+static uint32_t emit(lower_t *L, uint16_t op, uint32_t type,
+                     uint8_t nops, uint8_t subop)
+{
+    if (L->M->num_insts >= BIR_MAX_INSTS) return 0;
+    uint32_t idx = L->M->num_insts++;
+    bir_inst_t *I = &L->M->insts[idx];
+    memset(I, 0, sizeof(*I));
+    I->op   = op;
+    I->type = type;
+    I->num_operands = nops;
+    I->subop = subop;
+    L->M->blocks[L->cur_block].num_insts++;
+    /* Leave a trail of breadcrumbs back to the source */
+    if (L->cur_node && L->cur_node < L->P->num_nodes)
+        L->M->inst_lines[idx] = ND(L, L->cur_node)->line;
+    return idx;
+}
+
+static void set_op(lower_t *L, uint32_t inst, int slot, uint32_t val)
+{
+    L->M->insts[inst].operands[slot] = val;
+}
+
+/* ---- Block Management ---- */
+
+static uint32_t new_block(lower_t *L, const char *name)
+{
+    if (L->M->num_blocks >= BIR_MAX_BLOCKS) return 0;
+    uint32_t idx = L->M->num_blocks++;
+    bir_block_t *B = &L->M->blocks[idx];
+    B->name = bir_add_string(L->M, name, (uint32_t)strlen(name));
+    B->first_inst = L->M->num_insts;
+    B->num_insts  = 0;
+    /* Count blocks in current function */
+    L->M->funcs[L->cur_func].num_blocks++;
+    return idx;
+}
+
+static void set_block(lower_t *L, uint32_t bidx)
+{
+    L->cur_block = bidx;
+    if (L->M->blocks[bidx].num_insts == 0)
+        L->M->blocks[bidx].first_inst = L->M->num_insts;
+}
+
+/* Check if current block already has a terminator */
+static int block_terminated(const lower_t *L)
+{
+    const bir_block_t *B = &L->M->blocks[L->cur_block];
+    if (B->num_insts == 0) return 0;
+    uint32_t last = B->first_inst + B->num_insts - 1;
+    uint16_t op = L->M->insts[last].op;
+    return op == BIR_BR || op == BIR_BR_COND || op == BIR_RET
+        || op == BIR_UNREACHABLE || op == BIR_SWITCH;
+}
+
+/* ---- Label Lookup (Goto/Label) ---- */
+
+static uint32_t find_or_create_label(lower_t *L, const char *name)
+{
+    for (int i = 0; i < L->nlabels; i++)
+        if (strcmp(L->labels[i].name, name) == 0)
+            return L->labels[i].block;
+    if (L->nlabels >= 256) {
+        lower_error(L, 0, "too many labels (max 256)");
+        return L->cur_block;
+    }
+    int idx = L->nlabels++;
+    snprintf(L->labels[idx].name, sizeof(L->labels[0].name), "%s", name);
+    L->labels[idx].block = new_block(L, name);
+    return L->labels[idx].block;
+}
+
+/* ---- Type Resolution ---- */
+
+static uint32_t resolve_basic(lower_t *L, int kind)
+{
+    switch (kind) {
+    case TYPE_VOID:     return bir_type_void(L->M);
+    case TYPE_BOOL:     return bir_type_int(L->M, 1);
+    case TYPE_CHAR:     return bir_type_int(L->M, 8);
+    case TYPE_SHORT:    return bir_type_int(L->M, 16);
+    case TYPE_INT:      return bir_type_int(L->M, 32);
+    case TYPE_LONG:     return bir_type_int(L->M, 64);
+    case TYPE_LLONG:    return bir_type_int(L->M, 64);
+    case TYPE_FLOAT:    return bir_type_float(L->M, 32);
+    case TYPE_DOUBLE:   return bir_type_float(L->M, 64);
+    case TYPE_LDOUBLE:  return bir_type_float(L->M, 64);
+    case TYPE_UNSIGNED: return bir_type_int(L->M, 32);
+    case TYPE_SIGNED:   return bir_type_int(L->M, 32);
+    default:            return bir_type_int(L->M, 32);
+    }
+}
+
+static uint32_t resolve_type(lower_t *L, uint32_t node, int ptr_depth,
+                             uint16_t cuda)
+{
+    uint32_t base;
+    if (!node) return bir_type_int(L->M, 32);
+    const ast_node_t *n = ND(L, node);
+
+    if (n->type != AST_TYPE_SPEC)
+        return bir_type_int(L->M, 32);
+
+    int kind = n->d.btype.kind;
+
+    if (kind == TYPE_NAME) {
+        char name[128] = {0};
+        uint32_t nc = n->first_child;
+        if (nc) get_text(L, nc, name, sizeof(name));
+
+        uint32_t bound;
+        if (find_binding(L, name, &bound))
+            base = bound;
+        else if (find_typedef(L, name, &bound))
+            base = bound;
+        else if (strcmp(name, "size_t") == 0)
+            base = bir_type_int(L->M, 64);
+        else if (strcmp(name, "__half") == 0 || strcmp(name, "half") == 0)
+            base = bir_type_float(L->M, 16);
+        else {
+            /* ---- Vector types → synthetic structs ---- */
+            static const struct { const char *name; int elem; int lanes; } vec_map[] = {
+                {"float2",TYPE_FLOAT,2},{"float3",TYPE_FLOAT,3},{"float4",TYPE_FLOAT,4},
+                {"double2",TYPE_DOUBLE,2},{"double3",TYPE_DOUBLE,3},{"double4",TYPE_DOUBLE,4},
+                {"int2",TYPE_INT,2},{"int3",TYPE_INT,3},{"int4",TYPE_INT,4},
+                {"uint2",TYPE_INT,2},{"uint3",TYPE_INT,3},{"uint4",TYPE_INT,4},
+                {"char2",TYPE_CHAR,2},{"char3",TYPE_CHAR,3},{"char4",TYPE_CHAR,4},
+                {"uchar2",TYPE_CHAR,2},{"uchar3",TYPE_CHAR,3},{"uchar4",TYPE_CHAR,4},
+                {"short2",TYPE_SHORT,2},{"short3",TYPE_SHORT,3},{"short4",TYPE_SHORT,4},
+                {"ushort2",TYPE_SHORT,2},{"ushort3",TYPE_SHORT,3},{"ushort4",TYPE_SHORT,4},
+                {"long2",TYPE_LONG,2},{"long3",TYPE_LONG,3},{"long4",TYPE_LONG,4},
+                {"ulong2",TYPE_LONG,2},{"ulong3",TYPE_LONG,3},{"ulong4",TYPE_LONG,4},
+                {"longlong2",TYPE_LLONG,2},{"ulonglong2",TYPE_LLONG,2},
+                {"dim3",TYPE_INT,3},
+                {NULL,0,0}
+            };
+            int vfound = 0;
+            for (int vi = 0; vec_map[vi].name; vi++) {
+                if (strcmp(name, vec_map[vi].name) != 0) continue;
+                uint32_t et = resolve_basic(L, vec_map[vi].elem);
+                int lanes = vec_map[vi].lanes;
+                uint32_t fields[4] = {et, et, et, et};
+                uint32_t st = bir_type_struct(L->M, fields, lanes);
+                /* Register as struct_def so member access works */
+                if (L->nstructs < MAX_STRUCTS) {
+                    static const char *xyzw[] = {"x","y","z","w"};
+                    struct_def_t *sd = &L->structs[L->nstructs];
+                    memset(sd, 0, sizeof(*sd));
+                    snprintf(sd->name, sizeof(sd->name), "%s", name);
+                    sd->num_fields = lanes;
+                    sd->bir_type = st;
+                    for (int fi = 0; fi < lanes; fi++) {
+                        sd->field_types[fi] = et;
+                        snprintf(sd->field_names[fi], sizeof(sd->field_names[0]),
+                                 "%s", xyzw[fi]);
+                    }
+                    L->nstructs++;
+                }
+                base = st;
+                vfound = 1;
+                break;
+            }
+            if (!vfound) {
+                /* Check user-defined structs (C++ style: Vec2 v; without 'struct') */
+                for (int si = 0; si < L->nstructs; si++) {
+                    if (strcmp(L->structs[si].name, name) == 0) {
+                        base = L->structs[si].bir_type;
+                        vfound = 1;
+                        break;
+                    }
+                }
+                if (!vfound)
+                    base = bir_type_int(L->M, 32);
+            }
+        }
+    } else if (kind == TYPE_STRUCT || kind == TYPE_UNION) {
+        char name[128] = {0};
+        uint32_t nc = n->first_child;
+        if (nc) get_text(L, nc, name, sizeof(name));
+        base = bir_type_int(L->M, 32); /* fallback */
+        for (int i = 0; i < L->nstructs; i++) {
+            if (strcmp(L->structs[i].name, name) == 0) {
+                base = L->structs[i].bir_type;
+                break;
+            }
+        }
+    } else if (kind == TYPE_ENUM) {
+        base = bir_type_int(L->M, 32);
+    } else {
+        base = resolve_basic(L, kind);
+    }
+
+    for (int i = 0; i < ptr_depth; i++) {
+        int as = BIR_AS_GLOBAL;
+        if (cuda & CUDA_SHARED)   as = BIR_AS_SHARED;
+        if (cuda & CUDA_CONSTANT) as = BIR_AS_CONSTANT;
+        base = bir_type_ptr(L->M, base, as);
+    }
+
+    return base;
+}
+
+/* ---- Type Queries ---- */
+
+static uint32_t ref_type(const lower_t *L, uint32_t ref)
+{
+    if (ref == BIR_VAL_NONE) return 0;
+    if (BIR_VAL_IS_CONST(ref)) {
+        uint32_t ci = BIR_VAL_INDEX(ref);
+        return ci < L->M->num_consts ? L->M->consts[ci].type : 0;
+    }
+    uint32_t ii = BIR_VAL_INDEX(ref);
+    return ii < L->M->num_insts ? L->M->insts[ii].type : 0;
+}
+
+static int is_float_type(const lower_t *L, uint32_t t)
+{
+    return t < L->M->num_types && L->M->types[t].kind == BIR_TYPE_FLOAT;
+}
+
+static int is_ptr_type(const lower_t *L, uint32_t t)
+{
+    return t < L->M->num_types && L->M->types[t].kind == BIR_TYPE_PTR;
+}
+
+static uint32_t ptr_inner(const lower_t *L, uint32_t t)
+{
+    if (is_ptr_type(L, t)) return L->M->types[t].inner;
+    return 0;
+}
+
+static int is_void_type(const lower_t *L, uint32_t t)
+{
+    return t < L->M->num_types && L->M->types[t].kind == BIR_TYPE_VOID;
+}
+
+/* ---- Sema Signedness Query ---- */
+
+static int node_is_unsigned(const lower_t *L, uint32_t ast_node)
+{
+    if (!L->sema || !ast_node || ast_node >= BC_MAX_NODES) return 0;
+    uint32_t st = L->sema->node_types[ast_node];
+    if (!st || st >= L->sema->num_types) return 0;
+    uint8_t k = L->sema->types[st].kind;
+    return k == STYPE_BOOL || k == STYPE_UCHAR || k == STYPE_USHORT
+        || k == STYPE_UINT || k == STYPE_ULONG || k == STYPE_ULLONG;
+}
+
+/* ---- Literal Parsing ---- */
+
+static int64_t parse_int_text(const char *s, int len)
+{
+    char buf[64];
+    int n = len > 63 ? 63 : len;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    while (n > 0 && (buf[n-1]=='u'||buf[n-1]=='U'||
+                     buf[n-1]=='l'||buf[n-1]=='L'))
+        buf[--n] = '\0';
+    return strtoll(buf, NULL, 0);
+}
+
+static double parse_float_text(const char *s, int len, int *is_f32)
+{
+    char buf[64];
+    int n = len > 63 ? 63 : len;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    *is_f32 = 0;
+    if (n > 0 && (buf[n-1]=='f'||buf[n-1]=='F')) {
+        buf[--n] = '\0';
+        *is_f32 = 1;
+    }
+    return strtod(buf, NULL);
+}
+
+/* ---- Operator Mapping ---- */
+
+static int bin_op_code(int tok, int is_fp, int is_unsigned)
+{
+    switch (tok) {
+    case TOK_PLUS:    return is_fp ? BIR_FADD : BIR_ADD;
+    case TOK_MINUS:   return is_fp ? BIR_FSUB : BIR_SUB;
+    case TOK_STAR:    return is_fp ? BIR_FMUL : BIR_MUL;
+    case TOK_SLASH:   return is_fp ? BIR_FDIV : (is_unsigned ? BIR_UDIV : BIR_SDIV);
+    case TOK_PERCENT: return is_fp ? BIR_FREM : (is_unsigned ? BIR_UREM : BIR_SREM);
+    case TOK_AMP:     return BIR_AND;
+    case TOK_PIPE:    return BIR_OR;
+    case TOK_CARET:   return BIR_XOR;
+    case TOK_SHL:     return BIR_SHL;
+    case TOK_SHR:     return is_unsigned ? BIR_LSHR : BIR_ASHR;
+    default:          return -1;
+    }
+}
+
+static int cmp_pred(int tok, int is_fp, int is_unsigned)
+{
+    if (is_fp) {
+        switch (tok) {
+        case TOK_EQ: return BIR_FCMP_OEQ;
+        case TOK_NE: return BIR_FCMP_ONE;
+        case TOK_LT: return BIR_FCMP_OLT;
+        case TOK_LE: return BIR_FCMP_OLE;
+        case TOK_GT: return BIR_FCMP_OGT;
+        case TOK_GE: return BIR_FCMP_OGE;
+        default:     return BIR_FCMP_OEQ;
+        }
+    }
+    switch (tok) {
+    case TOK_EQ: return BIR_ICMP_EQ;
+    case TOK_NE: return BIR_ICMP_NE;
+    case TOK_LT: return is_unsigned ? BIR_ICMP_ULT : BIR_ICMP_SLT;
+    case TOK_LE: return is_unsigned ? BIR_ICMP_ULE : BIR_ICMP_SLE;
+    case TOK_GT: return is_unsigned ? BIR_ICMP_UGT : BIR_ICMP_SGT;
+    case TOK_GE: return is_unsigned ? BIR_ICMP_UGE : BIR_ICMP_SGE;
+    default:     return BIR_ICMP_EQ;
+    }
+}
+
+static int is_cmp_tok(int t)
+{
+    return t==TOK_EQ||t==TOK_NE||t==TOK_LT||t==TOK_GT||t==TOK_LE||t==TOK_GE;
+}
+
+static int compound_base(int tok)
+{
+    switch (tok) {
+    case TOK_PLUS_EQ:    return TOK_PLUS;
+    case TOK_MINUS_EQ:   return TOK_MINUS;
+    case TOK_STAR_EQ:    return TOK_STAR;
+    case TOK_SLASH_EQ:   return TOK_SLASH;
+    case TOK_PERCENT_EQ: return TOK_PERCENT;
+    case TOK_AMP_EQ:     return TOK_AMP;
+    case TOK_PIPE_EQ:    return TOK_PIPE;
+    case TOK_CARET_EQ:   return TOK_CARET;
+    case TOK_SHL_EQ:     return TOK_SHL;
+    case TOK_SHR_EQ:     return TOK_SHR;
+    default:             return -1;
+    }
+}
+
+static int is_compound_assign(int tok)
+{
+    return compound_base(tok) >= 0;
+}
+
+/* ---- Forward Declarations ---- */
+
+static uint32_t lower_expr(lower_t *L, uint32_t node);
+static uint32_t lower_lvalue(lower_t *L, uint32_t node);
+static void     lower_stmt(lower_t *L, uint32_t node);
+static void     lower_block_stmts(lower_t *L, uint32_t node);
+static void     lower_func_body(lower_t *L, uint32_t func_def,
+                                uint16_t cuda_flags, const char *name_override);
+
+/* ---- CUDA Builtin Detection ---- */
+
+static int try_cuda_builtin(lower_t *L, uint32_t node, uint32_t *out)
+{
+    const ast_node_t *n = ND(L, node);
+    if (n->type != AST_MEMBER) return 0;
+
+    uint32_t obj = n->first_child;
+    uint32_t fld = obj ? ND(L, obj)->next_sibling : 0;
+    if (!obj || !fld) return 0;
+    if (ND(L, obj)->type != AST_IDENT) return 0;
+    if (ND(L, fld)->type != AST_IDENT) return 0;
+
+    uint16_t op;
+    if      (text_eq(L, obj, "threadIdx")) op = BIR_THREAD_ID;
+    else if (text_eq(L, obj, "blockIdx"))  op = BIR_BLOCK_ID;
+    else if (text_eq(L, obj, "blockDim"))  op = BIR_BLOCK_DIM;
+    else if (text_eq(L, obj, "gridDim"))   op = BIR_GRID_DIM;
+    else return 0;
+
+    uint8_t dim = 0;
+    if      (text_eq(L, fld, "y")) dim = 1;
+    else if (text_eq(L, fld, "z")) dim = 2;
+
+    uint32_t t_i32 = bir_type_int(L->M, 32);
+    uint32_t inst = emit(L, op, t_i32, 0, dim);
+    *out = BIR_MAKE_VAL(inst);
+    return 1;
+}
+
+/* ---- Expression Lowering ---- */
+
+static uint32_t lower_expr(lower_t *L, uint32_t node)
+{
+    if (!node) return BIR_VAL_NONE;
+    L->cur_node = node;
+    const ast_node_t *n = ND(L, node);
+
+    switch (n->type) {
+    case AST_NONE:
+        return BIR_VAL_NONE;
+
+    case AST_INT_LIT: {
+        int64_t val = parse_int_text(L->src + n->d.text.offset,
+                                     (int)n->d.text.len);
+        uint32_t t = bir_type_int(L->M, 32);
+        return BIR_MAKE_CONST(bir_const_int(L->M, t, val));
+    }
+
+    case AST_FLOAT_LIT: {
+        int is_f32;
+        double val = parse_float_text(L->src + n->d.text.offset,
+                                      (int)n->d.text.len, &is_f32);
+        uint32_t t = is_f32 ? bir_type_float(L->M, 32)
+                            : bir_type_float(L->M, 64);
+        return BIR_MAKE_CONST(bir_const_float(L->M, t, val));
+    }
+
+    case AST_BOOL_LIT: {
+        uint32_t t = bir_type_int(L->M, 1);
+        return BIR_MAKE_CONST(bir_const_int(L->M, t, n->d.ival));
+    }
+
+    case AST_NULL_LIT: {
+        uint32_t pt = bir_type_ptr(L->M, bir_type_int(L->M, 8),
+                                   BIR_AS_GENERIC);
+        return BIR_MAKE_CONST(bir_const_null(L->M, pt));
+    }
+
+    case AST_CHAR_LIT: {
+        /* 'c' → i8 constant */
+        int64_t val = 0;
+        if (n->d.text.len >= 3) /* 'X' */
+            val = (int64_t)(unsigned char)L->src[n->d.text.offset + 1];
+        uint32_t t = bir_type_int(L->M, 8);
+        return BIR_MAKE_CONST(bir_const_int(L->M, t, val));
+    }
+
+    case AST_IDENT: {
+        char name[128];
+        get_text(L, node, name, sizeof(name));
+
+        /* Enum constant? */
+        int64_t eval;
+        if (find_enum(L, name, &eval))
+            return BIR_MAKE_CONST(bir_const_int(L->M,
+                bir_type_int(L->M, 32), eval));
+
+        /* Template non-type binding? */
+        int64_t bval;
+        if (find_binding_int(L, name, &bval))
+            return BIR_MAKE_CONST(bir_const_int(L->M,
+                bir_type_int(L->M, 32), bval));
+
+        sym_t *s = find_sym(L, name);
+        if (!s) {
+            lower_error(L, node, "undefined variable");
+            return BIR_VAL_NONE;
+        }
+        if (s->is_alloca) {
+            uint32_t inst = emit(L, BIR_LOAD, s->type, 1, 0);
+            set_op(L, inst, 0, BIR_MAKE_VAL(s->ref));
+            return BIR_MAKE_VAL(inst);
+        }
+        return s->ref; /* param — direct SSA value */
+    }
+
+    case AST_PAREN:
+        return lower_expr(L, n->first_child);
+
+    case AST_MEMBER: {
+        uint32_t result;
+        if (try_cuda_builtin(L, node, &result))
+            return result;
+
+        /* Struct member: get address, then load */
+        uint32_t addr = lower_lvalue(L, node);
+        if (addr == BIR_VAL_NONE) return BIR_VAL_NONE;
+        uint32_t pt = ref_type(L, addr);
+        uint32_t et = ptr_inner(L, pt);
+        if (!et) et = bir_type_int(L->M, 32);
+        uint32_t inst = emit(L, BIR_LOAD, et, 1, 0);
+        set_op(L, inst, 0, addr);
+        return BIR_MAKE_VAL(inst);
+    }
+
+    case AST_SUBSCRIPT: {
+        uint32_t base_n = n->first_child;
+        uint32_t idx_n  = ND(L, base_n)->next_sibling;
+
+        uint32_t base_v = lower_expr(L, base_n);
+        uint32_t idx_v  = lower_expr(L, idx_n);
+        uint32_t bt     = ref_type(L, base_v);
+        uint32_t et     = ptr_inner(L, bt);
+        if (!et) et = bir_type_int(L->M, 32);
+
+        uint32_t gep = emit(L, BIR_GEP, bt, 2, 0);
+        set_op(L, gep, 0, base_v);
+        set_op(L, gep, 1, idx_v);
+
+        uint32_t ld = emit(L, BIR_LOAD, et, 1, 0);
+        set_op(L, ld, 0, BIR_MAKE_VAL(gep));
+        return BIR_MAKE_VAL(ld);
+    }
+
+    case AST_BINARY: {
+        int op = n->d.oper.op;
+        uint32_t lhs_n = n->first_child;
+        uint32_t rhs_n = ND(L, lhs_n)->next_sibling;
+
+        /* Assignment */
+        if (op == TOK_ASSIGN) {
+            uint32_t ptr = lower_lvalue(L, lhs_n);
+            uint32_t val = lower_expr(L, rhs_n);
+            uint32_t t_void = bir_type_void(L->M);
+            uint32_t st = emit(L, BIR_STORE, t_void, 2, 0);
+            set_op(L, st, 0, val);
+            set_op(L, st, 1, ptr);
+            return val;
+        }
+
+        /* Compound assignment (+=, *=, etc.) */
+        if (is_compound_assign(op)) {
+            uint32_t ptr = lower_lvalue(L, lhs_n);
+            uint32_t pt  = ref_type(L, ptr);
+            uint32_t et  = ptr_inner(L, pt);
+            if (!et) et  = bir_type_int(L->M, 32);
+
+            uint32_t old = emit(L, BIR_LOAD, et, 1, 0);
+            set_op(L, old, 0, ptr);
+            uint32_t rhs = lower_expr(L, rhs_n);
+
+            int base = compound_base(op);
+            int fp   = is_float_type(L, et);
+            int opc  = bin_op_code(base, fp, node_is_unsigned(L, node));
+
+            uint32_t res = emit(L, (uint16_t)opc, et, 2, 0);
+            set_op(L, res, 0, BIR_MAKE_VAL(old));
+            set_op(L, res, 1, rhs);
+
+            uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, st, 0, BIR_MAKE_VAL(res));
+            set_op(L, st, 1, ptr);
+            return BIR_MAKE_VAL(res);
+        }
+
+        /* Comparison */
+        if (is_cmp_tok(op)) {
+            uint32_t lhs = lower_expr(L, lhs_n);
+            uint32_t rhs = lower_expr(L, rhs_n);
+            uint32_t lt  = ref_type(L, lhs);
+            int fp       = is_float_type(L, lt);
+            uint32_t t1  = bir_type_int(L->M, 1);
+            int pred     = cmp_pred(op, fp, node_is_unsigned(L, lhs_n));
+            uint32_t inst = emit(L, fp ? BIR_FCMP : BIR_ICMP,
+                                 t1, 2, (uint8_t)pred);
+            set_op(L, inst, 0, lhs);
+            set_op(L, inst, 1, rhs);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        /* Short-circuit && via alloca+store+load (mem2reg cleans up) */
+        if (op == TOK_LAND) {
+            uint32_t t1 = bir_type_int(L->M, 1);
+            uint32_t pt = bir_type_ptr(L->M, t1, BIR_AS_PRIVATE);
+            uint32_t al = emit(L, BIR_ALLOCA, pt, 0, 0);
+            uint32_t f  = BIR_MAKE_CONST(bir_const_int(L->M, t1, 0));
+            uint32_t s0 = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, s0, 0, f);
+            set_op(L, s0, 1, BIR_MAKE_VAL(al));
+            uint32_t lhs   = lower_expr(L, lhs_n);
+            uint32_t rhs_b = new_block(L, "land.rhs");
+            uint32_t end_b = new_block(L, "land.end");
+            uint32_t br    = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            set_op(L, br, 0, lhs);
+            set_op(L, br, 1, rhs_b);
+            set_op(L, br, 2, end_b);
+            set_block(L, rhs_b);
+            uint32_t rhs = lower_expr(L, rhs_n);
+            uint32_t s1  = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, s1, 0, rhs);
+            set_op(L, s1, 1, BIR_MAKE_VAL(al));
+            if (!block_terminated(L)) {
+                uint32_t j = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+                set_op(L, j, 0, end_b);
+            }
+            set_block(L, end_b);
+            uint32_t ld = emit(L, BIR_LOAD, t1, 1, 0);
+            set_op(L, ld, 0, BIR_MAKE_VAL(al));
+            return BIR_MAKE_VAL(ld);
+        }
+        /* Short-circuit || via alloca+store+load */
+        if (op == TOK_LOR) {
+            uint32_t t1 = bir_type_int(L->M, 1);
+            uint32_t pt = bir_type_ptr(L->M, t1, BIR_AS_PRIVATE);
+            uint32_t al = emit(L, BIR_ALLOCA, pt, 0, 0);
+            uint32_t tr = BIR_MAKE_CONST(bir_const_int(L->M, t1, 1));
+            uint32_t s0 = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, s0, 0, tr);
+            set_op(L, s0, 1, BIR_MAKE_VAL(al));
+            uint32_t lhs   = lower_expr(L, lhs_n);
+            uint32_t rhs_b = new_block(L, "lor.rhs");
+            uint32_t end_b = new_block(L, "lor.end");
+            uint32_t br    = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            set_op(L, br, 0, lhs);
+            set_op(L, br, 1, end_b);  /* true → skip RHS */
+            set_op(L, br, 2, rhs_b);  /* false → eval RHS */
+            set_block(L, rhs_b);
+            uint32_t rhs = lower_expr(L, rhs_n);
+            uint32_t s1  = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, s1, 0, rhs);
+            set_op(L, s1, 1, BIR_MAKE_VAL(al));
+            if (!block_terminated(L)) {
+                uint32_t j = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+                set_op(L, j, 0, end_b);
+            }
+            set_block(L, end_b);
+            uint32_t ld = emit(L, BIR_LOAD, t1, 1, 0);
+            set_op(L, ld, 0, BIR_MAKE_VAL(al));
+            return BIR_MAKE_VAL(ld);
+        }
+
+        /* Comma */
+        if (op == TOK_COMMA) {
+            lower_expr(L, lhs_n);
+            return lower_expr(L, rhs_n);
+        }
+
+        /* Regular binary arithmetic/bitwise */
+        {
+            uint32_t lhs = lower_expr(L, lhs_n);
+            uint32_t rhs = lower_expr(L, rhs_n);
+            uint32_t lt  = ref_type(L, lhs);
+
+            /* Operator overloading: struct-typed operands → call operator func */
+            if (lt < L->M->num_types
+                && L->M->types[lt].kind == BIR_TYPE_STRUCT) {
+                char oname[32];
+                op_name_from_tok(op, oname, sizeof(oname));
+                /* Look up operator function in module */
+                for (uint32_t fi = 0; fi < L->M->num_funcs; fi++) {
+                    if (L->M->funcs[fi].name < L->M->string_len
+                        && strcmp(&L->M->strings[L->M->funcs[fi].name],
+                                 oname) == 0) {
+                        uint32_t ftype = L->M->funcs[fi].type;
+                        uint32_t ret_t = L->M->types[ftype].inner;
+                        uint32_t inst = emit(L, BIR_CALL, ret_t, 3, 0);
+                        set_op(L, inst, 0, fi);
+                        set_op(L, inst, 1, lhs);
+                        set_op(L, inst, 2, rhs);
+                        return BIR_MAKE_VAL(inst);
+                    }
+                }
+            }
+
+            int fp       = is_float_type(L, lt);
+            int opc      = bin_op_code(op, fp, node_is_unsigned(L, node));
+            if (opc < 0) {
+                lower_error(L, node, "unsupported binary op");
+                return lhs;
+            }
+            uint32_t inst = emit(L, (uint16_t)opc, lt, 2, 0);
+            set_op(L, inst, 0, lhs);
+            set_op(L, inst, 1, rhs);
+            return BIR_MAKE_VAL(inst);
+        }
+    }
+
+    case AST_UNARY_PREFIX: {
+        int op = n->d.oper.op;
+        uint32_t operand = n->first_child;
+
+        if (op == TOK_PLUS)
+            return lower_expr(L, operand);
+
+        if (op == TOK_MINUS) {
+            uint32_t val = lower_expr(L, operand);
+            uint32_t t   = ref_type(L, val);
+            if (is_float_type(L, t)) {
+                uint32_t z = BIR_MAKE_CONST(bir_const_float(L->M, t, 0.0));
+                uint32_t inst = emit(L, BIR_FSUB, t, 2, 0);
+                set_op(L, inst, 0, z);
+                set_op(L, inst, 1, val);
+                return BIR_MAKE_VAL(inst);
+            }
+            uint32_t z = BIR_MAKE_CONST(bir_const_int(L->M, t, 0));
+            uint32_t inst = emit(L, BIR_SUB, t, 2, 0);
+            set_op(L, inst, 0, z);
+            set_op(L, inst, 1, val);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        if (op == TOK_BANG) {
+            uint32_t val = lower_expr(L, operand);
+            uint32_t t   = ref_type(L, val);
+            uint32_t t1  = bir_type_int(L->M, 1);
+            uint32_t z   = BIR_MAKE_CONST(bir_const_int(L->M, t, 0));
+            uint32_t inst = emit(L, BIR_ICMP, t1, 2, BIR_ICMP_EQ);
+            set_op(L, inst, 0, val);
+            set_op(L, inst, 1, z);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        if (op == TOK_TILDE) {
+            uint32_t val = lower_expr(L, operand);
+            uint32_t t   = ref_type(L, val);
+            uint32_t neg = BIR_MAKE_CONST(bir_const_int(L->M, t, -1));
+            uint32_t inst = emit(L, BIR_XOR, t, 2, 0);
+            set_op(L, inst, 0, val);
+            set_op(L, inst, 1, neg);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        if (op == TOK_AMP)
+            return lower_lvalue(L, operand);
+
+        if (op == TOK_STAR) {
+            uint32_t ptr = lower_expr(L, operand);
+            uint32_t pt  = ref_type(L, ptr);
+            uint32_t et  = ptr_inner(L, pt);
+            if (!et) et  = bir_type_int(L->M, 32);
+            uint32_t inst = emit(L, BIR_LOAD, et, 1, 0);
+            set_op(L, inst, 0, ptr);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        if (op == TOK_INC || op == TOK_DEC) {
+            uint32_t ptr = lower_lvalue(L, operand);
+            uint32_t pt  = ref_type(L, ptr);
+            uint32_t et  = ptr_inner(L, pt);
+            if (!et) et  = bir_type_int(L->M, 32);
+
+            uint32_t old = emit(L, BIR_LOAD, et, 1, 0);
+            set_op(L, old, 0, ptr);
+
+            uint32_t one, res;
+            if (is_float_type(L, et)) {
+                one = BIR_MAKE_CONST(bir_const_float(L->M, et, 1.0));
+                res = emit(L, op==TOK_INC ? BIR_FADD : BIR_FSUB, et, 2, 0);
+            } else {
+                one = BIR_MAKE_CONST(bir_const_int(L->M, et, 1));
+                res = emit(L, op==TOK_INC ? BIR_ADD : BIR_SUB, et, 2, 0);
+            }
+            set_op(L, res, 0, BIR_MAKE_VAL(old));
+            set_op(L, res, 1, one);
+
+            uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, st, 0, BIR_MAKE_VAL(res));
+            set_op(L, st, 1, ptr);
+            return BIR_MAKE_VAL(res); /* pre-inc returns new value */
+        }
+
+        lower_error(L, node, "unsupported unary prefix");
+        return BIR_VAL_NONE;
+    }
+
+    case AST_UNARY_POSTFIX: {
+        int op = n->d.oper.op;
+        uint32_t operand = n->first_child;
+
+        if (op == TOK_INC || op == TOK_DEC) {
+            uint32_t ptr = lower_lvalue(L, operand);
+            uint32_t pt  = ref_type(L, ptr);
+            uint32_t et  = ptr_inner(L, pt);
+            if (!et) et  = bir_type_int(L->M, 32);
+
+            uint32_t old = emit(L, BIR_LOAD, et, 1, 0);
+            set_op(L, old, 0, ptr);
+
+            uint32_t one, res;
+            if (is_float_type(L, et)) {
+                one = BIR_MAKE_CONST(bir_const_float(L->M, et, 1.0));
+                res = emit(L, op==TOK_INC ? BIR_FADD : BIR_FSUB, et, 2, 0);
+            } else {
+                one = BIR_MAKE_CONST(bir_const_int(L->M, et, 1));
+                res = emit(L, op==TOK_INC ? BIR_ADD : BIR_SUB, et, 2, 0);
+            }
+            set_op(L, res, 0, BIR_MAKE_VAL(old));
+            set_op(L, res, 1, one);
+
+            uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, st, 0, BIR_MAKE_VAL(res));
+            set_op(L, st, 1, ptr);
+            return BIR_MAKE_VAL(old); /* post-inc returns old value */
+        }
+        lower_error(L, node, "unsupported postfix op");
+        return BIR_VAL_NONE;
+    }
+
+    case AST_TERNARY: {
+        uint32_t cond_n = n->first_child;
+        uint32_t then_n = ND(L, cond_n)->next_sibling;
+        uint32_t else_n = ND(L, then_n)->next_sibling;
+
+        uint32_t cond = lower_expr(L, cond_n);
+        uint32_t tv   = lower_expr(L, then_n);
+        uint32_t ev   = lower_expr(L, else_n);
+        uint32_t rt   = ref_type(L, tv);
+
+        uint32_t inst = emit(L, BIR_SELECT, rt, 3, 0);
+        set_op(L, inst, 0, cond);
+        set_op(L, inst, 1, tv);
+        set_op(L, inst, 2, ev);
+        return BIR_MAKE_VAL(inst);
+    }
+
+    case AST_CALL: {
+        uint32_t callee_n = n->first_child;
+
+        /* ---- Cooperative groups: phantom types meet real hardware ---- */
+        if (ND(L, callee_n)->type == AST_SCOPE_RES) {
+            uint32_t ns_n = ND(L, callee_n)->first_child;
+            uint32_t fn_n = ns_n ? ND(L, ns_n)->next_sibling : 0;
+            if (ns_n && fn_n && text_eq(L, ns_n, "cooperative_groups")) {
+                if (text_eq(L, fn_n, "this_thread_block")) {
+                    /* Returns a phantom handle. The GPU doesn't care about
+                       your type system — it's just a thread block. */
+                    uint32_t i32 = bir_type_int(L->M, 32);
+                    return BIR_MAKE_CONST(bir_const_int(L->M, i32, 0));
+                }
+                if (text_eq(L, fn_n, "this_grid")) {
+                    uint32_t i32 = bir_type_int(L->M, 32);
+                    return BIR_MAKE_CONST(bir_const_int(L->M, i32, 0));
+                }
+            }
+        }
+        if (ND(L, callee_n)->type == AST_MEMBER) {
+            uint32_t obj_n = ND(L, callee_n)->first_child;
+            uint32_t fld_n = obj_n ? ND(L, obj_n)->next_sibling : 0;
+            if (fld_n && ND(L, fld_n)->type == AST_IDENT) {
+                if (text_eq(L, fld_n, "sync")) {
+                    /* .sync() → barrier. All threads, please stop and wait politely. */
+                    uint32_t inst = emit(L, BIR_BARRIER, bir_type_void(L->M), 0, 0);
+                    return BIR_MAKE_VAL(inst);
+                }
+                if (text_eq(L, fld_n, "thread_rank")) {
+                    /* .thread_rank() → threadIdx.x. A thread by any other name. */
+                    uint32_t i32 = bir_type_int(L->M, 32);
+                    uint32_t inst = emit(L, BIR_THREAD_ID, i32, 0, 0);
+                    return BIR_MAKE_VAL(inst);
+                }
+                if (text_eq(L, fld_n, "size")) {
+                    /* .size() → blockDim.x. How many of us are there? */
+                    uint32_t i32 = bir_type_int(L->M, 32);
+                    uint32_t inst = emit(L, BIR_BLOCK_DIM, i32, 0, 0);
+                    return BIR_MAKE_VAL(inst);
+                }
+            }
+        }
+
+        char cname[128];
+        get_text(L, callee_n, cname, sizeof(cname));
+
+        /* ---- CUDA builtin functions ---- */
+
+        /* Barriers: zero args, void return */
+        if (strcmp(cname, "__syncthreads") == 0) {
+            uint32_t inst = emit(L, BIR_BARRIER, bir_type_void(L->M), 0, 0);
+            return BIR_MAKE_VAL(inst);
+        }
+        if (strcmp(cname, "__threadfence") == 0) {
+            uint32_t inst = emit(L, BIR_BARRIER, bir_type_void(L->M), 0, 1);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        /* Atomics: 2-arg (ptr, val) */
+        {
+            static const struct { const char *n; uint16_t op; } atab[] = {
+                {"atomicAdd", BIR_ATOMIC_ADD}, {"atomicSub", BIR_ATOMIC_SUB},
+                {"atomicAnd", BIR_ATOMIC_AND}, {"atomicOr",  BIR_ATOMIC_OR},
+                {"atomicXor", BIR_ATOMIC_XOR}, {"atomicMin", BIR_ATOMIC_MIN},
+                {"atomicMax", BIR_ATOMIC_MAX}, {"atomicExch",BIR_ATOMIC_XCHG},
+            };
+            int matched = 0;
+            for (int bi = 0; bi < 8; bi++) {
+                if (strcmp(cname, atab[bi].n) != 0) continue;
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t a0 = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t a1 = lower_expr(L, an);
+                uint32_t rt = ref_type(L, a1);
+                uint32_t inst = emit(L, atab[bi].op, rt, 2, BIR_ORDER_RELAXED);
+                set_op(L, inst, 0, a0);
+                set_op(L, inst, 1, a1);
+                return BIR_MAKE_VAL(inst);
+            }
+            (void)matched;
+        }
+
+        /* atomicCAS: 3-arg (ptr, cmp, val) */
+        if (strcmp(cname, "atomicCAS") == 0) {
+            uint32_t an = ND(L, callee_n)->next_sibling;
+            uint32_t a0 = lower_expr(L, an);
+            an = ND(L, an)->next_sibling;
+            uint32_t a1 = lower_expr(L, an);
+            an = ND(L, an)->next_sibling;
+            uint32_t a2 = lower_expr(L, an);
+            uint32_t rt = ref_type(L, a1);
+            uint32_t inst = emit(L, BIR_ATOMIC_CAS, rt, 3, BIR_ORDER_RELAXED);
+            set_op(L, inst, 0, a0);
+            set_op(L, inst, 1, a1);
+            set_op(L, inst, 2, a2);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        /* Warp shuffle: up to 4-arg (mask, val, lane/delta, [width]) */
+        {
+            static const struct { const char *n; uint16_t op; } stab[] = {
+                {"__shfl_sync",      BIR_SHFL},
+                {"__shfl_up_sync",   BIR_SHFL_UP},
+                {"__shfl_down_sync", BIR_SHFL_DOWN},
+                {"__shfl_xor_sync",  BIR_SHFL_XOR},
+            };
+            for (int bi = 0; bi < 4; bi++) {
+                if (strcmp(cname, stab[bi].n) != 0) continue;
+                uint32_t sa[4];
+                int sn = 0;
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                while (an && sn < 4) {
+                    sa[sn++] = lower_expr(L, an);
+                    an = ND(L, an)->next_sibling;
+                }
+                uint32_t rt = sn >= 2 ? ref_type(L, sa[1])
+                                      : bir_type_int(L->M, 32);
+                uint32_t inst = emit(L, stab[bi].op, rt, (uint8_t)sn, 0);
+                for (int j = 0; j < sn; j++)
+                    set_op(L, inst, j, sa[j]);
+                return BIR_MAKE_VAL(inst);
+            }
+        }
+
+        /* Warp vote: 2-arg (mask, pred) */
+        {
+            static const struct { const char *n; uint16_t op; } vtab[] = {
+                {"__ballot_sync", BIR_BALLOT},
+                {"__any_sync",    BIR_VOTE_ANY},
+                {"__all_sync",    BIR_VOTE_ALL},
+            };
+            for (int bi = 0; bi < 3; bi++) {
+                if (strcmp(cname, vtab[bi].n) != 0) continue;
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t a0 = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t a1 = lower_expr(L, an);
+                uint32_t rt = (vtab[bi].op == BIR_BALLOT)
+                    ? bir_type_int(L->M, 32) : bir_type_int(L->M, 1);
+                uint32_t inst = emit(L, vtab[bi].op, rt, 2, 0);
+                set_op(L, inst, 0, a0);
+                set_op(L, inst, 1, a1);
+                return BIR_MAKE_VAL(inst);
+            }
+        }
+
+        /* ---- Vector constructors: make_float2/3/4, make_int2/3/4 etc. ---- */
+        if (strncmp(cname, "make_", 5) == 0) {
+            /* Try to resolve as vector type name (without "make_" prefix) */
+            uint32_t vst = resolve_type(L, 0, 0, 0); /* dummy, overwritten */
+            char vname[64];
+            { int vl = (int)strlen(cname + 5);
+              if (vl > 63) vl = 63;
+              memcpy(vname, cname + 5, vl);
+              vname[vl] = '\0'; }
+            /* Find struct_def for the vector type */
+            struct_def_t *vsd = NULL;
+            for (int si = 0; si < L->nstructs; si++) {
+                if (strcmp(L->structs[si].name, vname) == 0) {
+                    vsd = &L->structs[si]; break;
+                }
+            }
+            if (!vsd) {
+                /* Force-resolve so it gets registered */
+                /* Force-resolve inline to register the struct_def */
+                static const struct { const char *name; int elem; int lanes; } vc_map[] = {
+                    {"float2",TYPE_FLOAT,2},{"float3",TYPE_FLOAT,3},{"float4",TYPE_FLOAT,4},
+                    {"double2",TYPE_DOUBLE,2},{"double3",TYPE_DOUBLE,3},{"double4",TYPE_DOUBLE,4},
+                    {"int2",TYPE_INT,2},{"int3",TYPE_INT,3},{"int4",TYPE_INT,4},
+                    {"uint2",TYPE_INT,2},{"uint3",TYPE_INT,3},{"uint4",TYPE_INT,4},
+                    {"char2",TYPE_CHAR,2},{"char3",TYPE_CHAR,3},{"char4",TYPE_CHAR,4},
+                    {"uchar2",TYPE_CHAR,2},{"uchar3",TYPE_CHAR,3},{"uchar4",TYPE_CHAR,4},
+                    {"short2",TYPE_SHORT,2},{"short3",TYPE_SHORT,3},{"short4",TYPE_SHORT,4},
+                    {"ushort2",TYPE_SHORT,2},{"ushort3",TYPE_SHORT,3},{"ushort4",TYPE_SHORT,4},
+                    {"long2",TYPE_LONG,2},{"long3",TYPE_LONG,3},{"long4",TYPE_LONG,4},
+                    {"ulong2",TYPE_LONG,2},{"ulong3",TYPE_LONG,3},{"ulong4",TYPE_LONG,4},
+                    {NULL,0,0}
+                };
+                for (int vi = 0; vc_map[vi].name; vi++) {
+                    if (strcmp(vname, vc_map[vi].name) != 0) continue;
+                    uint32_t et = resolve_basic(L, vc_map[vi].elem);
+                    int lanes = vc_map[vi].lanes;
+                    uint32_t fields[4] = {et, et, et, et};
+                    vst = bir_type_struct(L->M, fields, lanes);
+                    if (L->nstructs < MAX_STRUCTS) {
+                        static const char *xyzw[] = {"x","y","z","w"};
+                        vsd = &L->structs[L->nstructs];
+                        memset(vsd, 0, sizeof(*vsd));
+                        snprintf(vsd->name, sizeof(vsd->name), "%s", vname);
+                        vsd->num_fields = lanes;
+                        vsd->bir_type = vst;
+                        for (int fi = 0; fi < lanes; fi++) {
+                            vsd->field_types[fi] = et;
+                            snprintf(vsd->field_names[fi],
+                                     sizeof(vsd->field_names[0]),
+                                     "%s", xyzw[fi]);
+                        }
+                        L->nstructs++;
+                    }
+                    break;
+                }
+            }
+            if (vsd) {
+                /* Alloca struct, GEP+store each arg, load result */
+                uint32_t st = vsd->bir_type;
+                uint32_t pt = bir_type_ptr(L->M, st, BIR_AS_PRIVATE);
+                uint32_t al = emit(L, BIR_ALLOCA, pt, 0, 0);
+
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                for (int fi = 0; fi < vsd->num_fields && an; fi++) {
+                    uint32_t val = lower_expr(L, an);
+                    uint32_t fpt = bir_type_ptr(L->M, vsd->field_types[fi],
+                                                BIR_AS_PRIVATE);
+                    uint32_t ci = BIR_MAKE_CONST(bir_const_int(L->M,
+                        bir_type_int(L->M, 32), fi));
+                    uint32_t gep = emit(L, BIR_GEP, fpt, 2, 0);
+                    set_op(L, gep, 0, BIR_MAKE_VAL(al));
+                    set_op(L, gep, 1, ci);
+                    uint32_t sv = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+                    set_op(L, sv, 0, val);
+                    set_op(L, sv, 1, BIR_MAKE_VAL(gep));
+                    an = ND(L, an)->next_sibling;
+                }
+                uint32_t ld = emit(L, BIR_LOAD, st, 1, 0);
+                set_op(L, ld, 0, BIR_MAKE_VAL(al));
+                return BIR_MAKE_VAL(ld);
+            }
+        }
+
+        /* ---- Half conversion builtins ---- */
+        if (strcmp(cname, "__float2half") == 0) {
+            uint32_t an = ND(L, callee_n)->next_sibling;
+            uint32_t val = lower_expr(L, an);
+            uint32_t f16 = bir_type_float(L->M, 16);
+            uint32_t inst = emit(L, BIR_FPTRUNC, f16, 1, 0);
+            set_op(L, inst, 0, val);
+            return BIR_MAKE_VAL(inst);
+        }
+        if (strcmp(cname, "__half2float") == 0) {
+            uint32_t an = ND(L, callee_n)->next_sibling;
+            uint32_t val = lower_expr(L, an);
+            uint32_t f32 = bir_type_float(L->M, 32);
+            uint32_t inst = emit(L, BIR_FPEXT, f32, 1, 0);
+            set_op(L, inst, 0, val);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        /* ---- Regular function call ---- */
+
+        /* Find function in module */
+        uint32_t fi = 0;
+        int found = 0;
+        for (uint32_t i = 0; i < L->M->num_funcs; i++) {
+            if (L->M->funcs[i].name < L->M->string_len
+                && strcmp(&L->M->strings[L->M->funcs[i].name], cname) == 0) {
+                fi = i;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            lower_error(L, node, "unknown function in call");
+            return BIR_VAL_NONE;
+        }
+
+        uint32_t ftype = L->M->funcs[fi].type;
+        uint32_t ret_t = L->M->types[ftype].inner;
+
+        /* Lower arguments */
+        uint32_t args[16];
+        int nargs = 0;
+        uint32_t arg = ND(L, callee_n)->next_sibling;
+        while (arg && nargs < 16) {
+            args[nargs++] = lower_expr(L, arg);
+            arg = ND(L, arg)->next_sibling;
+        }
+
+        if (1 + nargs <= BIR_OPERANDS_INLINE) {
+            uint32_t inst = emit(L, BIR_CALL, ret_t, (uint8_t)(1+nargs), 0);
+            set_op(L, inst, 0, fi);
+            for (int i = 0; i < nargs; i++)
+                set_op(L, inst, 1+i, args[i]);
+            return BIR_MAKE_VAL(inst);
+        }
+        /* Overflow mode: pack into extra_operands */
+        {
+            uint32_t extra_start = L->M->num_extra_ops;
+            if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
+                L->M->extra_operands[L->M->num_extra_ops++] = fi;
+            for (int i = 0; i < nargs; i++)
+                if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
+                    L->M->extra_operands[L->M->num_extra_ops++] = args[i];
+            uint32_t total = L->M->num_extra_ops - extra_start;
+            uint32_t inst = emit(L, BIR_CALL, ret_t, BIR_OPERANDS_OVERFLOW, 0);
+            set_op(L, inst, 0, extra_start);
+            set_op(L, inst, 1, total);
+            return BIR_MAKE_VAL(inst);
+        }
+    }
+
+    case AST_CAST: {
+        uint32_t type_n = n->first_child;
+        uint32_t expr_n = ND(L, type_n)->next_sibling;
+        int pdepth      = n->d.oper.flags;
+
+        uint32_t dst_t  = resolve_type(L, type_n, pdepth, 0);
+        uint32_t val    = lower_expr(L, expr_n);
+        uint32_t src_t  = ref_type(L, val);
+
+        if (src_t == dst_t) return val;
+
+        int sf = is_float_type(L, src_t), df = is_float_type(L, dst_t);
+        int sp = is_ptr_type(L, src_t),   dp = is_ptr_type(L, dst_t);
+        int src_uns = node_is_unsigned(L, expr_n);
+        int dst_uns = node_is_unsigned(L, node);
+
+        uint16_t cop;
+        if (sf && df) {
+            cop = (L->M->types[dst_t].width > L->M->types[src_t].width)
+                  ? BIR_FPEXT : BIR_FPTRUNC;
+        } else if (sf && !df)  cop = dst_uns ? BIR_FPTOUI : BIR_FPTOSI;
+        else if (!sf && df)    cop = src_uns ? BIR_UITOFP : BIR_SITOFP;
+        else if (sp && !dp)    cop = BIR_PTRTOINT;
+        else if (!sp && dp)    cop = BIR_INTTOPTR;
+        else if (sp && dp)     cop = BIR_BITCAST;
+        else {
+            int sw = L->M->types[src_t].width;
+            int dw = L->M->types[dst_t].width;
+            if (dw > sw)      cop = src_uns ? BIR_ZEXT : BIR_SEXT;
+            else if (dw < sw) cop = BIR_TRUNC;
+            else              cop = BIR_BITCAST;
+        }
+
+        uint32_t inst = emit(L, cop, dst_t, 1, 0);
+        set_op(L, inst, 0, val);
+        return BIR_MAKE_VAL(inst);
+    }
+
+    case AST_SIZEOF: {
+        uint32_t inner = n->first_child;
+        int64_t sz = 4;
+        if (inner && ND(L, inner)->type == AST_TYPE_SPEC) {
+            switch (ND(L, inner)->d.btype.kind) {
+            case TYPE_CHAR:  sz = 1; break;
+            case TYPE_SHORT: sz = 2; break;
+            case TYPE_LONG: case TYPE_LLONG: sz = 8; break;
+            case TYPE_DOUBLE: case TYPE_LDOUBLE: sz = 8; break;
+            default: sz = 4; break;
+            }
+        }
+        uint32_t t = bir_type_int(L->M, 64);
+        return BIR_MAKE_CONST(bir_const_int(L->M, t, sz));
+    }
+
+    case AST_STRING_LIT:
+        /* String literals in device code are unusual — emit as i64 0 */
+        return BIR_MAKE_CONST(bir_const_int(L->M,
+            bir_type_int(L->M, 64), 0));
+
+    default:
+        lower_error(L, node, "unsupported expression node");
+        return BIR_VAL_NONE;
+    }
+}
+
+/* ---- L-Value Lowering ---- */
+
+static uint32_t lower_lvalue(lower_t *L, uint32_t node)
+{
+    if (!node) return BIR_VAL_NONE;
+    const ast_node_t *n = ND(L, node);
+
+    switch (n->type) {
+    case AST_IDENT: {
+        char name[128];
+        get_text(L, node, name, sizeof(name));
+        sym_t *s = find_sym(L, name);
+        if (!s) {
+            lower_error(L, node, "undefined lvalue");
+            return BIR_VAL_NONE;
+        }
+        if (s->is_alloca)
+            return BIR_MAKE_VAL(s->ref);
+        lower_error(L, node, "parameter not addressable");
+        return BIR_VAL_NONE;
+    }
+
+    case AST_SUBSCRIPT: {
+        uint32_t base_n = n->first_child;
+        uint32_t idx_n  = ND(L, base_n)->next_sibling;
+
+        uint32_t base_v = lower_expr(L, base_n);
+        uint32_t idx_v  = lower_expr(L, idx_n);
+        uint32_t bt     = ref_type(L, base_v);
+
+        uint32_t gep = emit(L, BIR_GEP, bt, 2, 0);
+        set_op(L, gep, 0, base_v);
+        set_op(L, gep, 1, idx_v);
+        return BIR_MAKE_VAL(gep);
+    }
+
+    case AST_UNARY_PREFIX:
+        if (n->d.oper.op == TOK_STAR)
+            return lower_expr(L, n->first_child);
+        lower_error(L, node, "not an lvalue (prefix)");
+        return BIR_VAL_NONE;
+
+    case AST_MEMBER: {
+        uint32_t obj = n->first_child;
+        uint32_t fld = ND(L, obj)->next_sibling;
+        char fname[128];
+        get_text(L, fld, fname, sizeof(fname));
+
+        uint32_t obj_ptr;
+        if (n->d.member.is_arrow)
+            obj_ptr = lower_expr(L, obj);
+        else
+            obj_ptr = lower_lvalue(L, obj);
+        if (obj_ptr == BIR_VAL_NONE) return BIR_VAL_NONE;
+
+        uint32_t pt = ref_type(L, obj_ptr);
+        uint32_t st = ptr_inner(L, pt);
+
+        for (int si = 0; si < L->nstructs; si++) {
+            if (L->structs[si].bir_type != st) continue;
+            for (int fi = 0; fi < L->structs[si].num_fields; fi++) {
+                if (strcmp(L->structs[si].field_names[fi], fname) != 0)
+                    continue;
+                uint32_t ft  = L->structs[si].field_types[fi];
+                uint32_t fpt = bir_type_ptr(L->M, ft, BIR_AS_PRIVATE);
+                uint32_t idx = BIR_MAKE_CONST(bir_const_int(L->M,
+                    bir_type_int(L->M, 32), fi));
+                uint32_t gep = emit(L, BIR_GEP, fpt, 2, 0);
+                set_op(L, gep, 0, obj_ptr);
+                set_op(L, gep, 1, idx);
+                return BIR_MAKE_VAL(gep);
+            }
+        }
+        lower_error(L, node, "unknown field in lvalue");
+        return BIR_VAL_NONE;
+    }
+
+    case AST_PAREN:
+        return lower_lvalue(L, n->first_child);
+
+    default:
+        lower_error(L, node, "not an lvalue");
+        return BIR_VAL_NONE;
+    }
+}
+
+/* ---- Statement Lowering ---- */
+
+static void lower_var_decl(lower_t *L, uint32_t node)
+{
+    L->cur_node = node;
+    const ast_node_t *n = ND(L, node);
+    uint32_t type_n = child_at(L, node, 0);
+    uint32_t name_n = child_at(L, node, 1);
+    if (!name_n || ND(L, name_n)->type != AST_IDENT) return;
+
+    char name[128];
+    get_text(L, name_n, name, sizeof(name));
+
+    uint32_t elem_t = resolve_type(L, type_n, n->d.oper.flags, n->cuda_flags);
+
+    /* Check for array declaration: child after name might be array size */
+    uint32_t next = ND(L, name_n)->next_sibling;
+    int is_array = 0;
+    uint32_t arr_count = 0;
+
+    /* Array size: integer literal, enum constant, or template int param */
+    if (next && ND(L, next)->type == AST_INT_LIT) {
+        is_array = 1;
+        arr_count = (uint32_t)parse_int_text(
+            L->src + ND(L, next)->d.text.offset,
+            (int)ND(L, next)->d.text.len);
+    } else if (next && ND(L, next)->type == AST_IDENT) {
+        char aname[128];
+        get_text(L, next, aname, sizeof(aname));
+        int64_t aval;
+        if (find_enum(L, aname, &aval) || find_binding_int(L, aname, &aval)) {
+            is_array = 1;
+            arr_count = (uint32_t)aval;
+        }
+    }
+
+    /* ---- __shared__ variables: LDS allocation, no initializer ---- */
+    if (n->cuda_flags & CUDA_SHARED) {
+        if (is_array) {
+            uint32_t arr_t = bir_type_array(L->M, elem_t, arr_count);
+            uint32_t ptr_t = bir_type_ptr(L->M, arr_t, BIR_AS_SHARED);
+            uint32_t sa = emit(L, BIR_SHARED_ALLOC, ptr_t, 0, 0);
+            add_sym(L, name, sa, arr_t, 1);
+        } else {
+            uint32_t ptr_t = bir_type_ptr(L->M, elem_t, BIR_AS_SHARED);
+            uint32_t sa = emit(L, BIR_SHARED_ALLOC, ptr_t, 0, 0);
+            add_sym(L, name, sa, elem_t, 1);
+        }
+        return;
+    }
+
+    if (is_array) {
+        uint32_t arr_t = bir_type_array(L->M, elem_t, arr_count);
+        uint32_t ptr_t = bir_type_ptr(L->M, arr_t, BIR_AS_PRIVATE);
+        uint32_t alloca = emit(L, BIR_ALLOCA, ptr_t, 0, 0);
+        add_sym(L, name, alloca, arr_t, 1);
+        /* Array initializer list: int arr[3] = {1, 2, 3}; */
+        uint32_t init_n = ND(L, next)->next_sibling;
+        if (init_n && ND(L, init_n)->type == AST_INIT_LIST) {
+            uint32_t ept = bir_type_ptr(L->M, elem_t, BIR_AS_PRIVATE);
+            uint32_t el = ND(L, init_n)->first_child;
+            uint32_t idx = 0;
+            while (el && idx < arr_count) {
+                uint32_t val = lower_expr(L, el);
+                uint32_t ci = BIR_MAKE_CONST(bir_const_int(L->M,
+                    bir_type_int(L->M, 32), (int64_t)idx));
+                uint32_t gep = emit(L, BIR_GEP, ept, 2, 0);
+                set_op(L, gep, 0, BIR_MAKE_VAL(alloca));
+                set_op(L, gep, 1, ci);
+                uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+                set_op(L, st, 0, val);
+                set_op(L, st, 1, BIR_MAKE_VAL(gep));
+                idx++;
+                el = ND(L, el)->next_sibling;
+            }
+        }
+        return;
+    }
+
+    /* Scalar / pointer variable */
+    uint32_t ptr_t = bir_type_ptr(L->M, elem_t, BIR_AS_PRIVATE);
+    uint32_t alloca = emit(L, BIR_ALLOCA, ptr_t, 0, 0);
+    add_sym(L, name, alloca, elem_t, 1);
+
+    /* Initializer: skip type and name, skip array sizes, find init expr */
+    uint32_t init_n = ND(L, name_n)->next_sibling;
+    if (init_n && ND(L, init_n)->type == AST_INIT_LIST) {
+        /* Struct initializer: Vec3 v = {1.0f, 2.0f, 3.0f}; */
+        struct_def_t *sd = NULL;
+        for (int si = 0; si < L->nstructs; si++) {
+            if (L->structs[si].bir_type == elem_t) { sd = &L->structs[si]; break; }
+        }
+        if (sd) {
+            uint32_t el = ND(L, init_n)->first_child;
+            for (int fi = 0; fi < sd->num_fields && el; fi++) {
+                uint32_t val = lower_expr(L, el);
+                uint32_t fpt = bir_type_ptr(L->M, sd->field_types[fi],
+                                            BIR_AS_PRIVATE);
+                uint32_t ci = BIR_MAKE_CONST(bir_const_int(L->M,
+                    bir_type_int(L->M, 32), fi));
+                uint32_t gep = emit(L, BIR_GEP, fpt, 2, 0);
+                set_op(L, gep, 0, BIR_MAKE_VAL(alloca));
+                set_op(L, gep, 1, ci);
+                uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+                set_op(L, st, 0, val);
+                set_op(L, st, 1, BIR_MAKE_VAL(gep));
+                el = ND(L, el)->next_sibling;
+            }
+        }
+    } else if (init_n && ND(L, init_n)->type != AST_NONE) {
+        uint32_t init_v = lower_expr(L, init_n);
+        uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+        set_op(L, st, 0, init_v);
+        set_op(L, st, 1, BIR_MAKE_VAL(alloca));
+    }
+}
+
+static void lower_stmt(lower_t *L, uint32_t node)
+{
+    if (!node) return;
+    L->cur_node = node;
+    const ast_node_t *n = ND(L, node);
+
+    switch (n->type) {
+    case AST_EXPR_STMT:
+        if (n->first_child) lower_expr(L, n->first_child);
+        break;
+
+    case AST_BLOCK:
+        push_scope(L);
+        lower_block_stmts(L, node);
+        pop_scope(L);
+        break;
+
+    case AST_VAR_DECL:
+        lower_var_decl(L, node);
+        break;
+
+    case AST_RETURN: {
+        uint32_t t_void = bir_type_void(L->M);
+        if (n->first_child) {
+            uint32_t val  = lower_expr(L, n->first_child);
+            uint32_t inst = emit(L, BIR_RET, t_void, 1, 0);
+            set_op(L, inst, 0, val);
+        } else {
+            emit(L, BIR_RET, t_void, 0, 0);
+        }
+        break;
+    }
+
+    case AST_IF: {
+        uint32_t cond_n = child_at(L, node, 0);
+        uint32_t then_n = child_at(L, node, 1);
+        uint32_t else_n = child_at(L, node, 2);
+
+        uint32_t cond = lower_expr(L, cond_n);
+
+        uint32_t then_b = new_block(L, "if.then");
+        uint32_t else_b = else_n ? new_block(L, "if.else") : 0;
+        uint32_t end_b  = new_block(L, "if.end");
+
+        uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+        set_op(L, br, 0, cond);
+        set_op(L, br, 1, then_b);
+        set_op(L, br, 2, else_n ? else_b : end_b);
+
+        /* Then */
+        set_block(L, then_b);
+        lower_stmt(L, then_n);
+        if (!block_terminated(L)) {
+            uint32_t j = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, j, 0, end_b);
+        }
+
+        /* Else */
+        if (else_n) {
+            set_block(L, else_b);
+            lower_stmt(L, else_n);
+            if (!block_terminated(L)) {
+                uint32_t j = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+                set_op(L, j, 0, end_b);
+            }
+        }
+
+        set_block(L, end_b);
+        break;
+    }
+
+    case AST_FOR: {
+        /* Children: init, cond, incr, body (always 4) */
+        uint32_t init_n = child_at(L, node, 0);
+        uint32_t cond_n = child_at(L, node, 1);
+        uint32_t incr_n = child_at(L, node, 2);
+        uint32_t body_n = child_at(L, node, 3);
+
+        push_scope(L);
+
+        /* Init */
+        if (init_n && ND(L, init_n)->type != AST_NONE) {
+            if (ND(L, init_n)->type == AST_VAR_DECL)
+                lower_var_decl(L, init_n);
+            else
+                lower_expr(L, init_n);
+        }
+
+        uint32_t cond_b = new_block(L, "for.cond");
+        uint32_t body_b = new_block(L, "for.body");
+        uint32_t incr_b = new_block(L, "for.inc");
+        uint32_t end_b  = new_block(L, "for.end");
+
+        /* Push loop targets */
+        if (L->loop_depth < MAX_LOOPS) {
+            L->break_tgt[L->loop_depth] = end_b;
+            L->cont_tgt[L->loop_depth]  = incr_b;
+            L->loop_depth++;
+        }
+
+        /* Branch to condition */
+        uint32_t j = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+        set_op(L, j, 0, cond_b);
+
+        /* Cond */
+        set_block(L, cond_b);
+        if (cond_n && ND(L, cond_n)->type != AST_NONE) {
+            uint32_t cv = lower_expr(L, cond_n);
+            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            set_op(L, br, 0, cv);
+            set_op(L, br, 1, body_b);
+            set_op(L, br, 2, end_b);
+        } else {
+            /* Infinite loop: for(;;) */
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, body_b);
+        }
+
+        /* Body */
+        set_block(L, body_b);
+        if (body_n) lower_stmt(L, body_n);
+        if (!block_terminated(L)) {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, incr_b);
+        }
+
+        /* Incr */
+        set_block(L, incr_b);
+        if (incr_n && ND(L, incr_n)->type != AST_NONE)
+            lower_expr(L, incr_n);
+        {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, cond_b);
+        }
+
+        /* Pop loop targets */
+        if (L->loop_depth > 0) L->loop_depth--;
+
+        set_block(L, end_b);
+        pop_scope(L);
+        break;
+    }
+
+    case AST_WHILE: {
+        uint32_t cond_n = child_at(L, node, 0);
+        uint32_t body_n = child_at(L, node, 1);
+
+        uint32_t cond_b = new_block(L, "while.cond");
+        uint32_t body_b = new_block(L, "while.body");
+        uint32_t end_b  = new_block(L, "while.end");
+
+        if (L->loop_depth < MAX_LOOPS) {
+            L->break_tgt[L->loop_depth] = end_b;
+            L->cont_tgt[L->loop_depth]  = cond_b;
+            L->loop_depth++;
+        }
+
+        uint32_t j = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+        set_op(L, j, 0, cond_b);
+
+        set_block(L, cond_b);
+        {
+            uint32_t cv = lower_expr(L, cond_n);
+            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            set_op(L, br, 0, cv);
+            set_op(L, br, 1, body_b);
+            set_op(L, br, 2, end_b);
+        }
+
+        set_block(L, body_b);
+        if (body_n) lower_stmt(L, body_n);
+        if (!block_terminated(L)) {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, cond_b);
+        }
+
+        if (L->loop_depth > 0) L->loop_depth--;
+        set_block(L, end_b);
+        break;
+    }
+
+    case AST_DO_WHILE: {
+        uint32_t body_n = child_at(L, node, 0);
+        uint32_t cond_n = child_at(L, node, 1);
+
+        uint32_t body_b = new_block(L, "do.body");
+        uint32_t cond_b = new_block(L, "do.cond");
+        uint32_t end_b  = new_block(L, "do.end");
+
+        if (L->loop_depth < MAX_LOOPS) {
+            L->break_tgt[L->loop_depth] = end_b;
+            L->cont_tgt[L->loop_depth]  = cond_b;
+            L->loop_depth++;
+        }
+
+        {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, body_b);
+        }
+
+        set_block(L, body_b);
+        if (body_n) lower_stmt(L, body_n);
+        if (!block_terminated(L)) {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, cond_b);
+        }
+
+        set_block(L, cond_b);
+        {
+            uint32_t cv = lower_expr(L, cond_n);
+            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            set_op(L, br, 0, cv);
+            set_op(L, br, 1, body_b);
+            set_op(L, br, 2, end_b);
+        }
+
+        if (L->loop_depth > 0) L->loop_depth--;
+        set_block(L, end_b);
+        break;
+    }
+
+    case AST_SWITCH: {
+        uint32_t cond_n = child_at(L, node, 0);
+        uint32_t body_n = child_at(L, node, 1);
+
+        uint32_t cond_v = lower_expr(L, cond_n);
+        uint32_t end_b  = new_block(L, "switch.end");
+        uint32_t old_exit = L->switch_exit;
+        L->switch_exit = end_b;
+
+        /* Save break target */
+        int old_loop = L->loop_depth;
+        if (L->loop_depth < MAX_LOOPS) {
+            L->break_tgt[L->loop_depth] = end_b;
+            L->loop_depth++;
+        }
+
+        /* Scan body for case/default to build jump table */
+        /* Lower as if-else chain for simplicity */
+        uint32_t default_b = end_b;
+        uint32_t c = body_n ? ND(L, body_n)->first_child : 0;
+
+        /* Two passes: first create blocks, then lower */
+        /* Build case list */
+        typedef struct { uint32_t ast; uint32_t block; int is_default; } case_t;
+        case_t cases[64];
+        int ncases = 0;
+
+        uint32_t scan = c;
+        int case_idx = 0;
+        while (scan && ncases < 64) {
+            if (ND(L, scan)->type == AST_CASE || ND(L, scan)->type == AST_DEFAULT) {
+                char bname[32];
+                if (ND(L, scan)->type == AST_DEFAULT)
+                    snprintf(bname, sizeof(bname), "switch.default");
+                else
+                    snprintf(bname, sizeof(bname), "switch.case.%d", case_idx++);
+                cases[ncases].ast = scan;
+                cases[ncases].block = new_block(L, bname);
+                cases[ncases].is_default = (ND(L, scan)->type == AST_DEFAULT);
+                if (cases[ncases].is_default)
+                    default_b = cases[ncases].block;
+                ncases++;
+            }
+            scan = ND(L, scan)->next_sibling;
+        }
+
+        /* Emit BIR_SWITCH in overflow mode */
+        {
+            uint32_t extra_start = L->M->num_extra_ops;
+            /* Pack: cond_val, default_block, (case_const, target_block)... */
+            if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
+                L->M->extra_operands[L->M->num_extra_ops++] = cond_v;
+            if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
+                L->M->extra_operands[L->M->num_extra_ops++] = default_b;
+            for (int i = 0; i < ncases; i++) {
+                if (cases[i].is_default) continue;
+                uint32_t case_val_n = ND(L, cases[i].ast)->first_child;
+                uint32_t cv = lower_expr(L, case_val_n);
+                if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
+                    L->M->extra_operands[L->M->num_extra_ops++] = cv;
+                if (L->M->num_extra_ops < BIR_MAX_EXTRA_OPS)
+                    L->M->extra_operands[L->M->num_extra_ops++] = cases[i].block;
+            }
+            uint32_t total = L->M->num_extra_ops - extra_start;
+            uint32_t sw = emit(L, BIR_SWITCH, bir_type_void(L->M),
+                               BIR_OPERANDS_OVERFLOW, 0);
+            set_op(L, sw, 0, extra_start);
+            set_op(L, sw, 1, total);
+        }
+
+        /* Lower case bodies */
+        uint32_t stmt_node = c;
+        int cur_case = -1;
+        while (stmt_node) {
+            if (ND(L, stmt_node)->type == AST_CASE ||
+                ND(L, stmt_node)->type == AST_DEFAULT) {
+                /* Find this case's block */
+                for (int i = 0; i < ncases; i++) {
+                    if (cases[i].ast == stmt_node) {
+                        cur_case = i;
+                        set_block(L, cases[i].block);
+                        break;
+                    }
+                }
+            } else if (cur_case >= 0) {
+                lower_stmt(L, stmt_node);
+            }
+            stmt_node = ND(L, stmt_node)->next_sibling;
+        }
+
+        /* Terminate last case if needed */
+        if (!block_terminated(L)) {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, end_b);
+        }
+
+        L->switch_exit = old_exit;
+        L->loop_depth = old_loop;
+        set_block(L, end_b);
+        break;
+    }
+
+    case AST_BREAK:
+        if (L->loop_depth > 0) {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, L->break_tgt[L->loop_depth - 1]);
+        }
+        break;
+
+    case AST_CONTINUE:
+        if (L->loop_depth > 0) {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, L->cont_tgt[L->loop_depth - 1]);
+        }
+        break;
+
+    case AST_LABEL: {
+        char lname[64];
+        uint32_t ln = n->first_child;
+        if (ln && ND(L, ln)->type == AST_IDENT)
+            get_text(L, ln, lname, sizeof(lname));
+        else
+            get_text(L, node, lname, sizeof(lname));
+        uint32_t lbl_b = find_or_create_label(L, lname);
+        if (!block_terminated(L)) {
+            uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+            set_op(L, br, 0, lbl_b);
+        }
+        set_block(L, lbl_b);
+        break;
+    }
+
+    case AST_GOTO: {
+        char lname[64];
+        uint32_t gn = n->first_child;
+        if (gn && ND(L, gn)->type == AST_IDENT)
+            get_text(L, gn, lname, sizeof(lname));
+        else
+            get_text(L, node, lname, sizeof(lname));
+        uint32_t lbl_b = find_or_create_label(L, lname);
+        uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
+        set_op(L, br, 0, lbl_b);
+        break;
+    }
+
+    case AST_PP_DIRECTIVE:
+        /* Preprocessor directives skipped */
+        break;
+
+    default:
+        /* Ignore other node types (struct defs, enum defs inside functions, etc.) */
+        break;
+    }
+}
+
+static void lower_block_stmts(lower_t *L, uint32_t block_node)
+{
+    uint32_t c = ND(L, block_node)->first_child;
+    while (c) {
+        if (ND(L, c)->type == AST_LABEL) {
+            /* Labels always processed — they create new unterminated blocks */
+            lower_stmt(L, c);
+        } else if (!block_terminated(L)) {
+            if (ND(L, c)->type == AST_VAR_DECL)
+                lower_var_decl(L, c);
+            else
+                lower_stmt(L, c);
+        }
+        c = ND(L, c)->next_sibling;
+    }
+}
+
+/* ---- Function Lowering ---- */
+
+/*
+ * Find the body (AST_BLOCK) node among func_def's children.
+ * Children are: type_spec, name, [params...], block
+ */
+static uint32_t find_func_body(const lower_t *L, uint32_t func_def)
+{
+    uint32_t c = ND(L, func_def)->first_child;
+    while (c) {
+        if (ND(L, c)->type == AST_BLOCK) return c;
+        c = ND(L, c)->next_sibling;
+    }
+    return 0;
+}
+
+/*
+ * Count and collect function parameters from AST_PARAM children.
+ * Parameters appear after type_spec and name, before body.
+ */
+static int collect_params(const lower_t *L, uint32_t func_def,
+                          uint32_t *out, int max)
+{
+    int count = 0;
+    uint32_t c = ND(L, func_def)->first_child;
+    while (c) {
+        if (ND(L, c)->type == AST_PARAM && count < max)
+            out[count++] = c;
+        c = ND(L, c)->next_sibling;
+    }
+    return count;
+}
+
+static void lower_func_body(lower_t *L, uint32_t func_def,
+                            uint16_t cuda_flags, const char *name_override)
+{
+    /* Get return type */
+    uint32_t type_n = child_at(L, func_def, 0);
+    uint32_t name_n = child_at(L, func_def, 1);
+    int ret_ptr = ND(L, func_def)->d.oper.flags;
+
+    char fname_raw[128], fname[128];
+    if (name_override)
+        snprintf(fname, sizeof(fname), "%s", name_override);
+    else {
+        get_text(L, name_n, fname_raw, sizeof(fname_raw));
+        /* Normalize operator names: "operator +" → "operator+" */
+        if (strncmp(fname_raw, "operator", 8) == 0 && fname_raw[8] != '\0')
+            normalize_op_name(fname_raw, fname, sizeof(fname));
+        else
+            memcpy(fname, fname_raw, sizeof(fname));
+    }
+
+    uint32_t ret_t = resolve_type(L, type_n, ret_ptr, 0);
+
+    /* Collect parameters */
+    uint32_t param_nodes[16];
+    int nparams = collect_params(L, func_def, param_nodes, 16);
+
+    /* Resolve param types and build function type */
+    uint32_t param_types[16];
+    for (int i = 0; i < nparams; i++) {
+        const ast_node_t *pn = ND(L, param_nodes[i]);
+        uint32_t pt_type_n = pn->first_child;
+        int pdepth = pn->d.oper.flags; /* stored by parser */
+        uint16_t p_cuda = pn->cuda_flags;
+        param_types[i] = resolve_type(L, pt_type_n, pdepth, p_cuda);
+    }
+
+    /* Create function type */
+    uint32_t fn_type = bir_type_func(L->M, ret_t, param_types, nparams);
+
+    /* Create function */
+    if (L->M->num_funcs >= BIR_MAX_FUNCS) return;
+    uint32_t fi = L->M->num_funcs++;
+    L->cur_func = fi;
+
+    bir_func_t *F = &L->M->funcs[fi];
+    memset(F, 0, sizeof(*F));
+    F->name = bir_add_string(L->M, fname, (uint32_t)strlen(fname));
+    F->type = fn_type;
+    F->cuda_flags = cuda_flags;
+    F->num_params = (uint16_t)nparams;
+    F->first_block = L->M->num_blocks;
+    F->num_blocks = 0;
+    F->launch_bounds_max = ND(L, func_def)->launch_bounds_max;
+    F->launch_bounds_min = ND(L, func_def)->launch_bounds_min;
+
+    /* Reset labels for this function */
+    L->nlabels = 0;
+
+    /* Entry block */
+    uint32_t entry = new_block(L, "entry");
+    set_block(L, entry);
+    L->base_inst = L->M->num_insts;
+
+    /* Emit PARAM instructions */
+    push_scope(L);
+    for (int i = 0; i < nparams; i++) {
+        uint32_t inst = emit(L, BIR_PARAM, param_types[i], 0, (uint8_t)i);
+        /* Get param name */
+        uint32_t pname_n = 0;
+        uint32_t pc = ND(L, param_nodes[i])->first_child;
+        while (pc) {
+            if (ND(L, pc)->type == AST_IDENT) { pname_n = pc; break; }
+            pc = ND(L, pc)->next_sibling;
+        }
+        if (pname_n) {
+            char pname[128];
+            get_text(L, pname_n, pname, sizeof(pname));
+            /* Struct params need an alloca so member access works */
+            if (param_types[i] < L->M->num_types
+                && L->M->types[param_types[i]].kind == BIR_TYPE_STRUCT) {
+                uint32_t pt = bir_type_ptr(L->M, param_types[i], BIR_AS_PRIVATE);
+                uint32_t al = emit(L, BIR_ALLOCA, pt, 0, 0);
+                uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+                set_op(L, st, 0, BIR_MAKE_VAL(inst));
+                set_op(L, st, 1, BIR_MAKE_VAL(al));
+                add_sym(L, pname, al, param_types[i], 1);
+            } else {
+                add_sym(L, pname, BIR_MAKE_VAL(inst), param_types[i], 0);
+            }
+        }
+    }
+
+    /* Lower body */
+    uint32_t body_n = find_func_body(L, func_def);
+    if (body_n) {
+        push_scope(L);
+        lower_block_stmts(L, body_n);
+        pop_scope(L);
+    }
+
+    /* Add implicit ret void if no terminator */
+    if (!block_terminated(L)) {
+        if (is_void_type(L, ret_t))
+            emit(L, BIR_RET, bir_type_void(L->M), 0, 0);
+        else
+            emit(L, BIR_UNREACHABLE, bir_type_void(L->M), 0, 0);
+    }
+
+    pop_scope(L);
+
+    /* Set total_insts */
+    F->total_insts = L->M->num_insts - L->base_inst;
+}
+
+/* ---- Declaration Collection (Pass 1) ---- */
+
+static void collect_struct(lower_t *L, uint32_t node)
+{
+    if (L->nstructs >= MAX_STRUCTS) return;
+
+    uint32_t type_n = ND(L, node)->first_child;
+    if (!type_n) return;
+
+    struct_def_t *sd = &L->structs[L->nstructs];
+    memset(sd, 0, sizeof(*sd));
+
+    /* Name from type_spec child */
+    uint32_t name_n = ND(L, type_n)->first_child;
+    if (name_n && ND(L, name_n)->type == AST_IDENT)
+        get_text(L, name_n, sd->name, sizeof(sd->name));
+
+    /* Collect fields: children after type_n */
+    uint32_t member = ND(L, type_n)->next_sibling;
+    while (member && sd->num_fields < 16) {
+        if (ND(L, member)->type == AST_VAR_DECL) {
+            uint32_t ft_n = ND(L, member)->first_child;
+            uint32_t fn_n = ft_n ? ND(L, ft_n)->next_sibling : 0;
+
+            uint32_t ft = resolve_type(L, ft_n, ND(L, member)->d.oper.flags, 0);
+
+            if (fn_n && ND(L, fn_n)->type == AST_IDENT) {
+                /* Handle comma-separated fields: float x, y, z;
+                   Parser puts all names as siblings within one var_decl */
+                sd->field_types[sd->num_fields] = ft;
+                get_text(L, fn_n, sd->field_names[sd->num_fields],
+                         sizeof(sd->field_names[0]));
+                sd->num_fields++;
+
+                /* Additional idents in the same var_decl */
+                uint32_t extra = ND(L, fn_n)->next_sibling;
+                while (extra && ND(L, extra)->type == AST_IDENT
+                       && sd->num_fields < 16) {
+                    sd->field_types[sd->num_fields] = ft;
+                    get_text(L, extra, sd->field_names[sd->num_fields],
+                             sizeof(sd->field_names[0]));
+                    sd->num_fields++;
+                    extra = ND(L, extra)->next_sibling;
+                }
+
+                /* Check for chained var_decl siblings (different types) */
+                uint32_t chain = ND(L, member)->next_sibling;
+                while (chain && ND(L, chain)->type == AST_VAR_DECL) {
+                    uint32_t cft = ND(L, chain)->first_child;
+                    uint32_t cfn = cft ? ND(L, cft)->next_sibling : 0;
+                    if (cfn && ND(L, cfn)->type == AST_IDENT
+                        && sd->num_fields < 16) {
+                        sd->field_types[sd->num_fields] = ft;
+                        get_text(L, cfn, sd->field_names[sd->num_fields],
+                                 sizeof(sd->field_names[0]));
+                        sd->num_fields++;
+                    }
+                    member = chain; /* advance past chained */
+                    chain = ND(L, chain)->next_sibling;
+                }
+            }
+        }
+        member = ND(L, member)->next_sibling;
+    }
+
+    /* Create BIR struct type */
+    if (sd->num_fields > 0) {
+        sd->bir_type = bir_type_struct(L->M, sd->field_types, sd->num_fields);
+        L->nstructs++;
+    }
+}
+
+static void collect_enum(lower_t *L, uint32_t node)
+{
+    uint32_t c = ND(L, node)->first_child;
+    /* Skip type_spec child */
+    if (c) c = ND(L, c)->next_sibling;
+
+    int64_t next_val = 0;
+    while (c && L->nenums < MAX_ENUMS) {
+        if (ND(L, c)->type == AST_ENUMERATOR) {
+            char name[64];
+            get_text(L, c, name, sizeof(name));
+
+            /* Check for explicit value */
+            if (ND(L, c)->first_child) {
+                const ast_node_t *val_n = ND(L, ND(L, c)->first_child);
+                if (val_n->type == AST_INT_LIT)
+                    next_val = parse_int_text(L->src + val_n->d.text.offset,
+                                              (int)val_n->d.text.len);
+            }
+
+            snprintf(L->enums[L->nenums].name,
+                     sizeof(L->enums[0].name), "%s", name);
+            L->enums[L->nenums].value = next_val;
+            L->nenums++;
+            next_val++;
+        }
+        c = ND(L, c)->next_sibling;
+    }
+}
+
+static void collect_typedef(lower_t *L, uint32_t node)
+{
+    /* typedef TYPE NAME;
+       In our AST this is a VAR_DECL with QUAL_TYPEDEF */
+    if (!(ND(L, node)->qualifiers & QUAL_TYPEDEF)) return;
+    if (L->ntypedefs >= MAX_TYPEDEFS) return;
+
+    uint32_t type_n = child_at(L, node, 0);
+    uint32_t name_n = child_at(L, node, 1);
+    if (!name_n || ND(L, name_n)->type != AST_IDENT) return;
+
+    typedef_def_t *td = &L->typedefs[L->ntypedefs++];
+    get_text(L, name_n, td->name, sizeof(td->name));
+    td->bir_type = resolve_type(L, type_n, ND(L, node)->d.oper.flags, 0);
+}
+
+static void collect_global_var(lower_t *L, uint32_t node)
+{
+    uint16_t cuda = ND(L, node)->cuda_flags;
+    if (!(cuda & (CUDA_SHARED | CUDA_CONSTANT | CUDA_DEVICE))) return;
+    if (L->M->num_globals >= BIR_MAX_GLOBALS) return;
+
+    uint32_t type_n = child_at(L, node, 0);
+    uint32_t name_n = child_at(L, node, 1);
+    if (!name_n || ND(L, name_n)->type != AST_IDENT) return;
+
+    char gname[128];
+    get_text(L, name_n, gname, sizeof(gname));
+
+    uint32_t elem_t = resolve_type(L, type_n, ND(L, node)->d.oper.flags, cuda);
+
+    /* Check for array size */
+    uint32_t next = ND(L, name_n)->next_sibling;
+    int has_arr_size = 0;
+    if (next && ND(L, next)->type == AST_INT_LIT) {
+        has_arr_size = 1;
+        uint32_t count = (uint32_t)parse_int_text(
+            L->src + ND(L, next)->d.text.offset,
+            (int)ND(L, next)->d.text.len);
+        elem_t = bir_type_array(L->M, elem_t, count);
+    } else if (next && ND(L, next)->type == AST_IDENT) {
+        char aname[128];
+        get_text(L, next, aname, sizeof(aname));
+        int64_t aval;
+        if (find_enum(L, aname, &aval) || find_binding_int(L, aname, &aval)) {
+            has_arr_size = 1;
+            elem_t = bir_type_array(L->M, elem_t, (uint32_t)aval);
+        }
+    }
+
+    uint32_t gi = L->M->num_globals++;
+    bir_global_t *G = &L->M->globals[gi];
+    G->name = bir_add_string(L->M, gname, (uint32_t)strlen(gname));
+    G->type = elem_t;
+    G->initializer = BIR_VAL_NONE;
+    /* Check for literal initializer (skip past array size if present) */
+    {
+        uint32_t ic = has_arr_size ? ND(L, next)->next_sibling : next;
+        if (ic && ND(L, ic)->type == AST_INT_LIT) {
+            int64_t v = parse_int_text(L->src + ND(L, ic)->d.text.offset,
+                                       (int)ND(L, ic)->d.text.len);
+            G->initializer = BIR_MAKE_CONST(
+                bir_const_int(L->M, bir_type_int(L->M, 32), v));
+        } else if (ic && ND(L, ic)->type == AST_FLOAT_LIT) {
+            int is_f32;
+            double v = parse_float_text(L->src + ND(L, ic)->d.text.offset,
+                                        (int)ND(L, ic)->d.text.len, &is_f32);
+            uint32_t ft = is_f32 ? bir_type_float(L->M, 32)
+                                 : bir_type_float(L->M, 64);
+            G->initializer = BIR_MAKE_CONST(bir_const_float(L->M, ft, v));
+        }
+    }
+    G->cuda_flags = cuda;
+    G->is_const = (cuda & CUDA_CONSTANT) ? 1 : 0;
+
+    if (cuda & CUDA_SHARED)        G->addrspace = BIR_AS_SHARED;
+    else if (cuda & CUDA_CONSTANT) G->addrspace = BIR_AS_CONSTANT;
+    else                           G->addrspace = BIR_AS_GLOBAL;
+}
+
+static void collect_template(lower_t *L, uint32_t node)
+{
+    if (L->ntemplates >= MAX_TEMPLATES) return;
+
+    /* Find the function def inside */
+    uint32_t c = ND(L, node)->first_child;
+    uint32_t func_n = 0;
+    while (c) {
+        if (ND(L, c)->type == AST_FUNC_DEF || ND(L, c)->type == AST_FUNC_DECL) {
+            func_n = c;
+            break;
+        }
+        c = ND(L, c)->next_sibling;
+    }
+    if (!func_n) return;
+
+    /* Get function name */
+    uint32_t fn_name = child_at(L, func_n, 1);
+    if (!fn_name) return;
+
+    template_def_t *td = &L->templates[L->ntemplates++];
+    td->ast = node;
+    get_text(L, fn_name, td->name, sizeof(td->name));
+}
+
+/* ---- Template Instantiation ---- */
+
+/*
+ * Scan host main() for kernel launches and instantiate templates.
+ * For scale<<<4, 256>>>(d_data, 2.0f, 1024):
+ *   - callee = "scale"
+ *   - Deduce T from literal arguments
+ */
+static void scan_launches(lower_t *L, uint32_t node)
+{
+    if (!node) return;
+    const ast_node_t *n = ND(L, node);
+
+    if (n->type == AST_LAUNCH) {
+        uint32_t callee_n = n->first_child;
+        if (!callee_n || ND(L, callee_n)->type != AST_IDENT) goto recurse;
+
+        char cname[128];
+        get_text(L, callee_n, cname, sizeof(cname));
+
+        template_def_t *tmpl = find_template(L, cname);
+        if (!tmpl) goto recurse;
+
+        /* Deduce template type from launch arguments.
+           Skip grid and block args (children 1 and 2 of launch).
+           Actual args start after that. */
+        uint32_t arg = ND(L, callee_n)->next_sibling; /* grid */
+        if (arg) arg = ND(L, arg)->next_sibling;      /* block */
+        /* Optional shared mem and stream */
+        /* Skip to actual function args: after >>> comes () */
+        /* In AST_LAUNCH, children after grid,block,[smem],[stream] are args */
+        /* We need to find the function args. Let's skip 2 more possible. */
+        if (arg) arg = ND(L, arg)->next_sibling; /* first real arg, or smem */
+
+        /* Collect template params from AST_TEMPLATE_DECL */
+        uint32_t tmpl_node = tmpl->ast;
+        uint32_t tp = ND(L, tmpl_node)->first_child;
+        int ntparams = 0;
+        binding_t new_bindings[8];
+
+        while (tp && ND(L, tp)->type == AST_TEMPLATE_PARAM && ntparams < 8) {
+            int is_type = (ND(L, tp)->d.oper.flags == 0);
+            uint32_t tpname_n = 0;
+            uint32_t tpc = ND(L, tp)->first_child;
+            while (tpc) {
+                if (ND(L, tpc)->type == AST_IDENT) { tpname_n = tpc; break; }
+                tpc = ND(L, tpc)->next_sibling;
+            }
+
+            new_bindings[ntparams].is_type = is_type;
+            new_bindings[ntparams].type = 0;
+            new_bindings[ntparams].ival = 0;
+            if (tpname_n)
+                get_text(L, tpname_n, new_bindings[ntparams].name,
+                         sizeof(new_bindings[0].name));
+            else
+                new_bindings[ntparams].name[0] = '\0';
+
+            ntparams++;
+            tp = ND(L, tp)->next_sibling;
+        }
+
+        /* Deduce types from arguments.
+           For typename T: look at float literal args (2.0f → float) */
+        /* Find the function def to match params with template params */
+        uint32_t func_n = 0;
+        {
+            uint32_t fc = ND(L, tmpl_node)->first_child;
+            while (fc) {
+                if (ND(L, fc)->type == AST_FUNC_DEF) { func_n = fc; break; }
+                fc = ND(L, fc)->next_sibling;
+            }
+        }
+
+        if (func_n) {
+            /* Match function params against launch args to deduce T */
+            uint32_t fparam_nodes[16];
+            int nfparams = collect_params(L, func_n, fparam_nodes, 16);
+
+            /* For each function param, check if its type is a template param */
+            /* Then look at the corresponding launch arg to deduce */
+            int arg_idx = 0;
+            for (int i = 0; i < nfparams && arg; i++) {
+                uint32_t fpt = ND(L, fparam_nodes[i])->first_child;
+                if (fpt && ND(L, fpt)->type == AST_TYPE_SPEC
+                    && ND(L, fpt)->d.btype.kind == TYPE_NAME) {
+                    /* Named type — might be a template param */
+                    uint32_t fpt_name = ND(L, fpt)->first_child;
+                    if (fpt_name) {
+                        char tname[64];
+                        get_text(L, fpt_name, tname, sizeof(tname));
+                        for (int b = 0; b < ntparams; b++) {
+                            if (new_bindings[b].is_type
+                                && strcmp(new_bindings[b].name, tname) == 0
+                                && new_bindings[b].type == 0) {
+                                /* Deduce from arg */
+                                if (ND(L, arg)->type == AST_FLOAT_LIT) {
+                                    int is_f32;
+                                    parse_float_text(
+                                        L->src + ND(L, arg)->d.text.offset,
+                                        (int)ND(L, arg)->d.text.len, &is_f32);
+                                    new_bindings[b].type = is_f32
+                                        ? bir_type_float(L->M, 32)
+                                        : bir_type_float(L->M, 64);
+                                } else if (ND(L, arg)->type == AST_INT_LIT) {
+                                    new_bindings[b].type = bir_type_int(L->M, 32);
+                                } else if (ND(L, arg)->type == AST_IDENT) {
+                                    /* Look up variable type */
+                                    /* For pointers like d_data (float*),
+                                       the template param T maps to pointee */
+                                    /* Can't easily deduce without host sym table.
+                                       Default to float for now. */
+                                    new_bindings[b].type = bir_type_float(L->M, 32);
+                                }
+                            }
+                        }
+                    }
+                }
+                arg = ND(L, arg)->next_sibling;
+                arg_idx++;
+            }
+        }
+
+        /* Default unresolved type bindings to float */
+        for (int i = 0; i < ntparams; i++) {
+            if (new_bindings[i].is_type && new_bindings[i].type == 0)
+                new_bindings[i].type = bir_type_float(L->M, 32);
+        }
+
+        /* Build mangled name */
+        char mangled[256];
+        snprintf(mangled, sizeof(mangled), "%s", cname);
+        /* For template instantiation, we could add <float> suffix
+           but keep it simple — just use the base name if unique */
+
+        /* Check if already instantiated */
+        int already = 0;
+        for (uint32_t i = 0; i < L->M->num_funcs; i++) {
+            if (L->M->funcs[i].name < L->M->string_len
+                && strcmp(&L->M->strings[L->M->funcs[i].name], mangled) == 0) {
+                already = 1;
+                break;
+            }
+        }
+
+        if (!already && func_n) {
+            /* Set bindings and instantiate */
+            int old_nb = L->nbindings;
+            for (int i = 0; i < ntparams && L->nbindings < 8; i++)
+                L->bindings[L->nbindings++] = new_bindings[i];
+
+            uint16_t cuda = ND(L, func_n)->cuda_flags;
+            lower_func_body(L, func_n, cuda, mangled);
+
+            L->nbindings = old_nb;
+        }
+
+        return;
+    }
+
+recurse:
+    {
+        uint32_t c = n->first_child;
+        while (c) {
+            scan_launches(L, c);
+            c = ND(L, c)->next_sibling;
+        }
+    }
+}
+
+/* ---- Top-Level Entry Point ---- */
+
+int bir_lower(const parser_t *P, uint32_t ast_root, bir_module_t *M,
+              const sema_ctx_t *sema)
+{
+    static lower_t L_storage; /* large struct — static to avoid stack overflow */
+    lower_t *L = &L_storage;
+    memset(L, 0, sizeof(*L));
+    L->P    = P;
+    L->M    = M;
+    L->src  = P->src;
+    L->sema = sema;
+
+    bir_module_init(M);
+
+    /* Pass 1: collect declarations */
+    uint32_t c = P->nodes[ast_root].first_child;
+    while (c) {
+        const ast_node_t *n = &P->nodes[c];
+        switch (n->type) {
+        case AST_STRUCT_DEF:
+            collect_struct(L, c);
+            break;
+        case AST_ENUM_DEF:
+            collect_enum(L, c);
+            break;
+        case AST_VAR_DECL:
+            if (n->qualifiers & QUAL_TYPEDEF)
+                collect_typedef(L, c);
+            else if (n->cuda_flags & (CUDA_SHARED|CUDA_CONSTANT|CUDA_DEVICE))
+                collect_global_var(L, c);
+            break;
+        case AST_TEMPLATE_DECL:
+            collect_template(L, c);
+            break;
+        default:
+            break;
+        }
+        c = P->nodes[c].next_sibling;
+    }
+
+    /* Pass 2: lower non-template device functions */
+    c = P->nodes[ast_root].first_child;
+    while (c) {
+        const ast_node_t *n = &P->nodes[c];
+        if (n->type == AST_FUNC_DEF) {
+            uint16_t cuda = n->cuda_flags;
+            if (cuda & (CUDA_GLOBAL | CUDA_DEVICE | CUDA_HOST)) {
+                lower_func_body(L, c, cuda, NULL);
+            }
+            /* Pure host functions (no CUDA qualifier) skipped for lowering
+               but scanned for launches below */
+        }
+        c = P->nodes[c].next_sibling;
+    }
+
+    /* Pass 3: scan host functions for kernel launches → instantiate templates */
+    c = P->nodes[ast_root].first_child;
+    while (c) {
+        const ast_node_t *n = &P->nodes[c];
+        if (n->type == AST_FUNC_DEF && !(n->cuda_flags & (CUDA_GLOBAL|CUDA_DEVICE))) {
+            /* Host function — scan for launches */
+            uint32_t body = find_func_body(L, c);
+            if (body) scan_launches(L, body);
+        }
+        c = P->nodes[c].next_sibling;
+    }
+
+    /* Report errors */
+    if (L->nerrors > 0) {
+        for (int i = 0; i < L->nerrors; i++) {
+            fprintf(stderr, "lower: %u:%u: %s\n",
+                    L->errors[i].loc.line, L->errors[i].loc.col,
+                    L->errors[i].msg);
+        }
+        return BC_ERR_LOWER;
+    }
+
+    return BC_OK;
+}
