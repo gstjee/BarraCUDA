@@ -227,5 +227,17 @@ Based in New Zealand, where it's already tomorrow and the GPUs are just as confu
 
 Apache 2.0. Do whatever you want. If this compiler somehow ends up in production, I'd love to hear about it, mostly so I can update my LinkedIn with something more interesting than wrote a CUDA compiler for fun.
 
+## Acknowledgements
+
+- **Steven Muchnick** for *Advanced Compiler Design and Implementation*. If this compiler does anything right, that book is why.
+- **Low Level** for the Zero to Hero C course and the YouTube channel. That's where I learnt C.
+- **Abe Kornelis** for being an amazing teacher. His work on the [z390 Portable Mainframe Assembler](https://github.com/z390development/z390) project is well worth your time.
+- To the people who've sent messages of kindness and critique, thank you from a forever student and a happy hobbyist.
+- My Granny, Grandad, Nana and Baka. Love you x
+
+*He aha te mea nui o te ao. He tāngata, he tāngata, he tāngata.*
+
+What is the most important thing in the world? It is people, it is people, it is people.
+
 ---
 
