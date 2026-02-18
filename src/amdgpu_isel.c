@@ -49,6 +49,9 @@ static struct {
     uint32_t        suppress_src;   /* BIR block whose BR to suppress */
     uint32_t        suppress_dst;   /* target BIR block of the suppressed BR */
 
+    /* Saved thread IDs: v0/v1/v2 must be copied before param loads clobber them */
+    uint32_t        saved_tid[3];   /* virtual VGPR holding saved threadIdx.x/y/z */
+
     /* Block mapping: BIR block index -> machine block index */
     uint32_t        block_map[BIR_MAX_BLOCKS];
 } S;
@@ -714,9 +717,14 @@ static void isel_icmp(uint32_t idx, const bir_inst_t *I, int div)
         uint16_t vcmp = icmp_to_vcmp(I->subop);
         /* VOPC writes VCC implicitly */
         emit0_2(vcmp, vs0, vs1);
-        /* Materialize: vDst = vcc ? 1 : 0 */
+        /* Materialize: vDst = vcc ? 1 : 0.
+           VOP2 VSRC1 must be a VGPR — literals there silently become v0.
+           Ask me how I know. */
+        uint32_t one_vr = new_vreg(1);
+        emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)one_vr), mop_imm(1));
         emit3(AMD_V_CNDMASK_B32, mop_vreg_v((uint16_t)vr),
-              mop_imm(0), mop_imm(1), mop_special(AMD_SPEC_VCC));
+              mop_imm(0), mop_vreg_v((uint16_t)one_vr),
+              mop_special(AMD_SPEC_VCC));
     } else {
         /* SOPC: s_cmp_* sets SCC. Materialize via s_cselect_b32 */
         uint16_t scmp = icmp_to_scmp(I->subop);
@@ -733,8 +741,11 @@ static void isel_fcmp(uint32_t idx, const bir_inst_t *I)
     uint32_t vr = map_bir_val(idx, 1);
     uint16_t vcmp = fcmp_to_vcmp(I->subop);
     emit0_2(vcmp, src0, src1);
+    uint32_t one_vr = new_vreg(1);
+    emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)one_vr), mop_imm(1));
     emit3(AMD_V_CNDMASK_B32, mop_vreg_v((uint16_t)vr),
-          mop_imm(0), mop_imm(1), mop_special(AMD_SPEC_VCC));
+          mop_imm(0), mop_vreg_v((uint16_t)one_vr),
+          mop_special(AMD_SPEC_VCC));
 }
 
 static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
@@ -1132,7 +1143,8 @@ static void isel_br_cond(const bir_inst_t *I, int cond_div)
            Nature's way of saying "why not both?" */
         moperand_t cond = resolve_val(I->operands[0], 1);
         moperand_t vcond = ensure_vgpr(cond);
-        emit0_2(AMD_V_CMP_NE_U32, vcond, mop_imm(0));
+        /* VOPC: immediate must be SRC0 (VSRC1 is VGPR-only). NE is commutative. */
+        emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);
 
         uint32_t saved = new_vreg(0);
         emit1(AMD_S_AND_SAVEEXEC_B32, mop_vreg_s((uint16_t)saved),
@@ -1293,9 +1305,13 @@ static void isel_thread_model(uint32_t idx, const bir_inst_t *I)
 
     switch (I->op) {
     case BIR_THREAD_ID: {
-        /* v0/v1/v2: pre-loaded thread IDs */
+        /* Use saved copies — originals may have been clobbered by param loads */
         uint32_t vr = map_bir_val(idx, 1);
-        emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_vgpr((uint16_t)dim));
+        if (S.is_kernel && dim < 3)
+            emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr),
+                  mop_vreg_v((uint16_t)S.saved_tid[dim]));
+        else
+            emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_vgpr((uint16_t)dim));
         break;
     }
     case BIR_BLOCK_ID: {
@@ -1437,16 +1453,16 @@ static void isel_warp(uint32_t idx, const bir_inst_t *I)
         break;
     }
     case BIR_BALLOT: {
-        /* v_cmp_ne_u32 vcc, pred, 0; v_mov_b32 vDst, vcc */
+        /* v_cmp_ne_u32 vcc, 0, pred; v_mov_b32 vDst, vcc */
         moperand_t pred = ensure_vgpr(resolve_val(I->operands[0], 1));
-        emit0_2(AMD_V_CMP_NE_U32, pred, mop_imm(0));
+        emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), pred);
         emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_special(AMD_SPEC_VCC));
         break;
     }
     case BIR_VOTE_ANY: {
-        /* v_cmp_ne_u32 vcc, pred, 0; s_cmp_ne vcc, 0; materialize SCC */
+        /* v_cmp_ne_u32 vcc, 0, pred; s_cmp_ne vcc, 0; materialize SCC */
         moperand_t pred = ensure_vgpr(resolve_val(I->operands[0], 1));
-        emit0_2(AMD_V_CMP_NE_U32, pred, mop_imm(0));
+        emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), pred);
         /* Check if VCC != 0 (any lane true) */
         uint32_t sv = new_vreg(0);
         emit1(AMD_V_READFIRSTLANE_B32, mop_vreg_s((uint16_t)sv), mop_special(AMD_SPEC_VCC));
@@ -1462,9 +1478,9 @@ static void isel_warp(uint32_t idx, const bir_inst_t *I)
         break;
     }
     case BIR_VOTE_ALL: {
-        /* v_cmp_ne vcc, pred, 0; check vcc == exec */
+        /* v_cmp_ne vcc, 0, pred; check vcc == exec */
         moperand_t pred = ensure_vgpr(resolve_val(I->operands[0], 1));
-        emit0_2(AMD_V_CMP_NE_U32, pred, mop_imm(0));
+        emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), pred);
         uint32_t sv = new_vreg(0);
         emit1(AMD_V_READFIRSTLANE_B32, mop_vreg_s((uint16_t)sv), mop_special(AMD_SPEC_VCC));
         emit0_2(AMD_S_CMP_EQ_U32, mop_vreg_s((uint16_t)sv), mop_special(AMD_SPEC_EXEC));
@@ -1491,9 +1507,9 @@ static void isel_select(uint32_t idx, const bir_inst_t *I, int div)
     uint32_t vr = map_bir_val(idx, div);
 
     if (div) {
-        /* v_cmp_ne_u32 vcc, cond, 0; v_cndmask_b32 dst, false, true, vcc */
+        /* v_cmp_ne_u32 vcc, 0, cond; v_cndmask_b32 dst, false, true, vcc */
         moperand_t vcond = ensure_vgpr(cond);
-        emit0_2(AMD_V_CMP_NE_U32, vcond, mop_imm(0));
+        emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);
         emit3(AMD_V_CNDMASK_B32, mop_vreg_v((uint16_t)vr),
               ensure_vgpr(vfalse), ensure_vgpr(vtrue), mop_special(AMD_SPEC_VCC));
     } else {
@@ -1614,6 +1630,16 @@ static void isel_function(uint32_t fi)
                       mop_special(AMD_SPEC_EXEC), mop_vreg_s(sv));
                 /* Pop the region */
                 S.div_depth--;
+            }
+        }
+
+        /* Save hardware thread IDs before params can clobber v0/v1/v2.
+           First block of kernel only — like saving the black box before takeoff. */
+        if (bi == 0 && S.is_kernel) {
+            for (uint32_t d = 0; d < 3; d++) {
+                S.saved_tid[d] = new_vreg(1);
+                emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)S.saved_tid[d]),
+                      mop_vgpr((uint16_t)d));
             }
         }
 

@@ -1423,9 +1423,9 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         /* compute_pgm_rsrc2 */
         kd.compute_pgm_rsrc2 = ((F->scratch_bytes > 0) ? 1u : 0u) | /* SCRATCH_EN */
                                (4u << 1) |   /* USER_SGPR_COUNT = 4 (dispatch_ptr + kernarg_ptr) */
-                               (1u << 11) |  /* TGID_X_EN */
-                               (1u << 12) |  /* TGID_Y_EN */
-                               (1u << 13);   /* TGID_Z_EN */
+                               (1u << 7) |   /* TGID_X_EN */
+                               (1u << 8) |   /* TGID_Y_EN */
+                               (1u << 9);    /* TGID_Z_EN */
 
         /* kernel_code_properties */
         kd.kernel_code_properties = (1u << 0) |  /* ENABLE_SGPR_DISPATCH_PTR */
