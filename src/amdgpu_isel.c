@@ -52,6 +52,9 @@ static struct {
     /* Saved thread IDs: v0/v1/v2 must be copied before param loads clobber them */
     uint32_t        saved_tid[3];   /* virtual VGPR holding saved threadIdx.x/y/z */
 
+    /* Hidden kernarg offset for __device__/__constant__ global pointers */
+    uint32_t        hkrarg;
+
     /* Block mapping: BIR block index -> machine block index */
     uint32_t        block_map[BIR_MAX_BLOCKS];
 } S;
@@ -1113,6 +1116,29 @@ static void isel_shared_alloc(uint32_t idx, const bir_inst_t *I)
     S.lds_offset += sz;
 }
 
+static void isel_global_ref(uint32_t idx, const bir_inst_t *I)
+{
+    /* Hidden kernarg: 64-bit pointer appended after explicit params.
+       Load into SGPR pair for saddr, VGPR gets zero offset. */
+    uint32_t offst = S.hkrarg;
+    S.hkrarg += 8;
+
+    uint16_t sbase = S.next_param_sgpr;
+    if (sbase & 1) sbase++;
+    if (sbase + 1 >= AMD_MAX_SGPRS) return;
+    S.next_param_sgpr = sbase + 2;
+
+    emit2(AMD_S_LOAD_DWORDX2, mop_sgpr(sbase),
+          mop_sgpr(AMD_SGPR_KERNARG_LO), mop_imm((int32_t)offst));
+    emit0_0(AMD_S_WAITCNT, AMD_WAIT_LGKMCNT0);
+    S.amd->val_sbase[idx] = sbase;
+
+    uint32_t vr = map_bir_val(idx, 1);
+    S.amd->val_file[idx] = 1;
+    S.amd->reg_file[vr] = 1;
+    emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_imm(0));
+}
+
 static void isel_branch(const bir_inst_t *I)
 {
     uint32_t target_bir = I->operands[0];
@@ -1558,6 +1584,7 @@ static void isel_function(uint32_t fi)
     S.is_kernel = (F->cuda_flags & CUDA_GLOBAL) ? 1 : 0;
     S.scratch_offset = 0;
     S.lds_offset = 0;
+    S.hkrarg = F->num_params * 8;
     S.div_depth = 0;
     S.suppress_src = 0xFFFFFFFF;
     S.suppress_dst = 0xFFFFFFFF;
@@ -1692,6 +1719,9 @@ static void isel_function(uint32_t fi)
             case BIR_SHARED_ALLOC:
                 isel_shared_alloc(idx, I);
                 break;
+            case BIR_GLOBAL_REF:
+                isel_global_ref(idx, I);
+                break;
 
             /* Control flow */
             case BIR_BR:
@@ -1778,6 +1808,7 @@ static void isel_function(uint32_t fi)
 
     MF->num_blocks = (uint16_t)(A->num_mblocks - MF->first_block);
     MF->scratch_bytes = S.scratch_offset;
+    MF->kernarg_bytes = S.hkrarg;
     MF->lds_bytes = S.lds_offset;
     MF->first_alloc_sgpr = S.next_param_sgpr;
 }

@@ -145,10 +145,7 @@ All data structures use pre-allocated fixed-size arrays. No malloc in hot paths.
 
 Being honest about limitations is important. Here's what's missing:
 
-- `const` qualifier
-- `__constant__` memory
 - 2D array declarations in shared memory (`__shared__ float a[16][16]`, flatten to 1D)
-- Integer literal suffixes (`0xFFu`, `1ULL`)
 - Parameter reassignment in `__device__` functions (use local variables)
 - Textures and surfaces
 - Dynamic parallelism (device-side kernel launch)

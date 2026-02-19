@@ -221,6 +221,17 @@ static void print_inst(const bir_module_t *M, const bir_inst_t *I,
             fprintf(out, ", align %u", 1u << I->subop);
         break;
 
+    /* global_ref: @name (subop = global index) */
+    case BIR_GLOBAL_REF: {
+        uint32_t gi = I->subop;
+        bir_type_str(M, I->type, tbuf, sizeof(tbuf));
+        if (gi < M->num_globals)
+            fprintf(out, " %s, @%s", tbuf, &M->strings[M->globals[gi].name]);
+        else
+            fprintf(out, " %s, @?", tbuf);
+        break;
+    }
+
     /* Load: [volatile] TYPE, %ptr */
     case BIR_LOAD:
         if (I->subop) fprintf(out, " volatile");

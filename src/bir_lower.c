@@ -733,19 +733,22 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
 
         sym_t *s = find_sym(L, name);
         if (!s) {
-            /* Check file-scope globals (__shared__, __device__, etc.) */
+            /* Check file-scope globals (__shared__, __device__, __constant__) */
             for (uint32_t gi = 0; gi < L->M->num_globals; gi++) {
                 bir_global_t *G = &L->M->globals[gi];
                 if (G->name < L->M->string_len
                     && strcmp(&L->M->strings[G->name], name) == 0) {
+                    int adrspc = G->addrspace;
+                    uint32_t ptr_t = bir_type_ptr(L->M, G->type, adrspc);
                     if (G->cuda_flags & CUDA_SHARED) {
-                        /* Materialize shared alloc into current function */
-                        uint32_t ptr_t = bir_type_ptr(L->M, G->type,
-                                                      BIR_AS_SHARED);
                         uint32_t sa = emit(L, BIR_SHARED_ALLOC, ptr_t, 0, 0);
                         add_sym(L, name, sa, G->type, 1);
-                        s = find_sym(L, name);
+                    } else {
+                        uint32_t gr = emit(L, BIR_GLOBAL_REF, ptr_t, 0,
+                                           (uint8_t)gi);
+                        add_sym(L, name, gr, G->type, 1);
                     }
+                    s = find_sym(L, name);
                     break;
                 }
             }

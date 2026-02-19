@@ -43,6 +43,7 @@ static const char *op_names[BIR_OP_COUNT] = {
 
     [BIR_ALLOCA]        = "alloca",
     [BIR_SHARED_ALLOC]  = "shared_alloc",
+    [BIR_GLOBAL_REF]    = "global_ref",
     [BIR_LOAD]          = "load",
     [BIR_STORE]         = "store",
     [BIR_GEP]           = "gep",
