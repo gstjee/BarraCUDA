@@ -715,6 +715,7 @@ static uint32_t parse_type_spec(parser_t *P, uint16_t *quals, uint16_t *cuda)
             break;
         }
         else if (t == TOK_IDENT) {
+            if (got_type) break;
             n->d.btype.kind = TYPE_NAME;
             uint32_t name = alloc_node(P, AST_IDENT);
             P->nodes[name].d.text.offset = cur(P)->offset;

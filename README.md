@@ -147,8 +147,6 @@ All data structures use pre-allocated fixed-size arrays. No malloc in hot paths.
 
 Being honest about limitations is important. Here's what's missing:
 
-- `unsigned` as a bare type specifier (use `unsigned int` or just `int`)
-- `+=`, `-=`, `>>=` and friends (compound assignment, spell it out for now)
 - `const` qualifier
 - `__constant__` memory
 - 2D array declarations in shared memory (`__shared__ float a[16][16]`, flatten to 1D)
@@ -180,7 +178,7 @@ None of these are architectural blockers. They're all "haven't got round to it y
 
 ### Near Term: Hardening
 
-Fix the known gaps: compound assignment operators, bare `unsigned`, integer literal suffixes, `const`, parameter reassignment. These are all small parser/lowerer changes. The goal is to compile real-world `.cu` files without modifications.
+Fix the known gaps: integer literal suffixes, `const`, parameter reassignment. These are all small parser/lowerer changes. The goal is to compile real-world `.cu` files without modifications.
 
 ### Medium Term: Optimisation
 
