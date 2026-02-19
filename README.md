@@ -74,7 +74,7 @@ make
 
 ## What Works
 
-This isn't a toy. The following CUDA features compile to working GFX11 machine code:
+ The following CUDA features compile to working GFX11 machine code:
 
 ### Core Language
 - `__global__`, `__device__`, `__host__` function qualifiers
@@ -121,7 +121,7 @@ $ ./barracuda --amdgpu-bin vector_add.cu -o vector_add.hsaco
 wrote vector_add.hsaco (528 bytes code, 1 kernels)
 ```
 
-528 bytes. One kernel. Zero LLVM.
+No LLVM required :-) 
 
 ## Architecture
 
@@ -145,12 +145,7 @@ All data structures use pre-allocated fixed-size arrays. No malloc in hot paths.
 
 Being honest about limitations is important. Here's what's missing:
 
-- `unsigned` as a bare type specifier (use `unsigned int` or just `int`)
-- `+=`, `-=`, `>>=` and friends (compound assignment, spell it out for now)
-- `const` qualifier
-- `__constant__` memory
 - 2D array declarations in shared memory (`__shared__ float a[16][16]`, flatten to 1D)
-- Integer literal suffixes (`0xFFu`, `1ULL`)
 - Parameter reassignment in `__device__` functions (use local variables)
 - Textures and surfaces
 - Dynamic parallelism (device-side kernel launch)
@@ -178,7 +173,7 @@ None of these are architectural blockers. They're all "haven't got round to it y
 
 ### Near Term: Hardening
 
-Fix the known gaps: compound assignment operators, bare `unsigned`, integer literal suffixes, `const`, parameter reassignment. These are all small parser/lowerer changes. The goal is to compile real-world `.cu` files without modifications.
+Fix the known gaps: integer literal suffixes, `const`, parameter reassignment. These are all small parser/lowerer changes. The goal is to compile real-world `.cu` files without modifications.
 
 ### Medium Term: Optimisation
 
@@ -233,6 +228,18 @@ Based in New Zealand, where it's already tomorrow and the GPUs are just as confu
 ## License
 
 Apache 2.0. Do whatever you want. If this compiler somehow ends up in production, I'd love to hear about it, mostly so I can update my LinkedIn with something more interesting than wrote a CUDA compiler for fun.
+
+## Acknowledgements
+
+- **Steven Muchnick** for *Advanced Compiler Design and Implementation*. If this compiler does anything right, that book is why.
+- **Low Level** for the Zero to Hero C course and the YouTube channel. That's where I learnt C.
+- **Abe Kornelis** for being an amazing teacher. His work on the [z390 Portable Mainframe Assembler](https://github.com/z390development/z390) project is well worth your time.
+- To the people who've sent messages of kindness and critique, thank you from a forever student and a happy hobbyist.
+- My Granny, Grandad, Nana and Baka. Love you x
+
+*He aha te mea nui o te ao. He tāngata, he tāngata, he tāngata.*
+
+What is the most important thing in the world? It is people, it is people, it is people.
 
 ---
 
