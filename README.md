@@ -1,6 +1,6 @@
 # BarraCUDA
 
-An open-source CUDA compiler that targets AMD GPUs, with more architectures planned. Written in 15,000 lines of C99. Zero LLVM dependency. Compiles `.cu` files straight to GFX11 machine code and spits out ELF `.hsaco` binaries that AMD GPUs can actually run.
+An open-source CUDA C++ compiler written from scratch in C99 that takes `.cu` files and compiles them to AMD GPU machine code, with more architectures planned. No LLVM, no dependencies, and no permission asked.
 
 This is what happens when you look at NVIDIA's walled garden and think "how hard can it be?" The answer is: quite hard, actually, but I did it anyway.
 
