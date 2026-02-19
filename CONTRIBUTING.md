@@ -36,7 +36,7 @@ Humour is welcome. Arrogance is not.
 
 Check `Issues` for current priorities. At time of writing, the most impactful areas are:
 
-- **Language features:** Compound assignment (`+=`), bare `unsigned`, literal suffixes, `const`, parameter reassignment
+- **Language features:** bare `unsigned`, literal suffixes, `const`, parameter reassignment
 - **Backend work:** New architecture targets (see below)
 - **Test cases:** Real CUDA kernels that break things are genuinely valuable
 
