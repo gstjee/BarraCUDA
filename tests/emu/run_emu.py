@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BarraCUDA RDNA3 emulator harness. Powered by tinygrad's mockgpu."""
+"""BarraCUDA RDNA3/RDNA4 emulator harness. Powered by tinygrad's mockgpu."""
 import struct, sys, ctypes, os
 
 TGDIR = os.environ.get('TINYGRAD_PATH', '')
@@ -12,6 +12,9 @@ LIBC  = ctypes.CDLL("libc.so.6")
 LIBC.mmap.restype  = ctypes.c_void_p
 LIBC.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+
+# ELF e_flags → tinygrad arch string
+ARCHM = { 0x41: "rdna3", 0x48: "rdna4" }
 
 def lo_mem(NBYTE):
     """mmap in low address space (MAP_32BIT)."""
@@ -31,41 +34,53 @@ def asm_dw(*DWORD):
 
 # ---- Smoke Tests (IPL Checks) ----
 
-def ipl1():
+def ipl1(ARCHV="rdna3"):
     """IPL1: s_endpgm only. Verify basic dispatch/terminate."""
     CADDR, CSIZ = asm_dw(0xBFB00000)
-    RETCD = run_asm(CADDR, CSIZ, 1, 1, 1, 32, 1, 1, 0, 0x08, 0, "rdna3", [0, 0])
+    RETCD = run_asm(CADDR, CSIZ, 1, 1, 1, 32, 1, 1, 0, 0x08, 0, ARCHV, [0, 0])
     PASSD = "PASS" if RETCD == 0 else "FAIL"
     print(f"  IPL1 s_endpgm:         {PASSD} (rc={RETCD})")
     return RETCD == 0
 
-def ipl2():
+def ipl2(ARCHV="rdna3"):
     """IPL2: store 42.0f via VOP1 + global_store (SADDR=null)."""
     MEMSZ = 4096
     MBASE = lo_mem(MEMSZ)
     OUTBF = (ctypes.c_float * 1).from_address(MBASE)
     OUTBF[0] = 0.0
 
-    # v_mov_b32 v1, s0        (lo addr into v1)
-    # v_mov_b32 v2, s1        (hi addr into v2)
-    # v_mov_b32 v3, 42.0f
-    # global_store_dword v[1:2], v3, off  (SADDR=null=0x7C)
-    # s_endpgm
-    CADDR, CSIZ = asm_dw(
-        0x7E020200,             # v_mov_b32 v1, s0
-        0x7E040201,             # v_mov_b32 v2, s1
-        0x7E0602FF, 0x42280000, # v_mov_b32 v3, 42.0f (literal)
-        0xDC6A0000, 0x007C0301, # global_store_dword SADDR=null VADDR=v1 DATA=v3
-        0xBFB00000,             # s_endpgm
-    )
+    if ARCHV == "rdna4":
+        # GFX12: 96-bit global_store_b32 (OP at [21:14] per AMD ISA XML)
+        # v_mov_b32 v1, s0 / v2, s1 / v3, 42.0f
+        # global_store_b32 v[1:2], v3, off  (3 dwords: enc|op|saddr, vsrc, vaddr)
+        GSTD0 = (0xEE << 24) | (0x1A << 14) | 0x7C  # enc=GLOBAL OP=STORE_B32 SADDR=null
+        GSTD1 = (3 << 23)                             # VSRC=v3
+        GSTD2 = 1                                     # VADDR=v1
+        CADDR, CSIZ = asm_dw(
+            0x7E020200,             # v_mov_b32 v1, s0
+            0x7E040201,             # v_mov_b32 v2, s1
+            0x7E0602FF, 0x42280000, # v_mov_b32 v3, 42.0f (literal)
+            GSTD0, GSTD1, GSTD2,   # global_store_b32 v[1:2], v3, off
+            0xBFB00000,             # s_endpgm
+        )
+    else:
+        # GFX11: 64-bit global_store_dword
+        CADDR, CSIZ = asm_dw(
+            0x7E020200,             # v_mov_b32 v1, s0
+            0x7E040201,             # v_mov_b32 v2, s1
+            0x7E0602FF, 0x42280000, # v_mov_b32 v3, 42.0f (literal)
+            0xDC6A0000, 0x007C0301, # global_store_dword SADDR=null VADDR=v1 DATA=v3
+            0xBFB00000,             # s_endpgm
+        )
+
     USRDT = [MBASE & 0xFFFFFFFF, (MBASE >> 32) & 0xFFFFFFFF]
-    RETCD = run_asm(CADDR, CSIZ, 1, 1, 1, 1, 1, 1, 0, 0x08, 0, "rdna3", USRDT)
+    RETCD = run_asm(CADDR, CSIZ, 1, 1, 1, 1, 1, 1, 0, 0x08, 0, ARCHV, USRDT)
     GVAL  = OUTBF[0]
     PASSD = "PASS" if (RETCD == 0 and abs(GVAL - 42.0) < 1e-5) else "FAIL"
     print(f"  IPL2 vop1+gstore:      {PASSD} (rc={RETCD}, got={GVAL})")
     return RETCD == 0 and abs(GVAL - 42.0) < 1e-5
 
-def ipl3():
+def ipl3(ARCHV="rdna3"):
     """IPL3: s_load_dwordx2 + global_store. Full SMEM pipeline."""
     MEMSZ = 4096
     MBASE = lo_mem(MEMSZ)
@@ -77,31 +92,44 @@ def ipl3():
     OUTBF[0] = 0.0
     struct.pack_into('<Q', (ctypes.c_uint8 * 8).from_address(KARGP), 0, OUTAD)
 
-    # s_load_dwordx2 s[4:5], s[0:1], 0   (load ptr from kernarg)
-    # s_waitcnt lgkmcnt(0)
-    # v_mov_b32 v1, 0                     (zero VGPR offset)
-    # v_mov_b32 v2, 0x42280000            (42.0f)
-    # global_store_dword v1, v2, s[4:5]   (SADDR=s4, VADDR=v1, DATA=v2)
-    # s_endpgm
+    if ARCHV == "rdna4":
+        # GFX12 SMEM: OP at [18:13] (6-bit), 24-bit IOFFSET
+        SMLD0 = (0x3D << 26) | (0x01 << 13) | (4 << 6) | 0
+        SMLD1 = (0x7C << 25) | 0
 
-    # encode s_load_dwordx2 s[4:5], s[0:1], 0
-    SMLD0 = (0x3D << 26) | (0x01 << 18) | (4 << 6) | 0
-    SMLD1 = (0x7C << 25) | 0
+        # GFX12 global_store_b32 v1, v2, s[4:5] — 96-bit (OP at [21:14])
+        GSTD0 = (0xEE << 24) | (0x1A << 14) | 4
+        GSTD1 = (2 << 23)      # VSRC=v2
+        GSTD2 = 1              # VADDR=v1
 
-    # encode global_store_dword v1, v2, s[4:5]
-    GSTD0 = (0x37 << 26) | (0x1A << 18) | (2 << 16)
-    GSTD1 = (0 << 24) | (4 << 16) | (2 << 8) | 1
+        CADDR, CSIZ = asm_dw(
+            SMLD0, SMLD1,           # s_load_dwordx2 s[4:5], s[0:1], 0
+            0xBFC70000,             # s_wait_kmcnt 0x0
+            0x7E020280,             # v_mov_b32 v1, 0
+            0x7E0402FF, 0x42280000, # v_mov_b32 v2, 42.0f
+            GSTD0, GSTD1, GSTD2,   # global_store_b32 v1, v2, s[4:5]
+            0xBFB00000,             # s_endpgm
+        )
+    else:
+        # GFX11 SMEM: OP at [25:18] (8-bit), 21-bit offset
+        SMLD0 = (0x3D << 26) | (0x01 << 18) | (4 << 6) | 0
+        SMLD1 = (0x7C << 25) | 0
 
-    CADDR, CSIZ = asm_dw(
-        SMLD0, SMLD1,           # s_load_dwordx2 s[4:5], s[0:1], 0
-        0xBF89FC07,             # s_waitcnt lgkmcnt(0)
-        0x7E020280,             # v_mov_b32 v1, 0
-        0x7E0402FF, 0x42280000, # v_mov_b32 v2, 42.0f
-        GSTD0, GSTD1,          # global_store_dword v1, v2, s[4:5]
-        0xBFB00000,             # s_endpgm
-    )
+        # GFX11 global_store_dword v1, v2, s[4:5] — 64-bit
+        GSTD0 = (0x37 << 26) | (0x1A << 18) | (2 << 16)
+        GSTD1 = (0 << 24) | (4 << 16) | (2 << 8) | 1
+
+        CADDR, CSIZ = asm_dw(
+            SMLD0, SMLD1,           # s_load_dwordx2 s[4:5], s[0:1], 0
+            0xBF89FC07,             # s_waitcnt lgkmcnt(0)
+            0x7E020280,             # v_mov_b32 v1, 0
+            0x7E0402FF, 0x42280000, # v_mov_b32 v2, 42.0f
+            GSTD0, GSTD1,          # global_store_dword v1, v2, s[4:5]
+            0xBFB00000,             # s_endpgm
+        )
+
     USRDT = [KARGP & 0xFFFFFFFF, (KARGP >> 32) & 0xFFFFFFFF]
-    RETCD = run_asm(CADDR, CSIZ, 1, 1, 1, 1, 1, 1, 0, 0x08, 0, "rdna3", USRDT)
+    RETCD = run_asm(CADDR, CSIZ, 1, 1, 1, 1, 1, 1, 0, 0x08, 0, ARCHV, USRDT)
     GVAL  = OUTBF[0]
     PASSD = "PASS" if (RETCD == 0 and abs(GVAL - 42.0) < 1e-5) else "FAIL"
     print(f"  IPL3 smem+gstore:      {PASSD} (rc={RETCD}, got={GVAL})")
@@ -130,6 +158,11 @@ def prs_elf(FDATA):
             return FDATA[TXOFF : TXOFF + TXSIZ]
     raise ValueError("no .text")
 
+def prs_arch(FDATA):
+    """Extract arch from ELF e_flags. Returns 'rdna3' or 'rdna4'."""
+    EFLGS = struct.unpack_from('<I', FDATA, 48)[0]
+    return ARCHM.get(EFLGS, "rdna3")
+
 def prs_kd(TXDAT):
     """Parse 64-byte kernel descriptor."""
     LDSSZ = struct.unpack_from('<I', TXDAT, 0)[0]
@@ -141,7 +174,7 @@ def prs_kd(TXDAT):
 
 # ---- vectorAdd Execution ----
 
-def run_vadd(TXDAT, RSRC2, SCRSZ):
+def run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV="rdna3"):
     """Execute vectorAdd and verify every element."""
     KCODE = TXDAT[256:]
     KCSIZ = len(KCODE)
@@ -158,13 +191,13 @@ def run_vadd(TXDAT, RSRC2, SCRSZ):
 
     AADDR = MBASE
     BADDR = MBASE + FSIZE
-    CADDR2 = MBASE + FSIZE * 2
+    CADR2 = MBASE + FSIZE * 2
     KAOFF = MBASE + FSIZE * 3
     DPOFF = KAOFF + 32
 
     BUFA  = (ctypes.c_float * NELMS).from_address(AADDR)
     BUFB  = (ctypes.c_float * NELMS).from_address(BADDR)
-    BUFC  = (ctypes.c_float * NELMS).from_address(CADDR2)
+    BUFC  = (ctypes.c_float * NELMS).from_address(CADR2)
     KARGS = (ctypes.c_uint8 * 32).from_address(KAOFF)
     DSPKT = (ctypes.c_uint8 * 64).from_address(DPOFF)
 
@@ -173,11 +206,11 @@ def run_vadd(TXDAT, RSRC2, SCRSZ):
         BUFB[i] = float(i * 2)
         BUFC[i] = 0.0
 
-    print(f"  bufa=0x{AADDR:016x} bufb=0x{BADDR:016x} bufc=0x{CADDR2:016x}")
+    print(f"  bufa=0x{AADDR:016x} bufb=0x{BADDR:016x} bufc=0x{CADR2:016x}")
 
     struct.pack_into('<Q', KARGS, 0,  AADDR)
     struct.pack_into('<Q', KARGS, 8,  BADDR)
-    struct.pack_into('<Q', KARGS, 16, CADDR2)
+    struct.pack_into('<Q', KARGS, 16, CADR2)
     struct.pack_into('<I', KARGS, 24, NELMS)
 
     struct.pack_into('<H', DSPKT, 4,  BKSIZ)
@@ -193,7 +226,7 @@ def run_vadd(TXDAT, RSRC2, SCRSZ):
     ]
 
     RETCD = run_asm(CADDR, KCSIZ, NGRPS, 1, 1, BKSIZ, 1, 1,
-                    KAOFF, RSRC2, SCRSZ, "rdna3", USRDT)
+                    KAOFF, RSRC2, SCRSZ, ARCHV, USRDT)
     if RETCD != 0:
         return RETCD, 0, NELMS
 
@@ -218,19 +251,21 @@ def main():
         print(f"usage: {sys.argv[0]} <file.hsaco>", file=sys.stderr)
         return 1
 
-    print("=== IPL checks (smoke tests) ===")
-    TPAS1 = ipl1()
-    TPAS2 = ipl2()
-    TPAS3 = ipl3()
+    with open(sys.argv[1], 'rb') as f:
+        FDATA = f.read()
+
+    ARCHV = prs_arch(FDATA)
+
+    print(f"=== IPL checks ({ARCHV}) ===")
+    TPAS1 = ipl1(ARCHV)
+    TPAS2 = ipl2(ARCHV)
+    TPAS3 = ipl3(ARCHV)
 
     if not TPAS1:
         print("ABORT: emulator cannot even s_endpgm. Check tinygrad install.")
         return 1
 
-    print(f"\n=== vectorAdd ===")
-    with open(sys.argv[1], 'rb') as f:
-        FDATA = f.read()
-
+    print(f"\n=== vectorAdd ({ARCHV}) ===")
     TXDAT = prs_elf(FDATA)
     RSRC1, RSRC2, KASIZ, LDSSZ, SCRSZ = prs_kd(TXDAT)
     KCSIZ = len(TXDAT) - 256
@@ -238,7 +273,7 @@ def main():
     print(f"  rsrc1=0x{RSRC1:08x} rsrc2=0x{RSRC2:08x} "
           f"kernarg={KASIZ} lds={LDSSZ} scratch={SCRSZ} code={KCSIZ}B")
 
-    RETCD, NFAIL, NELMS = run_vadd(TXDAT, RSRC2, SCRSZ)
+    RETCD, NFAIL, NELMS = run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV)
 
     if RETCD != 0:
         print(f"FAIL: emulator rc={RETCD}")
@@ -247,7 +282,7 @@ def main():
         print(f"FAIL: {NFAIL}/{NELMS} elements wrong")
         return 1
 
-    print(f"PASS: vectorAdd {NELMS} elements verified")
+    print(f"PASS: vectorAdd {NELMS} elements verified ({ARCHV})")
     return 0
 
 if __name__ == '__main__':

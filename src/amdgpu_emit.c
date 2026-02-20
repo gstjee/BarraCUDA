@@ -1146,15 +1146,16 @@ static void encode_flat_global(amd_module_t *A, const minst_t *mi, uint16_t hw_o
 
     if (A->target >= AMD_TARGET_GFX1200) {
         /* GFX12 FLAT/GLOBAL/SCRATCH: 3 dwords (96-bit)
-           DW0: [31:24]=ENCODING [20:13]=OP [6:0]=SADDR
+           DW0: [31:24]=ENCODING [21:14]=OP [7]=NV [6:0]=SADDR
            DW1: [30:23]=VSRC [22:20]=TH [19:18]=SCOPE [17]=SVE [7:0]=VDST
            DW2: [31:8]=IOFFSET(24-bit) [7:0]=VADDR
-           Encoding: global=0xEE, scratch=0xED */
+           Encoding: global=0xEE, scratch=0xED
+           (PDF says OP[20:13] but AMD ISA XML has OP[21:14]) */
         uint8_t enc = is_scratch ? 0xED : 0xEE;
         uint8_t sve = is_scratch ? 1 : 0;
 
         uint32_t dw0 = ((uint32_t)enc << 24) |
-                       ((uint32_t)(hw_op & 0xFF) << 13) |
+                       ((uint32_t)(hw_op & 0xFF) << 14) |
                        (saddr & 0x7F);
         uint32_t dw1 = ((uint32_t)data << 23) |
                        ((uint32_t)sve << 17) |
