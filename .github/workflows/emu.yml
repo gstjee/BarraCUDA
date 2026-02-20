@@ -1,4 +1,4 @@
-name: RDNA3 Emulator Tests
+name: RDNA3/4 Emulator Tests
 
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
           git clone --depth 1 https://github.com/tinygrad/tinygrad.git /tmp/tinygrad
           pip install -e /tmp/tinygrad
 
-      - name: vectorAdd (RDNA3 emulator)
+      - name: vectorAdd (RDNA3/4 emulator)
         env:
           TINYGRAD_PATH: /tmp/tinygrad
         run: python tests/emu/run_emu.py tests/vector_add.hsaco
