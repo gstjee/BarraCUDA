@@ -130,7 +130,7 @@ static void get_text(const lower_t *L, uint32_t node, char *buf, int sz)
     const ast_node_t *n = ND(L, node);
     int len = (int)n->d.text.len;
     if (len >= sz) len = sz - 1;
-    memcpy(buf, L->src + n->d.text.offset, len);
+    memcpy(buf, L->src + n->d.text.offset, (size_t)len);
     buf[len] = '\0';
 }
 
@@ -139,7 +139,7 @@ static int text_eq(const lower_t *L, uint32_t node, const char *s)
     const ast_node_t *n = ND(L, node);
     int len = (int)n->d.text.len;
     return (int)strlen(s) == len
-        && memcmp(L->src + n->d.text.offset, s, len) == 0;
+        && memcmp(L->src + n->d.text.offset, s, (size_t)len) == 0;
 }
 
 static void lower_error(lower_t *L, uint32_t node, const char *msg)
@@ -276,7 +276,7 @@ static void op_name_from_tok(int tok, char *out, int outsz)
     case TOK_GE: sym = ">="; break;
     default: sym = "?"; break;
     }
-    snprintf(out, outsz, "operator%s", sym);
+    snprintf(out, (size_t)outsz, "operator%s", sym);
 }
 
 /* ---- Instruction Emission ---- */
@@ -536,7 +536,7 @@ static int64_t parse_int_text(const char *s, int len)
 {
     char buf[64];
     int n = len > 63 ? 63 : len;
-    memcpy(buf, s, n);
+    memcpy(buf, s, (size_t)n);
     buf[n] = '\0';
     while (n > 0 && (buf[n-1]=='u'||buf[n-1]=='U'||
                      buf[n-1]=='l'||buf[n-1]=='L'))
@@ -548,7 +548,7 @@ static double parse_float_text(const char *s, int len, int *is_f32)
 {
     char buf[64];
     int n = len > 63 ? 63 : len;
-    memcpy(buf, s, n);
+    memcpy(buf, s, (size_t)n);
     buf[n] = '\0';
     *is_f32 = 0;
     if (n > 0 && (buf[n-1]=='f'||buf[n-1]=='F')) {
@@ -1258,7 +1258,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             char vname[64];
             { int vl = (int)strlen(cname + 5);
               if (vl > 63) vl = 63;
-              memcpy(vname, cname + 5, vl);
+              memcpy(vname, cname + 5, (size_t)vl);
               vname[vl] = '\0'; }
             /* Find struct_def for the vector type */
             struct_def_t *vsd = NULL;

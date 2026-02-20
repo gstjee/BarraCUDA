@@ -1083,7 +1083,7 @@ static void encode_ds(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
 
     uint16_t offset = 0;
     /* Check for immediate offset in last use operand */
-    uint8_t last_use = use_base + mi->num_uses - 1;
+    uint8_t last_use = (uint8_t)(use_base + mi->num_uses - 1);
     if (mi->num_uses > 0 && last_use < MINST_MAX_OPS &&
         mi->operands[last_use].kind == MOP_IMM)
         offset = (uint16_t)mi->operands[last_use].imm;
@@ -1412,8 +1412,8 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         kd.kernel_code_entry_byte_offset = 256; /* descriptor is 64 bytes, padded to 256 */
 
         /* compute_pgm_rsrc1 */
-        uint32_t vgpr_blocks = (F->num_vgprs > 0) ? ((F->num_vgprs + 7) / 8 - 1) : 0;
-        uint32_t sgpr_blocks = (F->num_sgprs > 0) ? ((F->num_sgprs + 7) / 8 - 1) : 0;
+        uint32_t vgpr_blocks = (F->num_vgprs > 0) ? (uint32_t)((F->num_vgprs + 7) / 8 - 1) : 0;
+        uint32_t sgpr_blocks = (F->num_sgprs > 0) ? (uint32_t)((F->num_sgprs + 7) / 8 - 1) : 0;
         kd.compute_pgm_rsrc1 = (vgpr_blocks & 0x3F) |
                                ((sgpr_blocks & 0xF) << 6) |
                                (1u << 20) |  /* IEEE_MODE */

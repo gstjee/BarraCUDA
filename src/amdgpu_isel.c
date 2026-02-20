@@ -1100,7 +1100,7 @@ static void isel_shared_alloc(uint32_t idx, const bir_inst_t *I)
         if (pt->kind == BIR_TYPE_PTR && pt->inner < S.bir->num_types) {
             const bir_type_t *elem = &S.bir->types[pt->inner];
             if (elem->kind == BIR_TYPE_ARRAY && elem->count < 0x10000)
-                sz = elem->count * bir_type_width(elem->inner) / 8;
+                sz = elem->count * (uint32_t)bir_type_width(elem->inner) / 8;
             else if (elem->kind == BIR_TYPE_INT || elem->kind == BIR_TYPE_FLOAT)
                 sz = elem->width / 8;
             else if (elem->kind == BIR_TYPE_STRUCT)
@@ -1810,7 +1810,7 @@ static void isel_function(uint32_t fi)
     MF->num_blocks = (uint16_t)(A->num_mblocks - MF->first_block);
     MF->scratch_bytes = S.scratch_offset;
     MF->kernarg_bytes = S.hkrarg;
-    MF->lds_bytes = S.lds_offset;
+    MF->lds_bytes = (uint16_t)S.lds_offset;
     MF->first_alloc_sgpr = S.next_param_sgpr;
 }
 

@@ -29,7 +29,7 @@ static int read_file(const char *path, char *buf, uint32_t max, uint32_t *out_le
         fclose(fp);
         return BC_ERR_IO;
     }
-    *out_len = (uint32_t)fread(buf, 1, sz, fp);
+    *out_len = (uint32_t)fread(buf, 1, (size_t)sz, fp);
     buf[*out_len] = '\0';
     fclose(fp);
     return BC_OK;

@@ -10,27 +10,27 @@ static int print_simple_type(const bir_module_t *M, uint32_t tidx,
                              char *buf, int size)
 {
     if (tidx >= M->num_types)
-        return snprintf(buf, size, "???");
+        return snprintf(buf, (size_t)size, "???");
     const bir_type_t *t = &M->types[tidx];
     switch (t->kind) {
-    case BIR_TYPE_VOID:  return snprintf(buf, size, "void");
-    case BIR_TYPE_INT:   return snprintf(buf, size, "i%u", t->width);
+    case BIR_TYPE_VOID:  return snprintf(buf, (size_t)size, "void");
+    case BIR_TYPE_INT:   return snprintf(buf, (size_t)size, "i%u", t->width);
     case BIR_TYPE_FLOAT:
-        if (t->width == 16) return snprintf(buf, size, "f16");
-        if (t->width == 32) return snprintf(buf, size, "f32");
-        return snprintf(buf, size, "f64");
+        if (t->width == 16) return snprintf(buf, (size_t)size, "f16");
+        if (t->width == 32) return snprintf(buf, (size_t)size, "f32");
+        return snprintf(buf, (size_t)size, "f64");
     case BIR_TYPE_PTR:
-        return snprintf(buf, size, "ptr<%s>",
+        return snprintf(buf, (size_t)size, "ptr<%s>",
                         bir_addrspace_name(t->addrspace));
     default:
-        return snprintf(buf, size, "type_%u", tidx);
+        return snprintf(buf, (size_t)size, "type_%u", tidx);
     }
 }
 
 int bir_type_str(const bir_module_t *M, uint32_t tidx, char *buf, int size)
 {
     if (tidx >= M->num_types)
-        return snprintf(buf, size, "???");
+        return snprintf(buf, (size_t)size, "???");
     const bir_type_t *t = &M->types[tidx];
     char inner[64];
     int pos = 0;
@@ -43,42 +43,42 @@ int bir_type_str(const bir_module_t *M, uint32_t tidx, char *buf, int size)
 
     case BIR_TYPE_PTR:
         print_simple_type(M, t->inner, inner, sizeof(inner));
-        return snprintf(buf, size, "ptr<%s, %s>",
+        return snprintf(buf, (size_t)size, "ptr<%s, %s>",
                         bir_addrspace_name(t->addrspace), inner);
 
     case BIR_TYPE_ARRAY:
         print_simple_type(M, t->inner, inner, sizeof(inner));
-        return snprintf(buf, size, "[%u x %s]", t->count, inner);
+        return snprintf(buf, (size_t)size, "[%u x %s]", t->count, inner);
 
     case BIR_TYPE_VECTOR:
         print_simple_type(M, t->inner, inner, sizeof(inner));
-        return snprintf(buf, size, "<%u x %s>", t->width, inner);
+        return snprintf(buf, (size_t)size, "<%u x %s>", t->width, inner);
 
     case BIR_TYPE_STRUCT:
-        pos = snprintf(buf, size, "{");
+        pos = snprintf(buf, (size_t)size, "{");
         for (uint16_t i = 0; i < t->num_fields && pos < size - 1; i++) {
-            if (i > 0) pos += snprintf(buf+pos, size-pos, ", ");
+            if (i > 0) pos += snprintf(buf+pos, (size_t)(size-pos), ", ");
             print_simple_type(M, M->type_fields[t->count + i],
                               inner, sizeof(inner));
-            pos += snprintf(buf+pos, size-pos, "%s", inner);
+            pos += snprintf(buf+pos, (size_t)(size-pos), "%s", inner);
         }
-        pos += snprintf(buf+pos, size-pos, "}");
+        pos += snprintf(buf+pos, (size_t)(size-pos), "}");
         return pos;
 
     case BIR_TYPE_FUNC:
         print_simple_type(M, t->inner, inner, sizeof(inner));
-        pos = snprintf(buf, size, "(");
+        pos = snprintf(buf, (size_t)size, "(");
         for (uint16_t i = 0; i < t->num_fields && pos < size - 1; i++) {
-            if (i > 0) pos += snprintf(buf+pos, size-pos, ", ");
+            if (i > 0) pos += snprintf(buf+pos, (size_t)(size-pos), ", ");
             print_simple_type(M, M->type_fields[t->count + i],
                               inner, sizeof(inner));
-            pos += snprintf(buf+pos, size-pos, "%s", inner);
+            pos += snprintf(buf+pos, (size_t)(size-pos), "%s", inner);
         }
-        pos += snprintf(buf+pos, size-pos, ") -> %s", inner);
+        pos += snprintf(buf+pos, (size_t)(size-pos), ") -> %s", inner);
         return pos;
 
     default:
-        return snprintf(buf, size, "type_%u", tidx);
+        return snprintf(buf, (size_t)size, "type_%u", tidx);
     }
 }
 

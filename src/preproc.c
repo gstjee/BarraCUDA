@@ -135,7 +135,7 @@ static int pp_define_macro(preproc_t *pp, const char *name, uint32_t name_len,
         existing->body_len = (uint16_t)body_len;
         existing->num_params = (int16_t)num_params;
         for (int i = 0; i < num_params && i < PP_MAX_PARAMS; i++) {
-            existing->param_off[i] = pool_add(pp, params[i], param_lens[i]);
+            existing->param_off[i] = (uint16_t)pool_add(pp, params[i], param_lens[i]);
             existing->param_len[i] = (uint8_t)param_lens[i];
         }
         return BC_OK;
@@ -154,7 +154,7 @@ static int pp_define_macro(preproc_t *pp, const char *name, uint32_t name_len,
     m->num_params = (int16_t)num_params;
 
     for (int i = 0; i < num_params && i < PP_MAX_PARAMS; i++) {
-        m->param_off[i] = pool_add(pp, params[i], param_lens[i]);
+        m->param_off[i] = (uint16_t)pool_add(pp, params[i], param_lens[i]);
         m->param_len[i] = (uint8_t)param_lens[i];
     }
     return BC_OK;
@@ -1043,7 +1043,7 @@ static int pp_read_file(const char *path, char **buf, uint32_t *out_len)
     }
     *buf = (char *)malloc((uint32_t)sz + 1);
     if (!*buf) { fclose(fp); return -1; }
-    *out_len = (uint32_t)fread(*buf, 1, sz, fp);
+    *out_len = (uint32_t)fread(*buf, 1, (size_t)sz, fp);
     (*buf)[*out_len] = '\0';
     fclose(fp);
     return 0;
