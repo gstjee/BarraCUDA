@@ -121,6 +121,7 @@ typedef enum {
     /* Memory */
     BIR_ALLOCA,                 /* per-thread stack. subop = log2(align) */
     BIR_SHARED_ALLOC,           /* per-block SRAM. Not stack, not heap. Its own thing. */
+    BIR_GLOBAL_REF,             /* subop = global index. Yields ptr to __device__/__constant__ global. */
     BIR_LOAD,                   /* subop: 0 = normal, 1 = volatile */
     BIR_STORE,                  /* subop: 0 = normal, 1 = volatile */
     BIR_GEP,                    /* base ptr + typed indices. Simpler than LLVM's. */

@@ -14,7 +14,7 @@
 /* Maps amd_op_t -> (format, hw_opcode, mnemonic) */
 /* GFX11 (gfx1100, RDNA 3) hardware opcodes.
    Extracted by assembling with llvm-mc and reading the bones.
-   Every value verified against the machine — no guesswork, no vibes. */
+   */
 const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     /* SOP2 */
     [AMD_S_ADD_U32]         = { AMD_FMT_SOP2, 0x00, "s_add_u32"         },
@@ -1083,7 +1083,7 @@ static void encode_ds(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
 
     uint16_t offset = 0;
     /* Check for immediate offset in last use operand */
-    uint8_t last_use = use_base + mi->num_uses - 1;
+    uint8_t last_use = (uint8_t)(use_base + mi->num_uses - 1);
     if (mi->num_uses > 0 && last_use < MINST_MAX_OPS &&
         mi->operands[last_use].kind == MOP_IMM)
         offset = (uint16_t)mi->operands[last_use].imm;
@@ -1412,8 +1412,8 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         kd.kernel_code_entry_byte_offset = 256; /* descriptor is 64 bytes, padded to 256 */
 
         /* compute_pgm_rsrc1 */
-        uint32_t vgpr_blocks = (F->num_vgprs > 0) ? ((F->num_vgprs + 7) / 8 - 1) : 0;
-        uint32_t sgpr_blocks = (F->num_sgprs > 0) ? ((F->num_sgprs + 7) / 8 - 1) : 0;
+        uint32_t vgpr_blocks = (F->num_vgprs > 0) ? (uint32_t)((F->num_vgprs + 7) / 8 - 1) : 0;
+        uint32_t sgpr_blocks = (F->num_sgprs > 0) ? (uint32_t)((F->num_sgprs + 7) / 8 - 1) : 0;
         kd.compute_pgm_rsrc1 = (vgpr_blocks & 0x3F) |
                                ((sgpr_blocks & 0xF) << 6) |
                                (1u << 20) |  /* IEEE_MODE */
@@ -1423,9 +1423,9 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         /* compute_pgm_rsrc2 */
         kd.compute_pgm_rsrc2 = ((F->scratch_bytes > 0) ? 1u : 0u) | /* SCRATCH_EN */
                                (4u << 1) |   /* USER_SGPR_COUNT = 4 (dispatch_ptr + kernarg_ptr) */
-                               (1u << 11) |  /* TGID_X_EN */
-                               (1u << 12) |  /* TGID_Y_EN */
-                               (1u << 13);   /* TGID_Z_EN */
+                               (1u << 7) |   /* TGID_X_EN */
+                               (1u << 8) |   /* TGID_Y_EN */
+                               (1u << 9);    /* TGID_Z_EN */
 
         /* kernel_code_properties */
         kd.kernel_code_properties = (1u << 0) |  /* ENABLE_SGPR_DISPATCH_PTR */

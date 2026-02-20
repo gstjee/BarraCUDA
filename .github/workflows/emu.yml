@@ -1,0 +1,33 @@
+name: RDNA3 Emulator Tests
+
+on:
+  push:
+    branches: [fixesAMD]
+  pull_request:
+    branches: [fixesAMD]
+
+jobs:
+  rdna3-emu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build BarraCUDA
+        run: make
+
+      - name: Compile test kernels
+        run: ./barracuda --amdgpu-bin tests/vector_add.cu -o tests/vector_add.hsaco
+
+      - name: Setup tinygrad emulator
+        run: |
+          git clone --depth 1 https://github.com/tinygrad/tinygrad.git /tmp/tinygrad
+          pip install -e /tmp/tinygrad
+
+      - name: vectorAdd (RDNA3 emulator)
+        env:
+          TINYGRAD_PATH: /tmp/tinygrad
+        run: python tests/emu/run_emu.py tests/vector_add.hsaco

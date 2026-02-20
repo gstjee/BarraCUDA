@@ -290,7 +290,7 @@ static inline char cur(const lexer_t *L)
 
 static inline char peek(const lexer_t *L, int ahead)
 {
-    uint32_t p = L->pos + ahead;
+    uint32_t p = L->pos + (uint32_t)ahead;
     return (p < L->src_len) ? L->src[p] : '\0';
 }
 
@@ -344,7 +344,7 @@ int lexer_token_text(const lexer_t *L, const token_t *tok,
 {
     int len = (int)tok->len;
     if (len >= bufsize) len = bufsize - 1;
-    memcpy(buf, L->src + tok->offset, len);
+    memcpy(buf, L->src + tok->offset, (size_t)len);
     buf[len] = '\0';
     return len;
 }

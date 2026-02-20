@@ -92,7 +92,7 @@ static int cur_type(const parser_t *P)
 
 static int peek_type(const parser_t *P, int ahead)
 {
-    uint32_t p = P->pos + ahead;
+    uint32_t p = P->pos + (uint32_t)ahead;
     if (p >= P->num_tokens) p = P->num_tokens - 1;
     return P->tokens[p].type;
 }
@@ -277,7 +277,7 @@ static int64_t parse_int_text(const char *s, int len)
 {
     char buf[64];
     int n = len > 63 ? 63 : len;
-    memcpy(buf, s, n);
+    memcpy(buf, s, (size_t)n);
     buf[n] = '\0';
     while (n > 0 && (buf[n-1]=='u'||buf[n-1]=='U'||
                      buf[n-1]=='l'||buf[n-1]=='L'))
@@ -715,6 +715,7 @@ static uint32_t parse_type_spec(parser_t *P, uint16_t *quals, uint16_t *cuda)
             break;
         }
         else if (t == TOK_IDENT) {
+            if (got_type) break;
             n->d.btype.kind = TYPE_NAME;
             uint32_t name = alloc_node(P, AST_IDENT);
             P->nodes[name].d.text.offset = cur(P)->offset;
@@ -1391,7 +1392,7 @@ static void dump_node_data(const parser_t *P, const ast_node_t *n)
     {
         int len = (int)n->d.text.len;
         if (len > 120) len = 120;
-        memcpy(text, P->src + n->d.text.offset, len);
+        memcpy(text, P->src + n->d.text.offset, (size_t)len);
         text[len] = '\0';
         printf(" %s", text);
         break;

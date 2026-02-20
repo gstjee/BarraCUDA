@@ -30,7 +30,7 @@ static void get_text(const sema_ctx_t *S, uint32_t node, char *buf, int sz)
     const ast_node_t *n = ND(S, node);
     int len = (int)n->d.text.len;
     if (len >= sz) len = sz - 1;
-    memcpy(buf, S->src + n->d.text.offset, len);
+    memcpy(buf, S->src + n->d.text.offset, (size_t)len);
     buf[len] = '\0';
 }
 
@@ -39,7 +39,7 @@ static int text_eq(const sema_ctx_t *S, uint32_t node, const char *s)
     const ast_node_t *n = ND(S, node);
     int len = (int)n->d.text.len;
     return (int)strlen(s) == len
-        && memcmp(S->src + n->d.text.offset, s, len) == 0;
+        && memcmp(S->src + n->d.text.offset, s, (size_t)len) == 0;
 }
 
 /* ---- Error Reporting ---- */
@@ -527,7 +527,7 @@ static void op_name_from_tok(int tok, char *out, int outsz)
     case TOK_GE: sym = ">="; break;
     default: sym = "?"; break;
     }
-    snprintf(out, outsz, "operator%s", sym);
+    snprintf(out, (size_t)outsz, "operator%s", sym);
 }
 
 /* ---- CUDA Builtin Type Resolution ---- */
@@ -593,7 +593,7 @@ static int64_t parse_int_value(const char *s, int len)
 {
     char buf[64];
     int n = len > 63 ? 63 : len;
-    memcpy(buf, s, n);
+    memcpy(buf, s, (size_t)n);
     buf[n] = '\0';
     /* Strip suffixes */
     while (n > 0 && (buf[n-1]=='u'||buf[n-1]=='U'||
@@ -1610,7 +1610,7 @@ static const char *stype_kind_names[] = {
 static int print_flat_type(const sema_ctx_t *S, uint32_t tidx, char *buf, int size)
 {
     if (size <= 0) return 0;
-    if (tidx >= S->num_types) return snprintf(buf, size, "?");
+    if (tidx >= S->num_types) return snprintf(buf, (size_t)size, "?");
 
     #define FLAT_MAX_WRAP 32
     struct { uint8_t kind; uint16_t width; } wrap[FLAT_MAX_WRAP];
@@ -1631,28 +1631,28 @@ static int print_flat_type(const sema_ctx_t *S, uint32_t tidx, char *buf, int si
 
     int n = 0;
     if (cur >= S->num_types) {
-        n = snprintf(buf, size, "?");
+        n = snprintf(buf, (size_t)size, "?");
     } else {
         const stype_t *b = &S->types[cur];
         if (b->kind == STYPE_STRUCT) {
             sema_struct_t *sd = find_struct_by_idx(S, b->extra);
             n = (sd && sd->name[0])
-                ? snprintf(buf, size, "struct %s", sd->name)
-                : snprintf(buf, size, "struct <anon>");
+                ? snprintf(buf, (size_t)size, "struct %s", sd->name)
+                : snprintf(buf, (size_t)size, "struct <anon>");
         } else if (b->kind == STYPE_FUNC) {
-            n = snprintf(buf, size, "func(...)");
+            n = snprintf(buf, (size_t)size, "func(...)");
         } else if (b->kind < STYPE_COUNT) {
-            n = snprintf(buf, size, "%s", stype_kind_names[b->kind]);
+            n = snprintf(buf, (size_t)size, "%s", stype_kind_names[b->kind]);
         } else {
-            n = snprintf(buf, size, "<kind:%d>", b->kind);
+            n = snprintf(buf, (size_t)size, "<kind:%d>", b->kind);
         }
     }
 
     for (int i = nw - 1; i >= 0 && n < size; i--) {
         if (wrap[i].kind == STYPE_PTR)
-            n += snprintf(buf + n, size - n, "*");
+            n += snprintf(buf + n, (size_t)(size - n), "*");
         else
-            n += snprintf(buf + n, size - n, "[%u]", wrap[i].width);
+            n += snprintf(buf + n, (size_t)(size - n), "[%u]", wrap[i].width);
     }
 
     return n;
@@ -1661,26 +1661,26 @@ static int print_flat_type(const sema_ctx_t *S, uint32_t tidx, char *buf, int si
 int stype_str(const sema_ctx_t *S, uint32_t tidx, char *buf, int size)
 {
     if (size <= 0) return 0;
-    if (tidx >= S->num_types) return snprintf(buf, size, "<invalid>");
+    if (tidx >= S->num_types) return snprintf(buf, (size_t)size, "<invalid>");
     const stype_t *t = &S->types[tidx];
 
     if (t->kind != STYPE_FUNC)
         return print_flat_type(S, tidx, buf, size);
 
     /* Function type: func(params) -> ret */
-    int n = snprintf(buf, size, "func(");
+    int n = snprintf(buf, (size_t)size, "func(");
     int nparams = (int)t->width;
     uint32_t start = t->extra;
     for (int i = 0; i < nparams && i < 16
              && (start + (uint32_t)i) < S->num_params; i++) {
         if (i > 0 && n < size)
-            n += snprintf(buf + n, size - n, ", ");
+            n += snprintf(buf + n, (size_t)(size - n), ", ");
         if (n < size)
-            n += print_flat_type(S, S->param_pool[start + i],
+            n += print_flat_type(S, S->param_pool[start + (uint32_t)i],
                                  buf + n, size - n);
     }
     if (n < size)
-        n += snprintf(buf + n, size - n, ") -> ");
+        n += snprintf(buf + n, (size_t)(size - n), ") -> ");
     if (n < size)
         n += print_flat_type(S, t->inner, buf + n, size - n);
     return n;
