@@ -3,11 +3,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-/* Thread coarsening + host code generation. Translates the fundamental
- * lie of GPU programming — "one thread per element" — into the truth:
- * one core, many tiles, 32 lanes doing the actual work. */
-
-/* ---- BIR Analysis ---- */
+/* Thread coarsening + host code generation. Translates "one thread per element"
+ * into one core, many tiles, 32 lanes doing the actual work. */
 
 typedef struct {
     uint32_t    tid[3];         /* BIR_THREAD_ID uses per dimension */
@@ -61,8 +58,6 @@ static void analyse_function(const bir_module_t *bir, uint32_t func_idx,
         }
     }
 }
-
-/* ---- Pattern Classification ---- */
 
 static const char *pattern_names[] = {
     "generic", "element-wise", "reduction"

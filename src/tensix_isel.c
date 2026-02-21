@@ -2,21 +2,13 @@
 #include <string.h>
 
 /* BIR SSA -> SFPU machine IR. 32 lanes pretending to be a million threads. */
-
-/* ---- Static State ---- */
-
-/* Large state kept static. The stack is not our friend on Windows. */
 static struct {
     tt_module_t         *tt;
     const bir_module_t  *bir;
 
-    /* Dst register file offset tracking (spill/alloca slots) */
     uint32_t    dst_offset;
-
-    /* Block mapping: BIR block index -> machine block index */
     uint32_t    block_map[BIR_MAX_BLOCKS];
 
-    /* Predication depth tracking for if/else lowering */
     #define TT_MAX_PRED_DEPTH 32
     struct {
         uint32_t false_bir;     /* BIR block for else path */
@@ -27,7 +19,7 @@ static struct {
 
 } S;
 
-/* ---- Operand Constructors ---- */
+/* ---- Operands ---- */
 
 static tt_operand_t mop_none(void)
 {
@@ -36,11 +28,11 @@ static tt_operand_t mop_none(void)
     return o;
 }
 
-static tt_operand_t mop_vreg(uint16_t v)
+static tt_operand_t mop_vreg(uint32_t v)
 {
     tt_operand_t o = {0};
     o.kind = TT_MOP_VREG;
-    o.reg_num = v;
+    o.reg_num = (uint16_t)v;
     return o;
 }
 
@@ -68,7 +60,7 @@ static tt_operand_t mop_dst_row(uint16_t row)
     return o;
 }
 
-/* ---- BIR Helpers ---- */
+/* ---- Helpers ---- */
 
 static uint32_t get_num_ops(const bir_inst_t *I)
 {
@@ -77,7 +69,6 @@ static uint32_t get_num_ops(const bir_inst_t *I)
     return I->num_operands;
 }
 
-/* Find unconditional branch target of a BIR block */
 static uint32_t bir_block_successor(uint32_t bir_bi)
 {
     if (bir_bi >= S.bir->num_blocks) return 0xFFFFFFFF;
@@ -89,7 +80,6 @@ static uint32_t bir_block_successor(uint32_t bir_bi)
     return 0xFFFFFFFF;
 }
 
-/* Find the merge block for an if-then or if-then-else */
 static uint32_t find_merge_block(uint32_t true_bir, uint32_t false_bir)
 {
     uint32_t true_succ = bir_block_successor(true_bir);
@@ -100,15 +90,12 @@ static uint32_t find_merge_block(uint32_t true_bir, uint32_t false_bir)
     return false_bir;
 }
 
-/* ---- Virtual Register Allocation ---- */
-
 static uint32_t new_vreg(void)
 {
     if (S.tt->vreg_count >= TT_MAX_VREGS) return 0;
     return S.tt->vreg_count++;
 }
 
-/* Map a BIR instruction result to a virtual register */
 static uint32_t map_bir_val(uint32_t bir_inst)
 {
     if (bir_inst < BIR_MAX_INSTS && S.tt->val_vreg[bir_inst] != 0)
@@ -119,9 +106,8 @@ static uint32_t map_bir_val(uint32_t bir_inst)
     return v;
 }
 
-/* ---- Machine Instruction Emission ---- */
+/* ---- Emission ---- */
 
-/* Generic emitter — all SFPU instructions go through here */
 static uint32_t emit(uint16_t op, uint8_t fmt,
                      uint8_t num_defs, uint8_t num_uses,
                      const tt_operand_t *ops, uint16_t flags)
@@ -144,7 +130,6 @@ static uint32_t emit(uint16_t op, uint8_t fmt,
     return idx;
 }
 
-/* Format A: dst = f(src_a, src_b, src_c) */
 static void emit_fmtA(uint16_t op, tt_operand_t dst,
                        tt_operand_t src_a, tt_operand_t src_b,
                        tt_operand_t src_c, uint16_t mod1)
@@ -153,7 +138,6 @@ static void emit_fmtA(uint16_t op, tt_operand_t dst,
     emit(op, TT_FMT_A, 1, 4, ops, mod1);
 }
 
-/* Format B: dst = f(src, imm12) */
 static void emit_fmtB(uint16_t op, tt_operand_t dst,
                        tt_operand_t src, int32_t imm12, uint16_t mod1)
 {
@@ -161,14 +145,12 @@ static void emit_fmtB(uint16_t op, tt_operand_t dst,
     emit(op, TT_FMT_B, 1, 3, ops, mod1);
 }
 
-/* Format C: control/config (imm16, optional dst) */
 static void emit_fmtC(uint16_t op, int32_t imm16, uint16_t mod1)
 {
     tt_operand_t ops[2] = { mop_imm(imm16), mop_imm(mod1) };
     emit(op, TT_FMT_C, 0, 2, ops, mod1);
 }
 
-/* Format D: load/store between LReg and Dst register file */
 static void emit_fmtD(uint16_t op, tt_operand_t lreg,
                        uint16_t mod0, uint16_t addr_mode, uint16_t dst_addr)
 {
@@ -180,7 +162,6 @@ static void emit_fmtD(uint16_t op, tt_operand_t lreg,
         emit(op, TT_FMT_D, 0, 4, ops, mod0);
 }
 
-/* Format E: load immediate into LReg */
 static void emit_fmtE(uint16_t op, tt_operand_t lreg,
                        uint16_t mod0, uint16_t imm16)
 {
@@ -188,9 +169,9 @@ static void emit_fmtE(uint16_t op, tt_operand_t lreg,
     emit(op, TT_FMT_E, 1, 2, ops, mod0);
 }
 
-/* ---- Constant Materialisation ---- */
+/* ---- Constants ---- */
 
-/* The universe provides zero and one for free. Everything else is two loads. */
+/* Zero and one are free. Everything else is two loads. */
 static tt_operand_t materialise_const(uint32_t const_idx)
 {
     if (const_idx >= S.bir->num_consts)
@@ -198,7 +179,6 @@ static tt_operand_t materialise_const(uint32_t const_idx)
 
     const bir_const_t *C = &S.bir->consts[const_idx];
 
-    /* Zero: use L9 */
     if (C->kind == BIR_CONST_ZERO ||
         (C->kind == BIR_CONST_INT && C->d.ival == 0) ||
         (C->kind == BIR_CONST_FLOAT && C->d.fval == 0.0) ||
@@ -206,16 +186,13 @@ static tt_operand_t materialise_const(uint32_t const_idx)
         return mop_lreg(TT_LREG_ZERO);
     }
 
-    /* 1.0f: use L10 */
     if (C->kind == BIR_CONST_FLOAT && C->d.fval == 1.0)
         return mop_lreg(TT_LREG_ONE);
 
-    /* Everything else: materialise into a fresh vreg */
     uint32_t vr = new_vreg();
     tt_operand_t dst = mop_vreg(vr);
 
     if (C->kind == BIR_CONST_FLOAT) {
-        /* FP32: load as two 16-bit halves */
         union { float f; uint32_t u; } pun;
         pun.f = (float)C->d.fval;
         emit_fmtE(TT_SFPLOADI, dst, TT_LOADI_MOD0_FLOATA,
@@ -223,7 +200,6 @@ static tt_operand_t materialise_const(uint32_t const_idx)
         emit_fmtE(TT_SFPLOADI, dst, TT_LOADI_MOD0_FLOATB,
                   (uint16_t)(pun.u & 0xFFFF));
     } else {
-        /* Integer: load as two 16-bit halves */
         uint32_t val = (uint32_t)C->d.ival;
         emit_fmtE(TT_SFPLOADI, dst, TT_LOADI_MOD0_INTA,
                   (uint16_t)(val >> 16));
@@ -234,7 +210,6 @@ static tt_operand_t materialise_const(uint32_t const_idx)
     return dst;
 }
 
-/* Resolve a BIR value reference to an operand */
 static tt_operand_t resolve_val(uint32_t val)
 {
     if (val == BIR_VAL_NONE) return mop_lreg(TT_LREG_ZERO);
@@ -280,8 +255,7 @@ static void isel_fp_arith(uint32_t idx, const bir_inst_t *I)
 
 /* ---- Integer Arithmetic ---- */
 
-/* SFPIADD is the only reg+reg integer op. The SFPU was not designed
- * by people who expected anyone to count. Two instructions per op. */
+/* SFPIADD is the only reg+reg integer op. Two instructions per op. */
 static void isel_int_arith(uint32_t idx, const bir_inst_t *I)
 {
     uint32_t vr = map_bir_val(idx);
@@ -296,11 +270,10 @@ static void isel_int_arith(uint32_t idx, const bir_inst_t *I)
         break;
     case BIR_SUB:
         emit_fmtB(TT_SFPMOV, dst, lhs, 0, 0);
-        /* mod1=1: subtract mode (dst -= src) */
-        emit_fmtB(TT_SFPIADD, dst, rhs, 0, 1);
+        emit_fmtB(TT_SFPIADD, dst, rhs, 0, 1); /* subtract mode */
         break;
     case BIR_MUL:
-        /* No int mul on WH. SFPMUL24 is Blackhole only. Promote and hope. */
+        /* No int mul on WH. SFPMUL24 is BH only. */
         emit_fmtA(TT_SFPMUL, dst, lhs, rhs, mop_lreg(TT_LREG_ZERO), 0);
         break;
     case BIR_AND:
@@ -402,9 +375,6 @@ static void isel_fcmp(uint32_t idx, const bir_inst_t *I)
 }
 
 /* ---- Control Flow -> Predication ---- */
-
-/* SFPU has no branches. Each lane executes independant of its neighbours,
- * masked by a condition stack: PUSHC → SETCC → ENCC → [then] → COMPC → POPC */
 
 static void isel_br_cond(const bir_inst_t *I)
 {
@@ -598,15 +568,13 @@ static void isel_select(uint32_t idx, const bir_inst_t *I)
 
 static void isel_barrier(void)
 {
-    /* On a single core, synchronisation is a philosophical question. NOP. */
-    emit_fmtC(TT_SFPNOP, 0, 0);
+    emit_fmtC(TT_SFPNOP, 0, 0); /* single core: nop */
 }
 
 /* ---- Call ---- */
 
 static void isel_call(uint32_t idx, const bir_inst_t *I)
 {
-    /* TODO: inline callee body. For now, return zero and pretend. */
     uint32_t vr = map_bir_val(idx);
     (void)I;
     emit_fmtB(TT_SFPMOV, mop_vreg(vr), mop_lreg(TT_LREG_ZERO), 0, 0);

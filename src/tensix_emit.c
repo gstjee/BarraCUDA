@@ -4,11 +4,9 @@
 #include <stdarg.h>
 
 /* Register allocation, binary encoding, C++ output. Eight LRegs on Tensix,
- * eight GPRs on System/360. The wheel turns but the spokes don't change. */
+ * eight GPRs on System/360. The wheel turns. */
 
-/* ---- Encoding Table ---- */
-
-/* From sfpi-binutils riscv-opc-sfpu.h. Wormhole B0. */
+/* ---- Encoding Table (Wormhole B0) ---- */
 static const tt_enc_entry_t enc_table_sparse[] = {
     /* Data movement */
     { TT_FMT_D, 0x70, "sfpload"    },  /* TT_SFPLOAD    */
@@ -92,7 +90,7 @@ static const tt_enc_entry_t *enc_lookup(uint16_t op)
     return NULL;
 }
 
-/* ---- Output Buffer Helpers ---- */
+/* ---- Output ---- */
 
 static void out_append(tt_module_t *tt, const char *fmt, ...)
 {
@@ -110,17 +108,15 @@ static void out_append(tt_module_t *tt, const char *fmt, ...)
 
 /* ---- Register Allocator ---- */
 
-/* Forward liveness, then Belady eviction with Dst spilling. */
-
 typedef struct {
-    uint32_t first_def;     /* abs inst index + 1 (0 = not defined) */
-    uint32_t last_use;      /* abs inst index + 1 (0 = never used) */
-    uint16_t activity;      /* weighted usage score */
-    uint8_t  phys_reg;      /* 0 = unassigned, 1-8 = LReg 0-7 */
-    uint8_t  spilled;       /* currently living in Dst, not an LReg */
-    uint16_t spill_row;     /* Dst row when spilled (0xFFFF = no slot yet) */
+    uint32_t first_def;
+    uint32_t last_use;
+    uint16_t activity;
+    uint8_t  phys_reg;      /* 0 = unassigned, 1-8 = L0-L7 */
+    uint8_t  spilled;
+    uint16_t spill_row;     /* 0xFFFF = no slot yet */
     uint16_t pad;
-} ra_vreg_info_t;           /* 16 bytes */
+} ra_vreg_info_t;
 
 #define RA_SCRATCH_SIZE 32768
 static tt_minst_t ra_scratch[RA_SCRATCH_SIZE];
@@ -165,8 +161,9 @@ static void ra_forward_pass(const tt_module_t *tt, const tt_mfunc_t *MF)
                     vi->activity += RA_WEIGHT_DEF;
                 } else {
                     vi->last_use = abs_idx + 1;
-                    vi->activity += (I->fmt == TT_FMT_A)
-                        ? RA_WEIGHT_FMTA : RA_WEIGHT_USE;
+                    vi->activity = (uint16_t)(vi->activity +
+                        ((I->fmt == TT_FMT_A)
+                         ? RA_WEIGHT_FMTA : RA_WEIGHT_USE));
                 }
             }
         }
@@ -317,7 +314,7 @@ static void ra_allocate_function(tt_module_t *tt, tt_mfunc_t *MF)
             int total = inst.num_defs + inst.num_uses;
             if (total > TT_MINST_MAX_OPS) total = TT_MINST_MAX_OPS;
 
-            /* Ensure USEs have LRegs */
+            /* Uses */
             for (int k = inst.num_defs; k < total; k++) {
                 tt_operand_t *op = &inst.operands[k];
                 if (op->kind != TT_MOP_VREG) continue;
@@ -327,13 +324,13 @@ static void ra_allocate_function(tt_module_t *tt, tt_mfunc_t *MF)
                 op->reg_num = (uint16_t)lreg;
             }
 
-            /* Assign DEFs, reusing dying source LRegs where possible */
+            /* Defs */
             for (int k = 0; k < inst.num_defs; k++) {
                 tt_operand_t *op = &inst.operands[k];
                 if (op->kind != TT_MOP_VREG) continue;
                 uint16_t vr = op->reg_num;
 
-                /* Operand sharing: reuse LReg of a dying source */
+                /* Reuse LReg of a dying source */
                 int shared = -1;
                 for (int u = inst.num_defs; u < total; u++) {
                     if (inst.operands[u].kind != TT_MOP_LREG) continue;
@@ -368,7 +365,7 @@ static void ra_allocate_function(tt_module_t *tt, tt_mfunc_t *MF)
             if (ra_out_pos < RA_SCRATCH_SIZE)
                 ra_scratch[ra_out_pos++] = inst;
 
-            /* Free dead vregs */
+            /* Free dead */
             for (int r = 0; r < TT_NUM_LREGS; r++) {
                 uint32_t vr = ra_lreg[r].vreg;
                 if (vr == 0) continue;
@@ -483,7 +480,7 @@ static uint32_t encode_inst(const tt_minst_t *I)
 
 /* ---- Disassembly ---- */
 
-static void disasm_inst(const tt_minst_t *I, char *buf, int bufsz)
+static void disasm_inst(const tt_minst_t *I, char *buf, size_t bufsz)
 {
     const tt_enc_entry_t *enc = enc_lookup(I->op);
     if (!enc) {
