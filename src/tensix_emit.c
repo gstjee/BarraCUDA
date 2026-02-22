@@ -582,18 +582,42 @@ int tensix_emit_metalium(tt_module_t *tt, const char *path)
             "void MAIN {\n"
             "    /* kernel: %s, %u LRegs, %u Dst rows, %s, %u tiles/core */\n"
             "    uint32_t num_tiles = get_arg_val<uint32_t>(0);\n"
-            "    constexpr auto cb_in = tt::CBIndex::c_0;\n"
-            "    constexpr auto cb_out = tt::CBIndex::c_16;\n"
             "\n"
-            "    for (uint32_t tile = 0; tile < num_tiles; tile++) {\n"
-            "        cb_wait_front(cb_in, 1);\n"
-            "        tile_regs_acquire();\n"
-            "\n",
+            "    for (uint32_t tile = 0; tile < num_tiles; tile++) {\n",
             name,
             (unsigned)MF->num_lregs_used,
             (unsigned)MF->dst_rows_used,
             pat,
             (unsigned)MF->tiles_per_core);
+
+        /* Wait on input CBs, unpack tiles into Dst */
+        {
+            const tt_dmov_t *dm = &tt->dmov;
+            if (dm->num_bufs > 0) {
+                int dg = TT_MAX_DMOV_BUFS;
+                for (uint32_t di = 0; di < dm->num_bufs && dg > 0; di++, dg--) {
+                    if (dm->bufs[di].is_output) continue;
+                    out_append(tt,
+                        "        cb_wait_front(tt::CBIndex::c_%u, 1);\n",
+                        dm->bufs[di].cb_index);
+                }
+                out_append(tt, "        tile_regs_acquire();\n");
+                dg = TT_MAX_DMOV_BUFS;
+                for (uint32_t di = 0; di < dm->num_bufs && dg > 0; di++, dg--) {
+                    if (dm->bufs[di].is_output) continue;
+                    out_append(tt,
+                        "        copy_tile(tt::CBIndex::c_%u, 0, %u);\n",
+                        dm->bufs[di].cb_index, dm->bufs[di].dst_row / 16);
+                }
+            } else {
+                /* Fallback: single CB, no copy_tile (pre-tier4 compat) */
+                out_append(tt,
+                    "        cb_wait_front(tt::CBIndex::c_0, 1);\n"
+                    "        tile_regs_acquire();\n");
+            }
+        }
+
+        out_append(tt, "\n");
 
         uint32_t inst_count = 0;
         for (uint32_t bi = 0; bi < MF->num_blocks; bi++) {
@@ -623,11 +647,45 @@ int tensix_emit_metalium(tt_module_t *tt, const char *path)
         out_append(tt,
             "\n"
             "        tile_regs_commit();\n"
-            "        tile_regs_wait();\n"
-            "        pack_tile(0, cb_out);\n"
-            "        tile_regs_release();\n"
-            "        cb_pop_front(cb_in, 1);\n"
-            "        cb_push_back(cb_out, 1);\n"
+            "        tile_regs_wait();\n");
+
+        /* Pack results + release + CB handshake */
+        {
+            const tt_dmov_t *dm = &tt->dmov;
+            if (dm->num_bufs > 0) {
+                int dg = TT_MAX_DMOV_BUFS;
+                for (uint32_t di = 0; di < dm->num_bufs && dg > 0; di++, dg--) {
+                    if (!dm->bufs[di].is_output) continue;
+                    out_append(tt,
+                        "        pack_tile(0, tt::CBIndex::c_%u);\n",
+                        dm->bufs[di].cb_index);
+                }
+                out_append(tt, "        tile_regs_release();\n");
+                dg = TT_MAX_DMOV_BUFS;
+                for (uint32_t di = 0; di < dm->num_bufs && dg > 0; di++, dg--) {
+                    if (dm->bufs[di].is_output) continue;
+                    out_append(tt,
+                        "        cb_pop_front(tt::CBIndex::c_%u, 1);\n",
+                        dm->bufs[di].cb_index);
+                }
+                dg = TT_MAX_DMOV_BUFS;
+                for (uint32_t di = 0; di < dm->num_bufs && dg > 0; di++, dg--) {
+                    if (!dm->bufs[di].is_output) continue;
+                    out_append(tt,
+                        "        cb_push_back(tt::CBIndex::c_%u, 1);\n",
+                        dm->bufs[di].cb_index);
+                }
+            } else {
+                /* Fallback: single CB pair (pre-tier4 compat) */
+                out_append(tt,
+                    "        pack_tile(0, tt::CBIndex::c_16);\n"
+                    "        tile_regs_release();\n"
+                    "        cb_pop_front(tt::CBIndex::c_0, 1);\n"
+                    "        cb_push_back(tt::CBIndex::c_16, 1);\n");
+            }
+        }
+
+        out_append(tt,
             "    }\n"
             "}\n"
             "} /* namespace */\n"

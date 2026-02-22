@@ -170,6 +170,27 @@ typedef enum {
     TT_PATTERN_COUNT
 } tt_coarsen_pattern_t;
 
+/* ---- Data Movement ---- */
+
+#define TT_MAX_DMOV_BUFS  16
+
+typedef struct {
+    uint32_t bir_param;       /* BIR param index (BIR_PARAM subop) */
+    uint32_t cb_index;        /* circular buffer ID (0-15 in, 16-31 out) */
+    uint32_t tile_size;       /* bytes per tile (2048 BF16, 4096 FP32) */
+    uint32_t dst_row;         /* Dst register file row for unpack */
+    uint32_t name;            /* string table offset for param name */
+    uint8_t  is_output;       /* 0 = input (loaded), 1 = output (stored) */
+    uint8_t  pad[3];
+} tt_dmov_buf_t;
+
+typedef struct {
+    tt_dmov_buf_t bufs[TT_MAX_DMOV_BUFS];
+    uint32_t      num_bufs;
+    uint32_t      num_inputs;
+    uint32_t      num_outputs;
+} tt_dmov_t;
+
 /* ---- Machine Block / Function ---- */
 
 typedef struct {
@@ -220,6 +241,8 @@ typedef struct {
 
     char        out_buf[TT_MAX_CODE_SIZE];
     uint32_t    out_len;
+
+    tt_dmov_t   dmov;
 } tt_module_t;
 
 /* ---- Encoding Table Entry ---- */
@@ -236,7 +259,15 @@ int  tensix_compile(const bir_module_t *bir, tt_module_t *tt);
 void tensix_coarsen(tt_module_t *tt);
 void tensix_regalloc(tt_module_t *tt);
 int  tensix_emit_metalium(tt_module_t *tt, const char *path);
-int  tensix_emit_host(tt_module_t *tt, const char *host_path,
-                      const char *compute_path);
+/* Data movement — Tier 4 */
+void tensix_analyze_datamov(const bir_module_t *bir, const tt_module_t *tt,
+                            tt_dmov_t *dmov);
+int  tensix_emit_reader(const tt_module_t *tt, const tt_dmov_t *dmov,
+                        const char *path);
+int  tensix_emit_writer(const tt_module_t *tt, const tt_dmov_t *dmov,
+                        const char *path);
+int  tensix_emit_host_full(const tt_module_t *tt, const tt_dmov_t *dmov,
+                           const char *host_path, const char *reader_path,
+                           const char *compute_path, const char *writer_path);
 
 #endif /* BARRACUDA_TENSIX_H */

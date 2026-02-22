@@ -326,28 +326,37 @@ int main(int argc, char *argv[])
 
                         const char *compute_path =
                             output_file ? output_file : "a_compute.cpp";
+
+                        /* Analyse data movement before emit (populates ttm->dmov) */
+                        tensix_analyze_datamov(bir_module, ttm, &ttm->dmov);
+
                         tensix_emit_metalium(ttm, compute_path);
 
-                        /* Derive host path: foo_compute.cpp -> foo_host.cpp,
-                         * foo.cpp -> foo_host.cpp */
+                        /* Derive paths: a_compute.cpp -> a_{reader,writer,host}.cpp */
                         char host_path[BC_MAX_PATH];
+                        char reader_path[BC_MAX_PATH];
+                        char writer_path[BC_MAX_PATH];
                         const char *stem = strstr(compute_path, "_compute");
+                        int pfx;
                         if (stem) {
-                            int pfx = (int)(stem - compute_path);
-                            snprintf(host_path, sizeof(host_path),
-                                     "%.*s_host.cpp", pfx, compute_path);
+                            pfx = (int)(stem - compute_path);
                         } else {
                             const char *dot = strrchr(compute_path, '.');
-                            if (dot) {
-                                int pfx = (int)(dot - compute_path);
-                                snprintf(host_path, sizeof(host_path),
-                                         "%.*s_host.cpp", pfx, compute_path);
-                            } else {
-                                snprintf(host_path, sizeof(host_path),
-                                         "%s_host.cpp", compute_path);
-                            }
+                            pfx = dot ? (int)(dot - compute_path)
+                                      : (int)strlen(compute_path);
                         }
-                        tensix_emit_host(ttm, host_path, compute_path);
+                        snprintf(host_path,   sizeof(host_path),
+                                 "%.*s_host.cpp",   pfx, compute_path);
+                        snprintf(reader_path, sizeof(reader_path),
+                                 "%.*s_reader.cpp", pfx, compute_path);
+                        snprintf(writer_path, sizeof(writer_path),
+                                 "%.*s_writer.cpp", pfx, compute_path);
+
+                        tensix_emit_reader(ttm, &ttm->dmov, reader_path);
+                        tensix_emit_writer(ttm, &ttm->dmov, writer_path);
+                        tensix_emit_host_full(ttm, &ttm->dmov, host_path,
+                                              reader_path, compute_path,
+                                              writer_path);
                     } else {
                         fprintf(stderr, "error: Tensix compilation failed\n");
                         rc = trc;
