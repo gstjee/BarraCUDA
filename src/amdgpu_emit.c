@@ -87,6 +87,8 @@ const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     [AMD_V_SUB_F32]          = { AMD_FMT_VOP2, 0x04, "v_sub_f32"          },
     [AMD_V_MUL_F32]          = { AMD_FMT_VOP2, 0x08, "v_mul_f32"          },
     [AMD_V_CNDMASK_B32]      = { AMD_FMT_VOP2, 0x01, "v_cndmask_b32"      },
+    [AMD_V_MIN_F32]          = { AMD_FMT_VOP2, 0x0F, "v_min_f32"          },
+    [AMD_V_MAX_F32]          = { AMD_FMT_VOP2, 0x10, "v_max_f32"          },
 
     /* VOP1 */
     [AMD_V_MOV_B32]          = { AMD_FMT_VOP1, 0x01, "v_mov_b32"          },
@@ -99,6 +101,17 @@ const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     [AMD_V_CVT_F64_F32]      = { AMD_FMT_VOP1, 0x10, "v_cvt_f64_f32"      },
     [AMD_V_CVT_F32_F64]      = { AMD_FMT_VOP1, 0x0F, "v_cvt_f32_f64"      },
     [AMD_V_RCP_F32]          = { AMD_FMT_VOP1, 0x2A, "v_rcp_f32"          },
+    [AMD_V_SQRT_F32]         = { AMD_FMT_VOP1, 0x33, "v_sqrt_f32"         },
+    [AMD_V_RSQ_F32]          = { AMD_FMT_VOP1, 0x2E, "v_rsq_f32"          },
+    [AMD_V_EXP_F32]          = { AMD_FMT_VOP1, 0x25, "v_exp_f32"          },
+    [AMD_V_LOG_F32]          = { AMD_FMT_VOP1, 0x27, "v_log_f32"          },
+    [AMD_V_SIN_F32]          = { AMD_FMT_VOP1, 0x35, "v_sin_f32"          },
+    [AMD_V_COS_F32]          = { AMD_FMT_VOP1, 0x36, "v_cos_f32"          },
+    [AMD_V_FLOOR_F32]        = { AMD_FMT_VOP1, 0x24, "v_floor_f32"        },
+    [AMD_V_CEIL_F32]         = { AMD_FMT_VOP1, 0x22, "v_ceil_f32"         },
+    [AMD_V_TRUNC_F32]        = { AMD_FMT_VOP1, 0x21, "v_trunc_f32"        },
+    [AMD_V_RNDNE_F32]        = { AMD_FMT_VOP1, 0x23, "v_rndne_f32"        },
+    [AMD_V_FRACT_F32]        = { AMD_FMT_VOP1, 0x20, "v_fract_f32"        },
     [AMD_V_NOT_B32]          = { AMD_FMT_VOP1, 0x37, "v_not_b32"          },
     [AMD_V_READFIRSTLANE_B32]= { AMD_FMT_VOP1, 0x02, "v_readfirstlane_b32"},
 

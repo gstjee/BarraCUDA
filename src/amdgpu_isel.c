@@ -570,6 +570,8 @@ static void isel_arith(uint32_t idx, const bir_inst_t *I, int div)
         case BIR_FADD: emit2(AMD_V_ADD_F32, dst, src0, ensure_vgpr(src1)); break;
         case BIR_FSUB: emit2(AMD_V_SUB_F32, dst, src0, ensure_vgpr(src1)); break;
         case BIR_FMUL: emit2(AMD_V_MUL_F32, dst, src0, ensure_vgpr(src1)); break;
+        case BIR_FMAX: emit2(AMD_V_MAX_F32, dst, src0, ensure_vgpr(src1)); break;
+        case BIR_FMIN: emit2(AMD_V_MIN_F32, dst, src0, ensure_vgpr(src1)); break;
         case BIR_FDIV: {
             /* v_rcp_f32 + v_mul_f32 */
             uint32_t tmp = new_vreg(1);
@@ -642,8 +644,8 @@ static void isel_arith(uint32_t idx, const bir_inst_t *I, int div)
         case BIR_ASHR: emit2(AMD_S_ASHR_I32, dst, src0, src1); break;
         /* Float ops: no scalar float ALU on AMDGPU, always vector */
         case BIR_FADD: case BIR_FSUB: case BIR_FMUL:
+        case BIR_FMAX: case BIR_FMIN:
         case BIR_FDIV: case BIR_FREM: {
-            /* Promote to vector for float */
             S.amd->val_file[idx] = 1;
             S.amd->reg_file[vr] = 1;
             moperand_t vdst = mop_vreg_v((uint16_t)vr);
@@ -652,6 +654,8 @@ static void isel_arith(uint32_t idx, const bir_inst_t *I, int div)
             if (I->op == BIR_FADD) emit2(AMD_V_ADD_F32, vdst, vs0, vs1);
             else if (I->op == BIR_FSUB) emit2(AMD_V_SUB_F32, vdst, vs0, vs1);
             else if (I->op == BIR_FMUL) emit2(AMD_V_MUL_F32, vdst, vs0, vs1);
+            else if (I->op == BIR_FMAX) emit2(AMD_V_MAX_F32, vdst, vs0, vs1);
+            else if (I->op == BIR_FMIN) emit2(AMD_V_MIN_F32, vdst, vs0, vs1);
             else if (I->op == BIR_FDIV) {
                 uint32_t rcp = new_vreg(1);
                 emit1(AMD_V_RCP_F32, mop_vreg_v((uint16_t)rcp), vs1);
@@ -915,11 +919,39 @@ static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
         break;
     }
     case BIR_PTRTOINT: case BIR_INTTOPTR: case BIR_BITCAST: {
-        /* Reinterpret: just copy */
         if (div)
             emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), ensure_vgpr(src));
         else
             emit1(AMD_S_MOV_B32, mop_vreg_s((uint16_t)vr), src);
+        break;
+    }
+    case BIR_SQRT: case BIR_RSQ: case BIR_RCP:
+    case BIR_EXP2: case BIR_LOG2:
+    case BIR_SIN: case BIR_COS:
+    case BIR_FLOOR: case BIR_CEIL: case BIR_FTRUNC: case BIR_RNDNE: {
+        S.amd->val_file[idx] = 1;
+        S.amd->reg_file[vr] = 1;
+        static const struct { bir_op_t bo; amd_op_t ao; } m1[] = {
+            {BIR_SQRT,AMD_V_SQRT_F32},{BIR_RSQ,AMD_V_RSQ_F32},
+            {BIR_RCP,AMD_V_RCP_F32},{BIR_EXP2,AMD_V_EXP_F32},
+            {BIR_LOG2,AMD_V_LOG_F32},{BIR_SIN,AMD_V_SIN_F32},
+            {BIR_COS,AMD_V_COS_F32},{BIR_FLOOR,AMD_V_FLOOR_F32},
+            {BIR_CEIL,AMD_V_CEIL_F32},{BIR_FTRUNC,AMD_V_TRUNC_F32},
+            {BIR_RNDNE,AMD_V_RNDNE_F32},
+        };
+        for (int mi = 0; mi < 11; mi++) {
+            if (m1[mi].bo == I->op) {
+                emit1(m1[mi].ao, mop_vreg_v((uint16_t)vr), ensure_vgpr(src));
+                break;
+            }
+        }
+        break;
+    }
+    case BIR_FABS: {
+        S.amd->val_file[idx] = 1;
+        S.amd->reg_file[vr] = 1;
+        emit2(AMD_V_AND_B32, mop_vreg_v((uint16_t)vr),
+              ensure_vgpr(src), mop_imm(0x7FFFFFFF));
         break;
     }
     default:
@@ -1727,6 +1759,7 @@ static void isel_function(uint32_t fi)
             case BIR_SDIV: case BIR_UDIV: case BIR_SREM: case BIR_UREM:
             case BIR_FADD: case BIR_FSUB: case BIR_FMUL:
             case BIR_FDIV: case BIR_FREM:
+            case BIR_FMAX: case BIR_FMIN:
             case BIR_AND: case BIR_OR: case BIR_XOR:
             case BIR_SHL: case BIR_LSHR: case BIR_ASHR:
                 isel_arith(idx, I, div);
@@ -1746,6 +1779,11 @@ static void isel_function(uint32_t fi)
             case BIR_FPTOSI: case BIR_FPTOUI:
             case BIR_SITOFP: case BIR_UITOFP:
             case BIR_PTRTOINT: case BIR_INTTOPTR: case BIR_BITCAST:
+            case BIR_SQRT: case BIR_RSQ: case BIR_RCP:
+            case BIR_EXP2: case BIR_LOG2:
+            case BIR_SIN: case BIR_COS:
+            case BIR_FABS: case BIR_FLOOR: case BIR_CEIL:
+            case BIR_FTRUNC: case BIR_RNDNE:
                 isel_conversion(idx, I, div);
                 break;
 

@@ -118,6 +118,13 @@ typedef enum {
     BIR_FPTOSI, BIR_FPTOUI, BIR_SITOFP, BIR_UITOFP,
     BIR_PTRTOINT, BIR_INTTOPTR, BIR_BITCAST,
 
+    /* Math */
+    BIR_SQRT, BIR_RSQ, BIR_RCP,
+    BIR_EXP2, BIR_LOG2,
+    BIR_SIN, BIR_COS,
+    BIR_FABS, BIR_FLOOR, BIR_CEIL, BIR_FTRUNC, BIR_RNDNE,
+    BIR_FMAX, BIR_FMIN,
+
     /* Memory */
     BIR_ALLOCA,                 /* per-thread stack. subop = log2(align) */
     BIR_SHARED_ALLOC,           /* per-block SRAM. Not stack, not heap. Its own thing. */

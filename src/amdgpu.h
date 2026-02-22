@@ -147,6 +147,8 @@ typedef enum {
     AMD_V_SUB_F32,
     AMD_V_MUL_F32,
     AMD_V_CNDMASK_B32,
+    AMD_V_MIN_F32,
+    AMD_V_MAX_F32,
 
     /* -- VOP1: vector one-input -- */
     AMD_V_MOV_B32,
@@ -159,6 +161,17 @@ typedef enum {
     AMD_V_CVT_F64_F32,
     AMD_V_CVT_F32_F64,
     AMD_V_RCP_F32,
+    AMD_V_SQRT_F32,
+    AMD_V_RSQ_F32,
+    AMD_V_EXP_F32,
+    AMD_V_LOG_F32,
+    AMD_V_SIN_F32,
+    AMD_V_COS_F32,
+    AMD_V_FLOOR_F32,
+    AMD_V_CEIL_F32,
+    AMD_V_TRUNC_F32,
+    AMD_V_RNDNE_F32,
+    AMD_V_FRACT_F32,
     AMD_V_NOT_B32,
     AMD_V_READFIRSTLANE_B32,
 

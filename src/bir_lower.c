@@ -1352,6 +1352,177 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             return BIR_MAKE_VAL(inst);
         }
 
+        /* ---- Math builtins: unary ---- */
+        {
+            static const struct { const char *n; uint16_t op; } mt1[] = {
+                {"sqrtf",BIR_SQRT},{"__fsqrt_rn",BIR_SQRT},
+                {"rsqrtf",BIR_RSQ},{"__frsqrt_rn",BIR_RSQ},
+                {"__frcp_rn",BIR_RCP},
+                {"exp2f",BIR_EXP2},{"log2f",BIR_LOG2},{"__log2f",BIR_LOG2},
+                {"fabsf",BIR_FABS},{"fabs",BIR_FABS},
+                {"floorf",BIR_FLOOR},{"ceilf",BIR_CEIL},
+                {"truncf",BIR_FTRUNC},{"roundf",BIR_RNDNE},{"rintf",BIR_RNDNE},
+            };
+            for (int mi = 0; mi < 15; mi++) {
+                if (strcmp(cname, mt1[mi].n) != 0) continue;
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t rt = ref_type(L, v);
+                uint32_t r = emit(L, mt1[mi].op, rt, 1, 0);
+                set_op(L, r, 0, v);
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
+        /* ---- Math builtins: binary ---- */
+        {
+            static const struct { const char *n; uint16_t op; } mt2[] = {
+                {"fmaxf",BIR_FMAX},{"fminf",BIR_FMIN},{"fmodf",BIR_FREM},
+            };
+            for (int mi = 0; mi < 3; mi++) {
+                if (strcmp(cname, mt2[mi].n) != 0) continue;
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t a0 = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t a1 = lower_expr(L, an);
+                uint32_t rt = ref_type(L, a0);
+                uint32_t r = emit(L, mt2[mi].op, rt, 2, 0);
+                set_op(L, r, 0, a0);
+                set_op(L, r, 1, a1);
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
+        /* ---- Math builtins: compound (scaling constants) ---- */
+        {
+            uint32_t f32 = bir_type_float(L->M, 32);
+            /* expf(x) = exp2(x * log2(e)) */
+            if (strcmp(cname, "expf") == 0 || strcmp(cname, "__expf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, f32, 1.4426950408889634));
+                uint32_t m = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, m, 0, v); set_op(L, m, 1, k);
+                uint32_t r = emit(L, BIR_EXP2, f32, 1, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(m));
+                return BIR_MAKE_VAL(r);
+            }
+            /* logf(x) = log2(x) * ln(2) */
+            if (strcmp(cname, "logf") == 0 || strcmp(cname, "__logf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t lg = emit(L, BIR_LOG2, f32, 1, 0);
+                set_op(L, lg, 0, v);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, f32, 0.6931471805599453));
+                uint32_t r = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(lg)); set_op(L, r, 1, k);
+                return BIR_MAKE_VAL(r);
+            }
+            /* log10f(x) = log2(x) * log10(2) */
+            if (strcmp(cname, "log10f") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t lg = emit(L, BIR_LOG2, f32, 1, 0);
+                set_op(L, lg, 0, v);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, f32, 0.30102999566398114));
+                uint32_t r = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(lg)); set_op(L, r, 1, k);
+                return BIR_MAKE_VAL(r);
+            }
+            /* sinf(x) = hw_sin(x / 2pi) */
+            if (strcmp(cname, "sinf") == 0 || strcmp(cname, "__sinf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, f32, 0.15915494309189535));
+                uint32_t m = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, m, 0, v); set_op(L, m, 1, k);
+                uint32_t r = emit(L, BIR_SIN, f32, 1, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(m));
+                return BIR_MAKE_VAL(r);
+            }
+            /* cosf(x) = hw_cos(x / 2pi) */
+            if (strcmp(cname, "cosf") == 0 || strcmp(cname, "__cosf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, f32, 0.15915494309189535));
+                uint32_t m = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, m, 0, v); set_op(L, m, 1, k);
+                uint32_t r = emit(L, BIR_COS, f32, 1, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(m));
+                return BIR_MAKE_VAL(r);
+            }
+            /* tanf(x) = sin(t) / cos(t), t = x / 2pi */
+            if (strcmp(cname, "tanf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, f32, 0.15915494309189535));
+                uint32_t t = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, t, 0, v); set_op(L, t, 1, k);
+                uint32_t s = emit(L, BIR_SIN, f32, 1, 0);
+                set_op(L, s, 0, BIR_MAKE_VAL(t));
+                uint32_t c = emit(L, BIR_COS, f32, 1, 0);
+                set_op(L, c, 0, BIR_MAKE_VAL(t));
+                uint32_t r = emit(L, BIR_FDIV, f32, 2, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(s)); set_op(L, r, 1, BIR_MAKE_VAL(c));
+                return BIR_MAKE_VAL(r);
+            }
+            /* powf(x,y) = exp2(y * log2(x)) */
+            if (strcmp(cname, "powf") == 0 || strcmp(cname, "__powf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t x = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t y = lower_expr(L, an);
+                uint32_t lg = emit(L, BIR_LOG2, f32, 1, 0);
+                set_op(L, lg, 0, x);
+                uint32_t m = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, m, 0, y); set_op(L, m, 1, BIR_MAKE_VAL(lg));
+                uint32_t r = emit(L, BIR_EXP2, f32, 1, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(m));
+                return BIR_MAKE_VAL(r);
+            }
+            /* tanhf(x) = (e2-1)/(e2+1), e2 = exp2(2x * log2e) */
+            if (strcmp(cname, "tanhf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t k2 = BIR_MAKE_CONST(bir_const_float(L->M, f32, 2.8853900817779268));
+                uint32_t m = emit(L, BIR_FMUL, f32, 2, 0);
+                set_op(L, m, 0, v); set_op(L, m, 1, k2);
+                uint32_t e2 = emit(L, BIR_EXP2, f32, 1, 0);
+                set_op(L, e2, 0, BIR_MAKE_VAL(m));
+                uint32_t one = BIR_MAKE_CONST(bir_const_float(L->M, f32, 1.0));
+                uint32_t nm = emit(L, BIR_FSUB, f32, 2, 0);
+                set_op(L, nm, 0, BIR_MAKE_VAL(e2)); set_op(L, nm, 1, one);
+                uint32_t dn = emit(L, BIR_FADD, f32, 2, 0);
+                set_op(L, dn, 0, BIR_MAKE_VAL(e2)); set_op(L, dn, 1, one);
+                uint32_t r = emit(L, BIR_FDIV, f32, 2, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(nm)); set_op(L, r, 1, BIR_MAKE_VAL(dn));
+                return BIR_MAKE_VAL(r);
+            }
+            /* copysignf(x,y) = (x & 0x7FFFFFFF) | (y & 0x80000000) */
+            if (strcmp(cname, "copysignf") == 0) {
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t xv = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t yv = lower_expr(L, an);
+                uint32_t i32 = bir_type_int(L->M, 32);
+                uint32_t bx = emit(L, BIR_BITCAST, i32, 1, 0);
+                set_op(L, bx, 0, xv);
+                uint32_t by = emit(L, BIR_BITCAST, i32, 1, 0);
+                set_op(L, by, 0, yv);
+                uint32_t mk = BIR_MAKE_CONST(bir_const_int(L->M, i32, 0x7FFFFFFF));
+                uint32_t sb = BIR_MAKE_CONST(bir_const_int(L->M, i32, (int64_t)0x80000000u));
+                uint32_t ax = emit(L, BIR_AND, i32, 2, 0);
+                set_op(L, ax, 0, BIR_MAKE_VAL(bx)); set_op(L, ax, 1, mk);
+                uint32_t ay = emit(L, BIR_AND, i32, 2, 0);
+                set_op(L, ay, 0, BIR_MAKE_VAL(by)); set_op(L, ay, 1, sb);
+                uint32_t o = emit(L, BIR_OR, i32, 2, 0);
+                set_op(L, o, 0, BIR_MAKE_VAL(ax)); set_op(L, o, 1, BIR_MAKE_VAL(ay));
+                uint32_t r = emit(L, BIR_BITCAST, f32, 1, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(o));
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
         /* ---- Regular function call ---- */
 
         /* Find function in module */

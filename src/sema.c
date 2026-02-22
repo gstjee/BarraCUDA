@@ -584,6 +584,14 @@ static const cuda_builtin_t cuda_builtins[] = {
     {"__shfl_up_sync",  -1, 0,  1},
     {"__shfl_down_sync",-1, 0,  1},
     {"__shfl_xor_sync", -1, 0,  1},
+    {"sqrtf",1,0,0},{"__fsqrt_rn",1,0,0},{"rsqrtf",1,0,0},{"__frsqrt_rn",1,0,0},
+    {"__frcp_rn",1,0,0},{"expf",1,0,0},{"__expf",1,0,0},{"exp2f",1,0,0},
+    {"logf",1,0,0},{"__logf",1,0,0},{"log2f",1,0,0},{"__log2f",1,0,0},
+    {"log10f",1,0,0},{"sinf",1,0,0},{"__sinf",1,0,0},{"cosf",1,0,0},
+    {"__cosf",1,0,0},{"tanf",1,0,0},{"fabsf",1,0,0},{"fabs",1,0,0},
+    {"floorf",1,0,0},{"ceilf",1,0,0},{"truncf",1,0,0},{"roundf",1,0,0},
+    {"rintf",1,0,0},{"tanhf",1,0,0},{"copysignf",2,0,0},
+    {"fmaxf",2,0,0},{"fminf",2,0,0},{"fmodf",2,0,0},{"powf",2,0,0},{"__powf",2,0,0},
     {NULL, 0, 0, 0}
 };
 
