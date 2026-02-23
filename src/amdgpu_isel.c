@@ -519,7 +519,22 @@ static int bir_type_width(uint32_t tidx)
     if (t->kind == BIR_TYPE_INT || t->kind == BIR_TYPE_FLOAT)
         return t->width;
     if (t->kind == BIR_TYPE_PTR) return 64;
+    if (t->kind == BIR_TYPE_ARRAY)
+        return (int)t->count * bir_type_width(t->inner);
     return 32;
+}
+
+static uint32_t arrsz(uint32_t tidx)
+{
+    if (tidx >= S.bir->num_types) return 4;
+    const bir_type_t *t = &S.bir->types[tidx];
+    if (t->kind == BIR_TYPE_ARRAY)
+        return t->count * arrsz(t->inner);
+    if (t->kind == BIR_TYPE_INT || t->kind == BIR_TYPE_FLOAT)
+        return t->width / 8;
+    if (t->kind == BIR_TYPE_PTR) return 8;
+    if (t->kind == BIR_TYPE_STRUCT) return t->num_fields * 4;
+    return 4;
 }
 
 /* Get type kind */
@@ -544,11 +559,7 @@ static uint32_t pointee_size(uint32_t ptr_type)
     if (ptr_type >= S.bir->num_types) return 4;
     const bir_type_t *pt = &S.bir->types[ptr_type];
     if (pt->kind != BIR_TYPE_PTR || pt->inner >= S.bir->num_types) return 4;
-    const bir_type_t *elem = &S.bir->types[pt->inner];
-    if (elem->kind == BIR_TYPE_INT || elem->kind == BIR_TYPE_FLOAT)
-        return elem->width / 8;
-    if (elem->kind == BIR_TYPE_PTR) return 8;
-    return 4;
+    return arrsz(pt->inner);
 }
 
 /* ---- Instruction Selection: Individual BIR Opcodes ---- */
@@ -1153,37 +1164,14 @@ static void isel_alloca(uint32_t idx, const bir_inst_t *I)
     /* v_mov_b32 vr, scratch_offset */
     emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_imm((int32_t)S.scratch_offset));
 
-    /* Advance scratch offset by the alloca size (from type) */
-    uint32_t sz = 4; /* default */
-    if (I->type < S.bir->num_types) {
-        const bir_type_t *pt = &S.bir->types[I->type];
-        if (pt->kind == BIR_TYPE_PTR && pt->inner < S.bir->num_types) {
-            const bir_type_t *elem = &S.bir->types[pt->inner];
-            if (elem->kind == BIR_TYPE_INT || elem->kind == BIR_TYPE_FLOAT)
-                sz = elem->width / 8;
-            else if (elem->kind == BIR_TYPE_ARRAY && elem->count < 0x10000)
-                sz = elem->count * 4;
-        }
-    }
+    uint32_t sz = pointee_size(I->type);
+    if (sz < 4) sz = 4;
     S.scratch_offset += sz;
 }
 
 static void isel_shared_alloc(uint32_t idx, const bir_inst_t *I)
 {
-    /* Static LDS allocation — cumulative offset per function */
-    uint32_t sz = 4;
-    if (I->type < S.bir->num_types) {
-        const bir_type_t *pt = &S.bir->types[I->type];
-        if (pt->kind == BIR_TYPE_PTR && pt->inner < S.bir->num_types) {
-            const bir_type_t *elem = &S.bir->types[pt->inner];
-            if (elem->kind == BIR_TYPE_ARRAY && elem->count < 0x10000)
-                sz = elem->count * (uint32_t)bir_type_width(elem->inner) / 8;
-            else if (elem->kind == BIR_TYPE_INT || elem->kind == BIR_TYPE_FLOAT)
-                sz = elem->width / 8;
-            else if (elem->kind == BIR_TYPE_STRUCT)
-                sz = elem->num_fields * 4; /* rough estimate */
-        }
-    }
+    uint32_t sz = pointee_size(I->type);
     if (sz < 1) sz = 4;
     /* Align to 4 bytes */
     S.lds_offset = (S.lds_offset + 3u) & ~3u;

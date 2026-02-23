@@ -798,6 +798,15 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
         set_op(L, gep, 0, base_v);
         set_op(L, gep, 1, idx_v);
 
+        /* a[i] on array-of-array: yield pointer, don't load */
+        if (et < L->M->num_types &&
+            L->M->types[et].kind == BIR_TYPE_ARRAY) {
+            uint32_t ipt = bir_type_ptr(L->M, et,
+                is_ptr_type(L, bt) ? L->M->types[bt].addrspace : 0);
+            L->M->insts[gep].type = ipt;
+            return BIR_MAKE_VAL(gep);
+        }
+
         uint32_t ld = emit(L, BIR_LOAD, et, 1, 0);
         set_op(L, ld, 0, BIR_MAKE_VAL(gep));
         return BIR_MAKE_VAL(ld);
@@ -1742,31 +1751,38 @@ static void lower_var_decl(lower_t *L, uint32_t node)
 
     uint32_t elem_t = resolve_type(L, type_n, n->d.oper.flags, n->cuda_flags);
 
-    /* Check for array declaration: child after name might be array size */
+    /* Collect array dimensions: float a[16][16] → dims={16,16}, ndim=2 */
     uint32_t next = ND(L, name_n)->next_sibling;
     int is_array = 0;
-    uint32_t arr_count = 0;
+    uint32_t dims[8];
+    int ndim = 0;
 
-    /* Array size: integer literal, enum constant, or template int param */
-    if (next && ND(L, next)->type == AST_INT_LIT) {
-        is_array = 1;
-        arr_count = (uint32_t)parse_int_text(
-            L->src + ND(L, next)->d.text.offset,
-            (int)ND(L, next)->d.text.len);
-    } else if (next && ND(L, next)->type == AST_IDENT) {
-        char aname[128];
-        get_text(L, next, aname, sizeof(aname));
-        int64_t aval;
-        if (find_enum(L, aname, &aval) || find_binding_int(L, aname, &aval)) {
+    while (next && ndim < 8) {
+        if (ND(L, next)->type == AST_INT_LIT) {
+            dims[ndim++] = (uint32_t)parse_int_text(
+                L->src + ND(L, next)->d.text.offset,
+                (int)ND(L, next)->d.text.len);
             is_array = 1;
-            arr_count = (uint32_t)aval;
-        }
+            next = ND(L, next)->next_sibling;
+        } else if (ND(L, next)->type == AST_IDENT) {
+            char aname[128];
+            get_text(L, next, aname, sizeof(aname));
+            int64_t aval;
+            if (find_enum(L, aname, &aval) || find_binding_int(L, aname, &aval)) {
+                dims[ndim++] = (uint32_t)aval;
+                is_array = 1;
+                next = ND(L, next)->next_sibling;
+            } else break;
+        } else break;
     }
+    uint32_t arr_count = ndim > 0 ? dims[0] : 0;
 
     /* ---- __shared__ variables: LDS allocation, no initializer ---- */
     if (n->cuda_flags & CUDA_SHARED) {
         if (is_array) {
-            uint32_t arr_t = bir_type_array(L->M, elem_t, arr_count);
+            uint32_t arr_t = elem_t;
+            for (int d = ndim - 1; d >= 0; d--)
+                arr_t = bir_type_array(L->M, arr_t, dims[d]);
             uint32_t ptr_t = bir_type_ptr(L->M, arr_t, BIR_AS_SHARED);
             uint32_t sa = emit(L, BIR_SHARED_ALLOC, ptr_t, 0, 0);
             add_sym(L, name, sa, arr_t, 1);
@@ -1779,7 +1795,9 @@ static void lower_var_decl(lower_t *L, uint32_t node)
     }
 
     if (is_array) {
-        uint32_t arr_t = bir_type_array(L->M, elem_t, arr_count);
+        uint32_t arr_t = elem_t;
+        for (int d = ndim - 1; d >= 0; d--)
+            arr_t = bir_type_array(L->M, arr_t, dims[d]);
         uint32_t ptr_t = bir_type_ptr(L->M, arr_t, BIR_AS_PRIVATE);
         uint32_t alloca = emit(L, BIR_ALLOCA, ptr_t, 0, 0);
         add_sym(L, name, alloca, arr_t, 1);
