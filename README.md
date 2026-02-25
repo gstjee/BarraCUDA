@@ -6,6 +6,8 @@ This is what happens when you look at NVIDIA's walled garden and think "how hard
 
 **UPDATE: RDNA 2, 3 and 4 now supported.** `--gfx1030` / `--gfx1100` / `--gfx1200`
 
+**UPDATE: HSA runtime launcher added.** Compile kernels and dispatch them on real AMD hardware — no HIP, no hipcc. See [Runtime Launcher](#runtime-launcher).
+
 ## What It Does
 
 Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compiles them to AMD RDNA 2 (gfx1030), RDNA 3 (gfx1100) and RDNA 4 (gfx1200) binaries. No LLVM. No HIP translation layer. No "convert your CUDA to something else first." Just a lexer, a parser, an IR, and a hand-written instruction selection backend that would make a compiler textbook weep.

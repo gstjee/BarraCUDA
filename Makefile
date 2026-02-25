@@ -25,7 +25,25 @@ $(TARGET): $(OBJECTS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-clean:
-	rm -f $(OBJECTS) $(TARGET) $(TARGET).exe
+# ---- Test Suite ----
+TCFLAGS = -std=c99 -Wall -Wextra -O0 -g -Isrc -Isrc/fe -Isrc/ir -Isrc/amdgpu
+TSRC    = tests/tmain.c tests/tsmoke.c tests/tcomp.c tests/tenc.c \
+          tests/ttabs.c tests/ttypes.c tests/terrs.c tests/tphase.c
+TOBJS   = $(TSRC:.c=.o)
+COBJS   = src/ir/bir.o src/ir/bir_print.o src/ir/bir_lower.o src/ir/bir_mem2reg.o \
+          src/amdgpu/encode.o src/amdgpu/enc_tab.o src/amdgpu/isel.o src/amdgpu/emit.o \
+          src/fe/lexer.o src/fe/parser.o src/fe/preproc.o src/fe/sema.o
 
-.PHONY: all clean
+test: $(TARGET) trunner
+	./trunner --all
+
+trunner: $(TOBJS) $(COBJS)
+	$(CC) $(TCFLAGS) -o $@ $^
+
+tests/%.o: tests/%.c
+	$(CC) $(TCFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJECTS) $(TARGET) $(TARGET).exe trunner trunner.exe $(TOBJS)
+
+.PHONY: all clean test
