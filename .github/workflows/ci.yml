@@ -20,12 +20,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install GCC
-        run: brew install gcc
+      - name: Find GCC
+        run: echo "REAL_GCC=$(ls $(brew --prefix gcc)/bin/gcc-1* | head -1)" >> $GITHUB_ENV
       - name: Build
-        run: make CC=gcc-14
+        run: make CC=$REAL_GCC
       - name: Test
-        run: make test CC=gcc-14
+        run: make test CC=$REAL_GCC
 
   windows:
     runs-on: windows-latest
