@@ -95,7 +95,7 @@ gcc -std=c99 -O2 -I src/runtime \
 ./launch_saxpy test.hsaco
 ```
 
-Requires Linux with ROCm installed. See `examples/launch_saxpy.c` for a complete example.
+Requires Linux with ROCm installed. See `examples/launch_saxpy.c` for a complete example. **Not yet tested on real hardware** — if you have an AMD GPU, we'd love a test report ([#39](https://github.com/Zaneham/BarraCUDA/issues/39)).
 
 ## What Works
 
