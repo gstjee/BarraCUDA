@@ -133,6 +133,7 @@ static const char *type_kind_names[BIR_TYPE_KIND_COUNT] = {
     [BIR_TYPE_VOID]   = "void",
     [BIR_TYPE_INT]    = "int",
     [BIR_TYPE_FLOAT]  = "float",
+    [BIR_TYPE_BFLOAT] = "bfloat",
     [BIR_TYPE_PTR]    = "ptr",
     [BIR_TYPE_VECTOR] = "vector",
     [BIR_TYPE_STRUCT] = "struct",
@@ -282,6 +283,15 @@ uint32_t bir_type_float(bir_module_t *M, int width_bits)
     memset(&t, 0, sizeof(t));
     t.kind = BIR_TYPE_FLOAT;
     t.width = (uint16_t)width_bits;
+    return intern_type(M, &t);
+}
+
+uint32_t bir_type_bfloat(bir_module_t *M)
+{
+    bir_type_t t;
+    memset(&t, 0, sizeof(t));
+    t.kind = BIR_TYPE_BFLOAT;
+    t.width = 16;
     return intern_type(M, &t);
 }
 

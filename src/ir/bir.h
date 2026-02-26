@@ -54,6 +54,7 @@ typedef enum {
     BIR_TYPE_VOID,
     BIR_TYPE_INT,       /* width: 1, 8, 16, 32, 64 bits */
     BIR_TYPE_FLOAT,     /* width: 16, 32, 64 bits */
+    BIR_TYPE_BFLOAT,    /* width: 16 (brain float) */
     BIR_TYPE_PTR,       /* addrspace + pointee */
     BIR_TYPE_VECTOR,    /* <N x element> where N = width field */
     BIR_TYPE_STRUCT,    /* named or anonymous aggregate */
@@ -296,6 +297,7 @@ void        bir_module_init(bir_module_t *M);
 uint32_t    bir_type_void(bir_module_t *M);
 uint32_t    bir_type_int(bir_module_t *M, int width_bits);
 uint32_t    bir_type_float(bir_module_t *M, int width_bits);
+uint32_t    bir_type_bfloat(bir_module_t *M);
 uint32_t    bir_type_ptr(bir_module_t *M, uint32_t pointee, int addrspace);
 uint32_t    bir_type_array(bir_module_t *M, uint32_t elem, uint32_t count);
 uint32_t    bir_type_vector(bir_module_t *M, uint32_t elem, uint32_t count);

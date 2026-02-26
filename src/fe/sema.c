@@ -158,7 +158,7 @@ static int is_floating(const sema_ctx_t *S, uint32_t t)
     if (t >= S->num_types) return 0;
     uint8_t k = S->types[t].kind;
     return k == STYPE_FLOAT || k == STYPE_DOUBLE || k == STYPE_LDOUBLE
-        || k == STYPE_HALF;
+        || k == STYPE_HALF || k == STYPE_BF16;
 }
 
 static int is_arithmetic(const sema_ctx_t *S, uint32_t t)
@@ -252,6 +252,9 @@ static uint32_t usual_arith_conv(sema_ctx_t *S, uint32_t a, uint32_t b)
     /* If either is half → half */
     if (a < S->num_types && S->types[a].kind == STYPE_HALF) return a;
     if (b < S->num_types && S->types[b].kind == STYPE_HALF) return b;
+    /* If either is bf16 → bf16 */
+    if (a < S->num_types && S->types[a].kind == STYPE_BF16) return a;
+    if (b < S->num_types && S->types[b].kind == STYPE_BF16) return b;
 
     /* Integer promotions on both */
     a = integer_promote(S, a);
@@ -391,6 +394,9 @@ static uint32_t resolve_typespec(sema_ctx_t *S, uint32_t node, int ptr_depth)
         if (strcmp(tname, "int8_t") == 0)       { base = st_schar(S); break; }
         if (strcmp(tname, "__half") == 0
             || strcmp(tname, "half") == 0)       { base = intern_type(S, STYPE_HALF, 0, 0, 0, 0); break; }
+        if (strcmp(tname, "__nv_bfloat16") == 0
+            || strcmp(tname, "nv_bfloat16") == 0
+            || strcmp(tname, "__bfloat16") == 0) { base = intern_type(S, STYPE_BF16, 0, 0, 0, 0); break; }
 
         /* ---- Vector types (CUDA vector_types.h) ---- */
         {
@@ -996,6 +1002,19 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
         if (strcmp(cname, "__half2float") == 0) {
             if (nargs != 1)
                 sema_error(S, node, "'__half2float' expects 1 arg, got %d", nargs);
+            return annotate(S, node, st_float(S));
+        }
+
+        /* ---- BF16 conversion builtins ---- */
+        if (strcmp(cname, "__float2bfloat16") == 0
+            || strcmp(cname, "__float2bfloat16_rn") == 0) {
+            if (nargs != 1)
+                sema_error(S, node, "'%s' expects 1 arg, got %d", cname, nargs);
+            return annotate(S, node, intern_type(S, STYPE_BF16, 0, 0, 0, 0));
+        }
+        if (strcmp(cname, "__bfloat162float") == 0) {
+            if (nargs != 1)
+                sema_error(S, node, "'__bfloat162float' expects 1 arg, got %d", nargs);
             return annotate(S, node, st_float(S));
         }
 
@@ -1605,7 +1624,7 @@ static const char *stype_kind_names[] = {
     "long", "unsigned long",
     "long long", "unsigned long long",
     "float", "double", "long double",
-    "__half",
+    "__half", "__bfloat16",
     "ptr", "array", "struct", "enum", "func", "vector",
     "<error>"
 };

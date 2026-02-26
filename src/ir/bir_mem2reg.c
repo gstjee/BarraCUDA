@@ -115,7 +115,8 @@ static int is_scalar_type(const bir_module_t *M, uint32_t tidx)
 {
     if (tidx >= M->num_types) return 0;
     uint8_t k = M->types[tidx].kind;
-    return k == BIR_TYPE_INT || k == BIR_TYPE_FLOAT || k == BIR_TYPE_PTR;
+    return k == BIR_TYPE_INT || k == BIR_TYPE_FLOAT || k == BIR_TYPE_BFLOAT
+        || k == BIR_TYPE_PTR;
 }
 
 static int find_promote_idx(const m2r_t *S, uint32_t alloca_inst)

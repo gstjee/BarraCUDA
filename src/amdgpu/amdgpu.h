@@ -162,6 +162,8 @@ typedef enum {
     AMD_V_CVT_F16_F32,
     AMD_V_CVT_F64_F32,
     AMD_V_CVT_F32_F64,
+    AMD_V_CVT_F32_BF16,
+    AMD_V_CVT_BF16_F32,
     AMD_V_RCP_F32,
     AMD_V_SQRT_F32,
     AMD_V_RSQ_F32,

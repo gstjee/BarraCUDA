@@ -516,7 +516,8 @@ static int bir_type_width(uint32_t tidx)
 {
     if (tidx >= S.bir->num_types) return 32;
     const bir_type_t *t = &S.bir->types[tidx];
-    if (t->kind == BIR_TYPE_INT || t->kind == BIR_TYPE_FLOAT)
+    if (t->kind == BIR_TYPE_INT || t->kind == BIR_TYPE_FLOAT
+        || t->kind == BIR_TYPE_BFLOAT)
         return t->width;
     if (t->kind == BIR_TYPE_PTR) return 64;
     if (t->kind == BIR_TYPE_ARRAY)
@@ -530,7 +531,8 @@ static uint32_t arrsz(uint32_t tidx)
     const bir_type_t *t = &S.bir->types[tidx];
     if (t->kind == BIR_TYPE_ARRAY)
         return t->count * arrsz(t->inner);
-    if (t->kind == BIR_TYPE_INT || t->kind == BIR_TYPE_FLOAT)
+    if (t->kind == BIR_TYPE_INT || t->kind == BIR_TYPE_FLOAT
+        || t->kind == BIR_TYPE_BFLOAT)
         return t->width / 8;
     if (t->kind == BIR_TYPE_PTR) return 8;
     if (t->kind == BIR_TYPE_STRUCT) return t->num_fields * 4;
@@ -909,21 +911,42 @@ static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
         break;
     }
     case BIR_FPTRUNC: {
-        /* f64->f32 or f32->f16 */
+        /* f64->f32, f32->f16, or f32->bf16 */
         S.amd->val_file[idx] = 1;
         S.amd->reg_file[vr] = 1;
-        int dw = bir_type_width(I->type);
-        if (dw <= 16)
+        uint8_t dkind = I->type < S.bir->num_types
+                       ? S.bir->types[I->type].kind : 0;
+        if (dkind == BIR_TYPE_BFLOAT)
+            emit2(AMD_V_LSHRREV_B32, mop_vreg_v((uint16_t)vr),
+                  mop_imm(16), ensure_vgpr(src));
+        else if (bir_type_width(I->type) <= 16)
             emit1(AMD_V_CVT_F16_F32, mop_vreg_v((uint16_t)vr), ensure_vgpr(src));
         else
             emit1(AMD_V_CVT_F32_F64, mop_vreg_v((uint16_t)vr), ensure_vgpr(src));
         break;
     }
     case BIR_FPEXT: {
+        /* bf16->f32, f16->f32, or f32->f64 */
         S.amd->val_file[idx] = 1;
         S.amd->reg_file[vr] = 1;
-        int dw = bir_type_width(I->type);
-        if (dw >= 64)
+        uint32_t opref = I->operands[0];
+        uint8_t skind = 0;
+        if (!BIR_VAL_IS_CONST(opref)) {
+            uint32_t oidx = BIR_VAL_INDEX(opref);
+            if (oidx < S.bir->num_insts) {
+                uint32_t styp = S.bir->insts[oidx].type;
+                if (styp < S.bir->num_types)
+                    skind = S.bir->types[styp].kind;
+            }
+        }
+        if (skind == BIR_TYPE_BFLOAT) {
+            if (S.amd->target >= AMD_TARGET_GFX1100)
+                emit1(AMD_V_CVT_F32_BF16, mop_vreg_v((uint16_t)vr),
+                      ensure_vgpr(src));
+            else
+                emit2(AMD_V_LSHLREV_B32, mop_vreg_v((uint16_t)vr),
+                      mop_imm(16), ensure_vgpr(src));
+        } else if (bir_type_width(I->type) >= 64)
             emit1(AMD_V_CVT_F64_F32, mop_vreg_v((uint16_t)vr), ensure_vgpr(src));
         else
             emit1(AMD_V_CVT_F32_F16, mop_vreg_v((uint16_t)vr), ensure_vgpr(src));

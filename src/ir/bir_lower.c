@@ -401,6 +401,10 @@ static uint32_t resolve_type(lower_t *L, uint32_t node, int ptr_depth,
             base = bir_type_int(L->M, 64);
         else if (strcmp(name, "__half") == 0 || strcmp(name, "half") == 0)
             base = bir_type_float(L->M, 16);
+        else if (strcmp(name, "__nv_bfloat16") == 0
+                 || strcmp(name, "nv_bfloat16") == 0
+                 || strcmp(name, "__bfloat16") == 0)
+            base = bir_type_bfloat(L->M);
         else {
             /* ---- Vector types → synthetic structs ---- */
             static const struct { const char *name; int elem; int lanes; } vec_map[] = {
@@ -499,7 +503,9 @@ static uint32_t ref_type(const lower_t *L, uint32_t ref)
 
 static int is_float_type(const lower_t *L, uint32_t t)
 {
-    return t < L->M->num_types && L->M->types[t].kind == BIR_TYPE_FLOAT;
+    if (t >= L->M->num_types) return 0;
+    uint8_t k = L->M->types[t].kind;
+    return k == BIR_TYPE_FLOAT || k == BIR_TYPE_BFLOAT;
 }
 
 static int is_ptr_type(const lower_t *L, uint32_t t)
@@ -1353,6 +1359,25 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             return BIR_MAKE_VAL(inst);
         }
         if (strcmp(cname, "__half2float") == 0) {
+            uint32_t an = ND(L, callee_n)->next_sibling;
+            uint32_t val = lower_expr(L, an);
+            uint32_t f32 = bir_type_float(L->M, 32);
+            uint32_t inst = emit(L, BIR_FPEXT, f32, 1, 0);
+            set_op(L, inst, 0, val);
+            return BIR_MAKE_VAL(inst);
+        }
+
+        /* ---- BF16 conversion builtins ---- */
+        if (strcmp(cname, "__float2bfloat16") == 0
+            || strcmp(cname, "__float2bfloat16_rn") == 0) {
+            uint32_t an = ND(L, callee_n)->next_sibling;
+            uint32_t val = lower_expr(L, an);
+            uint32_t bf16 = bir_type_bfloat(L->M);
+            uint32_t inst = emit(L, BIR_FPTRUNC, bf16, 1, 0);
+            set_op(L, inst, 0, val);
+            return BIR_MAKE_VAL(inst);
+        }
+        if (strcmp(cname, "__bfloat162float") == 0) {
             uint32_t an = ND(L, callee_n)->next_sibling;
             uint32_t val = lower_expr(L, an);
             uint32_t f32 = bir_type_float(L->M, 32);

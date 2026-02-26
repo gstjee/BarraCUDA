@@ -8,7 +8,7 @@
  * Two manuals, twice the fun.
  */
 
-/* ---- GFX11 Encoding Table ---- */
+/* ---- GFX11 Encoding Table (gfx1100, RDNA 3) ---- */
 
 const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     /* SOP2 */
@@ -95,6 +95,7 @@ const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     [AMD_V_CVT_F16_F32]      = { AMD_FMT_VOP1, 0x0A, "v_cvt_f16_f32"      },
     [AMD_V_CVT_F64_F32]      = { AMD_FMT_VOP1, 0x10, "v_cvt_f64_f32"      },
     [AMD_V_CVT_F32_F64]      = { AMD_FMT_VOP1, 0x0F, "v_cvt_f32_f64"      },
+    [AMD_V_CVT_F32_BF16]     = { AMD_FMT_VOP1, 0x72, "v_cvt_f32_bf16"    },
     [AMD_V_RCP_F32]          = { AMD_FMT_VOP1, 0x2A, "v_rcp_f32"          },
     [AMD_V_SQRT_F32]         = { AMD_FMT_VOP1, 0x33, "v_sqrt_f32"         },
     [AMD_V_RSQ_F32]          = { AMD_FMT_VOP1, 0x2E, "v_rsq_f32"          },

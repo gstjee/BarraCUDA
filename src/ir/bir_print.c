@@ -19,6 +19,8 @@ static int print_simple_type(const bir_module_t *M, uint32_t tidx,
         if (t->width == 16) return snprintf(buf, (size_t)size, "f16");
         if (t->width == 32) return snprintf(buf, (size_t)size, "f32");
         return snprintf(buf, (size_t)size, "f64");
+    case BIR_TYPE_BFLOAT:
+        return snprintf(buf, (size_t)size, "bf16");
     case BIR_TYPE_PTR:
         return snprintf(buf, (size_t)size, "ptr<%s>",
                         bir_addrspace_name(t->addrspace));
@@ -39,6 +41,7 @@ int bir_type_str(const bir_module_t *M, uint32_t tidx, char *buf, int size)
     case BIR_TYPE_VOID:
     case BIR_TYPE_INT:
     case BIR_TYPE_FLOAT:
+    case BIR_TYPE_BFLOAT:
         return print_simple_type(M, tidx, buf, size);
 
     case BIR_TYPE_PTR:
