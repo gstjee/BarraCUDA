@@ -4,6 +4,7 @@
 #include "sema.h"
 #include "bir_lower.h"
 #include "bir_mem2reg.h"
+#include "bir_dce.h"
 #include "amdgpu.h"
 #include <stdlib.h>
 
@@ -60,6 +61,7 @@ static void usage(const char *prog)
         "  --parse       Parse and dump AST\n"
         "  --ir          Lower to BIR and print IR\n"
         "  --no-mem2reg  Skip mem2reg optimization pass\n"
+        "  --no-dce      Skip dead code elimination\n"
         "  --sema        Run semantic analysis and dump types\n"
         "  --pp          Preprocess only and print result\n"
         "  --no-pp       Skip preprocessor\n"
@@ -86,6 +88,7 @@ int main(int argc, char *argv[])
     int mode_amdgpu = 0;
     int mode_amdgpu_bin = 0;
     int no_mem2reg = 0;
+    int no_dce = 0;
     int no_pp = 0;
     amd_target_t amd_target = AMD_TARGET_GFX1100;
     uint32_t     amd_elfm  = 0x41;       /* EF_AMDGPU_MACH for exact chip */
@@ -168,6 +171,8 @@ int main(int argc, char *argv[])
                 defines[num_defines++] = argv[i] + 2;
         } else if (strcmp(argv[i], "--no-mem2reg") == 0)
             no_mem2reg = 1;
+        else if (strcmp(argv[i], "--no-dce") == 0)
+            no_dce = 1;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -318,6 +323,8 @@ int main(int argc, char *argv[])
             if (lrc == BC_OK) {
                 if (!no_mem2reg)
                     bir_mem2reg(bir_module);
+                if (!no_dce)
+                    bir_dce(bir_module);
 
                 if (mode_ir) {
                     bir_print_module(bir_module, stdout);
