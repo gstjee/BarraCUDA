@@ -1,6 +1,6 @@
 # BarraCUDA
 
-An open-source CUDA C++ compiler written from scratch in C99 that takes `.cu` files and compiles them to AMD GPU machine code, with more architectures planned. No LLVM, no dependencies, and no permission asked.
+An open-source CUDA C++ compiler written from scratch in C99 that takes `.cu` files and compiles them to AMD GPU machine code and Tenstorrent Tensix C++, with more architectures planned. No LLVM, no dependencies, and no permission asked.
 
 This is what happens when you look at NVIDIA's walled garden and think "how hard can it be?" The answer is: quite hard, actually, but I did it anyway.
 
@@ -10,7 +10,7 @@ This is what happens when you look at NVIDIA's walled garden and think "how hard
 
 ## What It Does
 
-Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compiles them to AMD RDNA 2 (gfx1030), RDNA 3 (gfx1100) and RDNA 4 (gfx1200) binaries. No LLVM. No HIP translation layer. No "convert your CUDA to something else first." Just a lexer, a parser, an IR, and a hand-written instruction selection backend that would make a compiler textbook weep.
+Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compiles them to AMD RDNA 2/3/4 binaries or Tenstorrent Tensix Metalium C++. No LLVM. No HIP translation layer. No "convert your CUDA to something else first." Just a lexer, a parser, an IR, and hand-written backends that would make a compiler textbook weep.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -30,14 +30,15 @@ Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compile
 │       ↓                                                      │
 │  mem2reg → Promotes allocas to SSA registers                  │
 │       ↓                                                      │
-│  Instruction Selection → AMDGPU machine instructions         │
-│       ↓                                                      │
-│  Register Allocation → VGPR/SGPR assignment                  │
-│       ↓                                                      │
-│  Binary Encoding → GFX10/GFX11/GFX12 instruction words         │
-│       ↓                                                      │
-│  ELF Emission → .hsaco ready for the GPU                     │
-│       ↓                                                      │
+│  Instruction Selection                                       │
+│       ├──────────────────────┬───────────────────────┤        │
+│       ↓ AMD                  ↓ Tenstorrent            │        │
+│  VGPR/SGPR regalloc    Tensix SFPU isel              │        │
+│       ↓                      ↓                        │        │
+│  GFX10/11/12 encoding  Metalium C++ emission         │        │
+│       ↓                      ↓                        │        │
+│  .hsaco ELF            compute/reader/writer/host    │        │
+│       ↓                      ↓                        │        │
 │  Your kernel runs on silicon that NVIDIA doesn't control     │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -72,6 +73,9 @@ make
 # Compile for RDNA 4
 ./barracuda --amdgpu-bin --gfx1200 kernel.cu -o kernel.hsaco
 
+# Compile to Tenstorrent Metalium C++
+./barracuda --tensix kernel.cu -o kernel_compute.cpp
+
 # Dump the IR (for debugging or curiosity)
 ./barracuda --ir kernel.cu
 
@@ -101,7 +105,7 @@ Requires Linux with ROCm installed. See `examples/launch_saxpy.c` for a complete
 
 ## What Works
 
- The following CUDA features compile to working GFX10/GFX11/GFX12 machine code:
+ The following CUDA features compile to working GFX10/GFX11/GFX12 machine code and Tensix Metalium C++:
 
 ### Core Language
 - `__global__`, `__device__`, `__host__` function qualifiers
@@ -121,7 +125,7 @@ Requires Linux with ROCm installed. See `examples/launch_saxpy.c` for a complete
 - Warp intrinsics: `__shfl_sync`, `__shfl_up_sync`, `__shfl_down_sync`, `__shfl_xor_sync`
 - Warp votes: `__ballot_sync`, `__any_sync`, `__all_sync`
 - Vector types: `float2`, `float3`, `float4`, `int2`, `int3`, `int4` with `.x`/`.y`/`.z`/`.w` access
-- Half precision: `__half`, `__float2half()`, `__half2float()`
+- Half precision: `__half`, `__float2half()`, `__half2float()`, `__nv_bfloat16`
 - `__launch_bounds__` (parsed, propagated, enforces VGPR caps)
 - Cooperative groups: `cooperative_groups::this_thread_block()` with `.sync()`, `.thread_rank()`, `.size()`
 - Operator overloading
@@ -193,15 +197,15 @@ The generated code works but isn't winning any benchmarks. Priorities:
 
 - Instruction scheduling (hide memory latency)
 - Better register allocation (currently linear scan, consider graph colouring)
-- Constant folding and dead code elimination
+- Constant folding (dead code elimination: done)
 - Loop-invariant code motion
 - Occupancy tuning based on register pressure
 
 ### Long Term: More Architectures
 
-The IR (BIR) is target-independent. The backend is cleanly separated. Adding a new target means writing a new `isel` + `emit` pair. Candidates:
+The IR (BIR) is target-independent. The backend is cleanly separated. Adding a new target means writing a new `isel` + `emit` pair.
 
-- **Tenstorrent** - RISC-V based AI accelerators. Open ISA. Very different execution model (tile-based, not SIMT) but the IR maps well.
+- **Tenstorrent Tensix** - Done. Compiles CUDA to TT-Metalium C++ for Blackhole. `--tensix`
 - **Intel Arc** - Xe architecture. Would give BarraCUDA coverage across all three major GPU vendors.
 - **RISC-V Vector Extension** - For when GPUs are too mainstream and you want to run CUDA on a softcore.
 
