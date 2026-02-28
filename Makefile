@@ -43,7 +43,7 @@ test: $(TARGET) trunner
 	./trunner --all
 
 trunner: $(TOBJS) $(COBJS)
-	$(CC) $(TCFLAGS) -o $@ $^
+	$(CC) $(TCFLAGS) -o $@ $^ $(LIBS)
 
 tests/%.o: tests/%.c
 	$(CC) $(TCFLAGS) -c $< -o $@
