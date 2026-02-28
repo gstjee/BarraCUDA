@@ -13,6 +13,7 @@ This is what happens when you look at NVIDIA's walled garden and think "how hard
 ## What It Does
 
 Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compiles them to AMD RDNA 2/3/4 binaries or Tenstorrent Tensix Metalium C++. 
+
 ┌──────────────────────────────────────────────────────────────┐
 │                     BarraCUDA Pipeline                       │
 ├──────────────────────────────────────────────────────────────┤
