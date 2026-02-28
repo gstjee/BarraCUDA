@@ -8,6 +8,8 @@ This is what happens when you look at NVIDIA's walled garden and think "how hard
 
 **UPDATE: HSA runtime launcher added.** Compile kernels and dispatch them on AMD hardware. See [Runtime Launcher](#runtime-launcher).
 
+**UPDATE (AGAIN!):** Tenstorrent is now supported. Looking for testers, please fill out an issue if there is any problems. 
+
 ## What It Does
 
 Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compiles them to AMD RDNA 2/3/4 binaries or Tenstorrent Tensix Metalium C++. No LLVM. No HIP translation layer. No "convert your CUDA to something else first." Just a lexer, a parser, an IR, and hand-written backends that would make a compiler textbook weep.
