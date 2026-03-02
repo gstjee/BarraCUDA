@@ -72,6 +72,7 @@ static void usage(const char *prog)
         "  -D <name[=val]> Define a preprocessor macro\n"
         "  --amdgpu      Compile to AMDGCN assembly (default: gfx1100)\n"
         "  --amdgpu-bin  Compile to AMDGPU ELF code object (.hsaco)\n"
+        "  --gfx90a      Target CDNA 2 (gfx90a, MI250)\n"
         "  --gfx1030     Target RDNA 2 (gfx1030)\n"
         "  --gfx1200     Target RDNA 4 (gfx1200)\n"
         "  --tensix      Compile to TT-Metalium C++ (Tensix SFPU)\n"
@@ -123,6 +124,9 @@ int main(int argc, char *argv[])
             mode_amdgpu = 1;
         else if (strcmp(argv[i], "--amdgpu-bin") == 0)
             mode_amdgpu_bin = 1;
+        /* CDNA 2 (GFX9) */
+        else if (strcmp(argv[i], "--gfx90a") == 0)
+            { amd_target = AMD_TARGET_GFX90A; amd_elfm = 0x3F; amd_chip = "gfx90a"; }
         /* RDNA 2 (GFX10.3) */
         else if (strcmp(argv[i], "--gfx1030") == 0)
             { amd_target = AMD_TARGET_GFX1030; amd_elfm = 0x36; amd_chip = "gfx1030"; }

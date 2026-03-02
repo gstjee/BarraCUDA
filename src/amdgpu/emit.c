@@ -7,7 +7,7 @@
 /*
  * AMDGPU emitter: phi elimination, register allocation, assembly printer,
  * and ELF code object writer.
- * Targets RDNA 2 (gfx1030), RDNA 3 (gfx1100), and RDNA 4 (gfx1200), Wave32.
+ * Targets CDNA 2 (gfx90a, Wave64), RDNA 2/3/4 (gfx1030/1100/1200, Wave32).
  * Dependencies: libc, optimism, tea.
  */
 
@@ -344,10 +344,13 @@ static void regalloc_function(amd_module_t *A, uint32_t mf_idx)  /* called from 
        The maths of sharing: 256 VGPRs divided among the waves you
        promised the hardware you'd run. Break the promise at your peril. */
     if (F->launch_bounds_max > 0 && F->launch_bounds_max < 1024) {
-        uint32_t desired_waves = (F->launch_bounds_max + 31) / 32;
+        int w64 = (A->target <= AMD_TARGET_GFX90A);
+        uint32_t wsz = w64 ? 64u : 32u;
+        uint32_t desired_waves = (F->launch_bounds_max + wsz - 1) / wsz;
         if (desired_waves > 0) {
-            uint32_t vgpr_cap = (256 / desired_waves) & ~7u;
-            if (vgpr_cap < 8) vgpr_cap = 8;
+            uint32_t gran = w64 ? ~3u : ~7u;
+            uint32_t vgpr_cap = (256 / desired_waves) & gran;
+            if (vgpr_cap < (w64 ? 4u : 8u)) vgpr_cap = w64 ? 4u : 8u;
             if (F->num_vgprs > vgpr_cap)
                 F->num_vgprs = (uint16_t)vgpr_cap;
         }
@@ -446,8 +449,12 @@ static void print_operand(amd_module_t *A, const moperand_t *op)
         break;
     case MOP_SPECIAL:
         switch (op->imm) {
-        case AMD_SPEC_VCC:  asm_append(A, "vcc_lo"); break;
-        case AMD_SPEC_EXEC: asm_append(A, "exec_lo"); break;
+        case AMD_SPEC_VCC:
+            asm_append(A, A->target <= AMD_TARGET_GFX90A ? "vcc" : "vcc_lo");
+            break;
+        case AMD_SPEC_EXEC:
+            asm_append(A, A->target <= AMD_TARGET_GFX90A ? "exec" : "exec_lo");
+            break;
         case AMD_SPEC_SCC:  asm_append(A, "scc"); break;
         case AMD_SPEC_M0:   asm_append(A, "m0"); break;
         default:            asm_append(A, "???"); break;
@@ -847,21 +854,29 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         kd.kernarg_size = F->kernarg_bytes;
         kd.kernel_code_entry_byte_offset = 256; /* descriptor is 64 bytes, padded to 256 */
 
-        /* compute_pgm_rsrc1 */
-        uint32_t vgpr_blocks = (F->num_vgprs > 0) ? (uint32_t)((F->num_vgprs + 7) / 8 - 1) : 0;
+        /* compute_pgm_rsrc1 — GFX9: VGPR granularity 4, no WGP_MODE/MEM_ORDERED */
+        int cdna = (A->target <= AMD_TARGET_GFX90A);
+        uint32_t vgran = cdna ? 4u : 8u;
+        uint32_t vgpr_blocks = (F->num_vgprs > 0)
+            ? (uint32_t)((F->num_vgprs + vgran - 1) / vgran - 1) : 0;
         uint32_t sgpr_blocks = (F->num_sgprs > 0) ? (uint32_t)((F->num_sgprs + 7) / 8 - 1) : 0;
         kd.compute_pgm_rsrc1 = (vgpr_blocks & 0x3F) |
                                ((sgpr_blocks & 0xF) << 6) |
-                               (1u << 20) |  /* IEEE_MODE */
-                               (1u << 26) |  /* WGP_MODE */
-                               (1u << 27);   /* MEM_ORDERED */
+                               (1u << 20);   /* IEEE_MODE */
+        if (!cdna) {
+            kd.compute_pgm_rsrc1 |= (1u << 26) |  /* WGP_MODE (RDNA only) */
+                                    (1u << 27);    /* MEM_ORDERED (RDNA only) */
+        }
 
-        /* compute_pgm_rsrc2 */
+        /* compute_pgm_rsrc2 — GFX9: TGID at bits 11/12/13 */
+        uint32_t tgid_x = cdna ? 11u : 7u;
+        uint32_t tgid_y = cdna ? 12u : 8u;
+        uint32_t tgid_z = cdna ? 13u : 9u;
         kd.compute_pgm_rsrc2 = ((F->scratch_bytes > 0) ? 1u : 0u) | /* SCRATCH_EN */
-                               (4u << 1) |   /* USER_SGPR_COUNT = 4 (dispatch_ptr + kernarg_ptr) */
-                               (1u << 7) |   /* TGID_X_EN */
-                               (1u << 8) |   /* TGID_Y_EN */
-                               (1u << 9);    /* TGID_Z_EN */
+                               (4u << 1) |            /* USER_SGPR_COUNT = 4 */
+                               (1u << tgid_x) |       /* TGID_X_EN */
+                               (1u << tgid_y) |       /* TGID_Y_EN */
+                               (1u << tgid_z);         /* TGID_Z_EN */
 
         /* kernel_code_properties */
         kd.kernel_code_properties = (1u << 0) |  /* ENABLE_SGPR_DISPATCH_PTR */

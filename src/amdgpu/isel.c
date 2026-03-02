@@ -59,6 +59,10 @@ static struct {
     uint32_t        block_map[BIR_MAX_BLOCKS];
 } S;
 
+/* ---- Target Helpers ---- */
+
+static int is_cdna(void) { return S.amd->target <= AMD_TARGET_GFX90A; }
+
 /* ---- Divergence Analysis ---- */
 
 static int is_divergent(uint32_t bir_inst)
@@ -1262,8 +1266,8 @@ static void isel_br_cond(const bir_inst_t *I, int cond_div)
         emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);
 
         uint32_t saved = new_vreg(0);
-        emit1(AMD_S_AND_SAVEEXEC_B32, mop_vreg_s((uint16_t)saved),
-              mop_special(AMD_SPEC_VCC));
+        emit1(is_cdna() ? AMD_S_AND_SAVEEXEC_B64 : AMD_S_AND_SAVEEXEC_B32,
+              mop_vreg_s((uint16_t)saved), mop_special(AMD_SPEC_VCC));
         emit0_1(AMD_S_CBRANCH_EXECZ, mop_label(false_mb));
         /* Fall through to true block (next in layout) */
 
@@ -1695,7 +1699,7 @@ static void isel_function(uint32_t fi)
     MF->name = F->name;
     MF->first_block = A->num_mblocks;
     MF->is_kernel = S.is_kernel;
-    MF->wavefront_size = AMD_WAVE_SIZE;
+    MF->wavefront_size = is_cdna() ? AMD_WAVE64 : AMD_WAVE_SIZE;
     MF->lds_bytes = 0;
     MF->scratch_bytes = 0;
     MF->kernarg_bytes = F->num_params * 8;
@@ -1731,7 +1735,8 @@ static void isel_function(uint32_t fi)
             if (S.div_stack[di].has_else && S.div_stack[di].false_bir == bir_bi) {
                 /* Else block: xor EXEC to get false lanes */
                 uint16_t sv = (uint16_t)S.div_stack[di].saved_vreg;
-                emit2(AMD_S_XOR_B32, mop_special(AMD_SPEC_EXEC),
+                emit2(is_cdna() ? AMD_S_XOR_B64 : AMD_S_XOR_B32,
+                      mop_special(AMD_SPEC_EXEC),
                       mop_special(AMD_SPEC_EXEC), mop_vreg_s(sv));
                 /* If all false lanes are off, skip else body */
                 uint32_t merge_mb = S.block_map[S.div_stack[di].merge_bir];
@@ -1742,7 +1747,8 @@ static void isel_function(uint32_t fi)
             if (S.div_stack[di - 1].merge_bir == bir_bi) {
                 /* Merge block: restore all lanes */
                 uint16_t sv = (uint16_t)S.div_stack[di - 1].saved_vreg;
-                emit2(AMD_S_OR_B32, mop_special(AMD_SPEC_EXEC),
+                emit2(is_cdna() ? AMD_S_OR_B64 : AMD_S_OR_B32,
+                      mop_special(AMD_SPEC_EXEC),
                       mop_special(AMD_SPEC_EXEC), mop_vreg_s(sv));
                 /* Pop the region */
                 S.div_depth--;

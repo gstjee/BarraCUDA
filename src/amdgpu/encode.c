@@ -79,9 +79,11 @@ static void emit_dword(amd_module_t *A, uint32_t dw)
 
 const amd_enc_entry_t *get_enc_table(const amd_module_t *A)
 {
-    return (A->target <= AMD_TARGET_GFX1030)
-           ? amd_enc_table_gfx10
-           : amd_enc_table;
+    if (A->target <= AMD_TARGET_GFX90A)
+        return amd_enc_table_gfx9;
+    if (A->target <= AMD_TARGET_GFX1030)
+        return amd_enc_table_gfx10;
+    return amd_enc_table;
 }
 
 /* Encode SDST field: handles both physical SGPRs and special registers */
@@ -190,7 +192,17 @@ static void encode_smem(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
     if (mi->num_uses > 1)
         offset = mi->operands[mi->num_defs + 1].imm;
 
-    if (A->target >= AMD_TARGET_GFX1200) {
+    if (A->target <= AMD_TARGET_GFX90A) {
+        /* GFX9 SMEM: 2 dwords
+           DW0: [31:26]=110000 [25:18]=OP [17]=IMM [16]=GLC [12:6]=SDATA [5:0]=SBASE
+           DW1: [20:0]=OFFSET (when IMM=1) */
+        uint32_t dw0 = (0x30u << 26) | ((uint32_t)(hw_op & 0xFF) << 18) |
+                       (1u << 17) | /* IMM=1: use immediate offset */
+                       ((uint32_t)(sdata & 0x7F) << 6) | (uint32_t)(sbase & 0x3F);
+        uint32_t dw1 = (uint32_t)offset & 0x1FFFFF;
+        emit_dword(A, dw0);
+        emit_dword(A, dw1);
+    } else if (A->target >= AMD_TARGET_GFX1200) {
         /* GFX12 SMEM: 2 dwords
            DW0: [31:26]=111101 [24:23]=TH [22:21]=SCOPE [18:13]=OP(6) [12:6]=SDATA [5:0]=SBASE
            DW1: [31:25]=SOFFSET(0x7C=null) [23:0]=IOFFSET(24-bit) */
@@ -200,7 +212,7 @@ static void encode_smem(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
         emit_dword(A, dw0);
         emit_dword(A, dw1);
     } else {
-        /* GFX10/GFX11 SMEM: 2 dwords (same layout, different SOFFSET null)
+        /* GFX10/GFX11 SMEM: 2 dwords
            DW0: [31:26]=111101 [25:18]=OP(8) [12:6]=SDATA [5:0]=SBASE
            DW1: [31:25]=SOFFSET [20:0]=OFFSET(21-bit) */
         uint32_t soff_null = (A->target <= AMD_TARGET_GFX1030) ? 0x7Du : 0x7Cu;
@@ -248,9 +260,7 @@ static void encode_vop2(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
 
 static void encode_vop3(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
 {
-    /* VOP3: 2 dwords
-       DW0: [31:26]=110100 [25:16]=OP [15:8]=VDST [7:0]=ABS/CLAMP
-       DW1: [31]=0 [30:29]=OMOD [28:27]=NEG [26:18]=SRC2 [17:9]=SRC1 [8:0]=SRC0 */
+    /* VOP3: 2 dwords */
     uint32_t literal = 0;
     int need_lit = 0;
     uint8_t vdst = (mi->num_defs > 0) ?
@@ -262,9 +272,17 @@ static void encode_vop3(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
     uint16_t src2 = (mi->num_uses > 2) ?
                     encode_vsrc(&mi->operands[mi->num_defs + 2], &literal, &need_lit) : 0;
 
-    uint32_t dw0 = (0x35u << 26) | ((uint32_t)(hw_op & 0x3FF) << 16) |
-                   (uint32_t)vdst;
-    uint32_t dw1 = ((src2 & 0x1FF) << 18) | ((src1 & 0x1FF) << 9) | (src0 & 0x1FF);
+    uint32_t dw0, dw1;
+    if (A->target <= AMD_TARGET_GFX90A) {
+        /* GFX9: DW0: [31:26]=110100 [25:16]=OP [7:0]=VDST */
+        dw0 = (0x34u << 26) | ((uint32_t)(hw_op & 0x3FF) << 16) |
+              (uint32_t)vdst;
+    } else {
+        /* GFX10+: DW0: [31:26]=110101 [25:16]=OP [7:0]=VDST */
+        dw0 = (0x35u << 26) | ((uint32_t)(hw_op & 0x3FF) << 16) |
+              (uint32_t)vdst;
+    }
+    dw1 = ((src2 & 0x1FF) << 18) | ((src1 & 0x1FF) << 9) | (src0 & 0x1FF);
     emit_dword(A, dw0);
     emit_dword(A, dw1);
 }
@@ -367,6 +385,23 @@ static void encode_flat_global(amd_module_t *A, const minst_t *mi, uint16_t hw_o
         emit_dword(A, dw0);
         emit_dword(A, dw1);
         emit_dword(A, dw2);
+    } else if (A->target <= AMD_TARGET_GFX90A) {
+        /* GFX9 FLAT/GLOBAL: 2 dwords (64-bit)
+           DW0: [31:26]=0x37 [24:18]=OP(7b) [16]=GLC
+                [15:14]=SEG [12:0]=OFFSET(13b signed)
+           DW1: [31:24]=VDST [23:16]=SADDR [15:8]=DATA [7:0]=ADDR
+           Null SADDR=0x7F */
+        uint8_t seg = is_scratch ? 1 : 2;
+        if (saddr == 0x7C) saddr = 0x7F;
+
+        uint32_t off_lo = (uint32_t)offset & 0x1FFF;
+        uint32_t dw0 = (0x37u << 26) | ((uint32_t)(hw_op & 0x7F) << 18) |
+                       ((uint32_t)seg << 14) | off_lo;
+        uint32_t dw1 = ((uint32_t)vdst << 24) | ((saddr & 0xFF) << 16) |
+                       ((uint32_t)data << 8) | addr;
+        if (mi->flags & AMD_FLAG_GLC) dw0 |= (1u << 16);
+        emit_dword(A, dw0);
+        emit_dword(A, dw1);
     } else if (A->target <= AMD_TARGET_GFX1030) {
         /* GFX10 FLAT/GLOBAL/SCRATCH: 2 dwords (64-bit)
            DW0: [31:26]=0x37 [25]=DLC [24:18]=OP(7b) [17]=SLC [16]=GLC

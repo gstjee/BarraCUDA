@@ -5,7 +5,7 @@
 
 /*
  * AMDGPU backend for BarraCUDA.
- * Targets RDNA 2 (gfx1030), RDNA 3 (gfx1100), and RDNA 4 (gfx1200), Wave32.
+ * Targets CDNA 2 (gfx90a), RDNA 2 (gfx1030), RDNA 3 (gfx1100), RDNA 4 (gfx1200).
  * Compiles BIR SSA to AMDGCN machine IR, then emits assembly text
  * or binary ELF code objects (.hsaco).
  * Built with the quiet confidence of someone who reads ISA manuals for fun.
@@ -16,6 +16,7 @@
 /* ---- Target Selection ---- */
 
 typedef enum {
+    AMD_TARGET_GFX90A,    /* CDNA 2 (MI250, Wave64) */
     AMD_TARGET_GFX1030,   /* RDNA 2 */
     AMD_TARGET_GFX1100,   /* RDNA 3 */
     AMD_TARGET_GFX1200,   /* RDNA 4 */
@@ -26,6 +27,7 @@ typedef enum {
 #define AMD_MAX_SGPRS       102
 #define AMD_MAX_VGPRS       256
 #define AMD_WAVE_SIZE       32
+#define AMD_WAVE64          64
 
 /* Pre-loaded SGPRs for kernels */
 #define AMD_SGPR_DISPATCH_LO  0   /* s0: dispatch packet ptr lo */
@@ -51,6 +53,7 @@ typedef enum {
 /* ELF constants */
 #define EM_AMDGPU                224
 #define ELFOSABI_AMDGPU_HSA      64
+#define EF_AMDGPU_MACH_AMDGCN_GFX90A   0x3F
 #define EF_AMDGPU_MACH_AMDGCN_GFX1030  0x36
 #define EF_AMDGPU_MACH_AMDGCN_GFX1100  0x41
 #define EF_AMDGPU_MACH_AMDGCN_GFX1200  0x48
@@ -93,10 +96,20 @@ typedef enum {
     AMD_S_BFE_I32,
     AMD_S_CSELECT_B32,
 
+    /* -- SOP2: scalar two-input, 64-bit (CDNA/Wave64) -- */
+    AMD_S_AND_B64,
+    AMD_S_OR_B64,
+    AMD_S_XOR_B64,
+    AMD_S_ANDN2_B64,
+    AMD_S_ORN2_B64,
+
     /* -- SOP1: scalar one-input -- */
     AMD_S_MOV_B32,
     AMD_S_NOT_B32,
     AMD_S_AND_SAVEEXEC_B32,
+    AMD_S_MOV_B64,
+    AMD_S_NOT_B64,
+    AMD_S_AND_SAVEEXEC_B64,
     AMD_S_SETPC_B64,
     AMD_S_SWAPPC_B64,
     AMD_S_GETPC_B64,
@@ -409,5 +422,6 @@ int  amdgpu_emit_elf(amd_module_t *amd, const char *path);
 /* Encoding table (defined in amdgpu_emit.c) */
 extern const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT];
 extern const amd_enc_entry_t amd_enc_table_gfx10[AMD_OP_COUNT];
+extern const amd_enc_entry_t amd_enc_table_gfx9[AMD_OP_COUNT];
 
 #endif /* BARRACUDA_AMDGPU_H */
