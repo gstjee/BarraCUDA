@@ -124,7 +124,7 @@ void amdgpu_phi_elim(amd_module_t *A)
     }
 }
 
-/* ---- Register Allocation (Linear Scan) ---- */
+/* ---- Register Allocation ---- */
 
 /* Live interval for a virtual register */
 typedef struct {
@@ -254,7 +254,108 @@ static void expire_old(uint32_t point)
     RA.num_active = j;
 }
 
-static void regalloc_function(amd_module_t *A, uint32_t mf_idx)  /* called from amdgpu_regalloc */
+static void rewrite_operands(amd_module_t *A, const mfunc_t *F)
+{
+    for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+        const mblock_t *MB = &A->mblocks[F->first_block + bi];
+        for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+            uint32_t mi_idx = MB->first_inst + ii;
+            minst_t *mi = &A->minsts[mi_idx];
+
+            uint8_t total = mi->num_defs + mi->num_uses;
+            if (total > MINST_MAX_OPS) total = MINST_MAX_OPS;
+
+            for (uint8_t k = 0; k < total; k++) {
+                moperand_t *op = &mi->operands[k];
+                if (op->kind == MOP_VREG_S) {
+                    op->kind = MOP_SGPR;
+                    op->reg_num = A->reg_map[op->reg_num];
+                } else if (op->kind == MOP_VREG_V) {
+                    op->kind = MOP_VGPR;
+                    op->reg_num = A->reg_map[op->reg_num];
+                }
+            }
+
+            if (mi->op == AMD_PSEUDO_COPY) {
+                if (mi->operands[0].kind == MOP_VGPR)
+                    mi->op = AMD_V_MOV_B32;
+                else
+                    mi->op = AMD_S_MOV_B32;
+            }
+        }
+    }
+}
+
+/* Dead copy elimination: kill MOVs where src == dst. */
+static void dead_copy_elim(amd_module_t *A, const mfunc_t *F)
+{
+    for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+        const mblock_t *MB = &A->mblocks[F->first_block + bi];
+        for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+            uint32_t mi_idx = MB->first_inst + ii;
+            minst_t *mi = &A->minsts[mi_idx];
+
+            if ((mi->op == AMD_V_MOV_B32 || mi->op == AMD_S_MOV_B32) &&
+                mi->num_defs == 1 && mi->num_uses == 1 &&
+                mi->operands[0].kind == mi->operands[1].kind &&
+                mi->operands[0].reg_num == mi->operands[1].reg_num) {
+                mi->op = AMD_PSEUDO_DEF;
+                mi->num_defs = 0;
+                mi->num_uses = 0;
+                continue;
+            }
+
+            if ((mi->op == AMD_V_MOV_B32 || mi->op == AMD_S_MOV_B32 ||
+                 mi->op == AMD_PSEUDO_COPY) &&
+                mi->num_defs == 1 && ii + 1 < MB->num_insts) {
+                const minst_t *next = &A->minsts[MB->first_inst + ii + 1];
+                uint16_t dst_reg = mi->operands[0].reg_num;
+                uint8_t  dst_kind = mi->operands[0].kind;
+
+                int next_uses = 0;
+                for (uint8_t u = next->num_defs;
+                     u < next->num_defs + next->num_uses && u < MINST_MAX_OPS; u++) {
+                    if (next->operands[u].kind == dst_kind &&
+                        next->operands[u].reg_num == dst_reg)
+                        next_uses = 1;
+                }
+
+                int next_defs = 0;
+                for (uint8_t d = 0; d < next->num_defs && d < MINST_MAX_OPS; d++) {
+                    if (next->operands[d].kind == dst_kind &&
+                        next->operands[d].reg_num == dst_reg)
+                        next_defs = 1;
+                }
+
+                if (next_defs && !next_uses) {
+                    mi->op = AMD_PSEUDO_DEF;
+                    mi->num_defs = 0;
+                    mi->num_uses = 0;
+                }
+            }
+        }
+    }
+}
+
+static void finalize_reg_counts(mfunc_t *F)
+{
+    if (F->num_sgprs == 0) F->num_sgprs = 1;
+    if (F->num_vgprs == 0) F->num_vgprs = 1;
+
+    if (F->launch_bounds_max > 0 && F->launch_bounds_max < 1024) {
+        uint32_t desired_waves = (F->launch_bounds_max + 31) / 32;
+        if (desired_waves > 0) {
+            uint32_t vgpr_cap = (256 / desired_waves) & ~7u;
+            if (vgpr_cap < 8) vgpr_cap = 8;
+            if (F->num_vgprs > vgpr_cap)
+                F->num_vgprs = (uint16_t)vgpr_cap;
+        }
+    }
+}
+
+/* ---- Linear Scan (fallback) ---- */
+
+static void regalloc_linear(amd_module_t *A, uint32_t mf_idx)
 {
     mfunc_t *F = &A->mfuncs[mf_idx];
 
@@ -335,75 +436,918 @@ static void regalloc_function(amd_module_t *A, uint32_t mf_idx)  /* called from 
     /* Record usage for kernel descriptor */
     F->num_sgprs = RA.max_sgpr;
     F->num_vgprs = RA.max_vgpr;
+    finalize_reg_counts(F);
+    rewrite_operands(A, F);
+    dead_copy_elim(A, F);
+}
 
-    /* Minimum 1 SGPR/VGPR for the descriptor */
-    if (F->num_sgprs == 0) F->num_sgprs = 1;
-    if (F->num_vgprs == 0) F->num_vgprs = 1;
+/* ---- Graph Coloring Register Allocation ---- */
 
-    /* __launch_bounds__ VGPR cap. More threads = fewer registers.
-       The maths of sharing: 256 VGPRs divided among the waves you
-       promised the hardware you'd run. Break the promise at your peril. */
-    if (F->launch_bounds_max > 0 && F->launch_bounds_max < 1024) {
-        uint32_t desired_waves = (F->launch_bounds_max + 31) / 32;
-        if (desired_waves > 0) {
-            uint32_t vgpr_cap = (256 / desired_waves) & ~7u;
-            if (vgpr_cap < 8) vgpr_cap = 8;
-            if (F->num_vgprs > vgpr_cap)
-                F->num_vgprs = (uint16_t)vgpr_cap;
+#define RA_MAX_NODES 8192
+
+typedef struct {
+    uint32_t vreg;
+    uint32_t degree;
+    float    spill_cost;
+    uint16_t color;
+    uint16_t alias;
+    uint8_t  file;
+    uint8_t  spilled;
+    uint8_t  in_graph;
+} ra_node_t;
+
+/* Dynamically allocated per regalloc_graphcolor() call, sized to actual
+   node count N.  NOTE: these static globals make the allocator non-reentrant.  Fine for
+   single-threaded compilation; would need to be bundled into a context
+   struct if we ever parallelize across functions. */
+static void      *ra_mem;
+static uint32_t  *ra_ifg;
+static ra_node_t *ra_nodes;
+static uint32_t  *ra_stack;
+static uint32_t   ra_num_nodes;
+static uint32_t   ra_stride;
+static uint32_t   ra_stack_top;
+
+static uint16_t ra_vreg_to_node[AMD_MAX_VREGS];
+
+static void ra_ifg_set(uint32_t i, uint32_t j)
+{
+    uint64_t bit;
+    bit = (uint64_t)i * ra_stride + j;
+    ra_ifg[bit / 32] |= 1u << (bit % 32);
+    bit = (uint64_t)j * ra_stride + i;
+    ra_ifg[bit / 32] |= 1u << (bit % 32);
+}
+
+static int ra_ifg_test(uint32_t i, uint32_t j)
+{
+    uint64_t bit = (uint64_t)i * ra_stride + j;
+    return (ra_ifg[bit / 32] >> (bit % 32)) & 1;
+}
+
+static uint16_t ra_find(uint16_t n)
+{
+    while (ra_nodes[n].alias != n) {
+        ra_nodes[n].alias = ra_nodes[ra_nodes[n].alias].alias;
+        n = ra_nodes[n].alias;
+    }
+    return n;
+}
+
+static void ra_coalesce(uint16_t a, uint16_t b)
+{
+    ra_nodes[b].alias = a;
+    for (uint32_t k = 0; k < ra_num_nodes; k++) {
+        if (k == a || k == b) continue;
+        if (ra_find((uint16_t)k) != k) continue;
+        if (ra_ifg_test(b, k)) {
+            if (!ra_ifg_test(a, k)) {
+                ra_ifg_set(a, k);
+                ra_nodes[a].degree++;
+            }
+        }
+    }
+    ra_nodes[b].in_graph = 0;
+}
+
+/* Bitvector operations for liveness sets.
+   One bit per vreg, stored as uint32_t words. */
+
+static void bv_set(uint32_t *bv, uint32_t bit)
+{
+    bv[bit / 32] |= 1u << (bit % 32);
+}
+
+static void bv_clear(uint32_t *bv, uint32_t bit)
+{
+    bv[bit / 32] &= ~(1u << (bit % 32));
+}
+
+static int bv_test(const uint32_t *bv, uint32_t bit)
+{
+    return (int)((bv[bit / 32] >> (bit % 32)) & 1u);
+}
+
+static int bv_or(uint32_t *dst, const uint32_t *src, uint32_t nwords)
+{
+    int changed = 0;
+    for (uint32_t w = 0; w < nwords; w++) {
+        uint32_t old = dst[w];
+        dst[w] |= src[w];
+        if (dst[w] != old) changed = 1;
+    }
+    return changed;
+}
+
+/* Per-block liveness arrays.  Dynamically allocated, sized to actual
+   num_blocks × bv_words.  Accessed as ra_live_in[bi * ra_bv_words + w]. */
+#define RA_MAX_BLOCKS 4096
+
+static uint32_t *ra_live_in;    /* [nb][bv_words] flattened */
+static uint32_t *ra_live_out;
+static uint32_t *ra_blk_def;
+static uint32_t *ra_blk_use;
+static uint16_t *ra_succs;      /* [nb][2] flattened */
+static uint8_t  *ra_nsuccs;     /* [nb] */
+static uint32_t  ra_bv_words;   /* bitvector width for current allocation */
+static void     *ra_liveness_mem;
+
+#define RA_BV(arr, bi)  ((arr) + (size_t)(bi) * ra_bv_words)
+#define RA_SUCCS(bi)    (ra_succs + (size_t)(bi) * 2)
+
+static void ra_build_cfg(const amd_module_t *A, const mfunc_t *F)
+{
+    uint32_t nb = F->num_blocks;
+    memset(ra_nsuccs, 0, nb * sizeof(uint8_t));
+
+    for (uint32_t bi = 0; bi < nb; bi++) {
+        const mblock_t *MB = &A->mblocks[F->first_block + bi];
+        int has_unconditional = 0;
+
+        for (uint32_t ii = MB->num_insts; ii > 0; ii--) {
+            const minst_t *mi = &A->minsts[MB->first_inst + ii - 1];
+            if (!is_terminator(mi->op)) break;
+
+            if (mi->op == AMD_S_ENDPGM || mi->op == AMD_S_SETPC_B64) {
+                has_unconditional = 1;
+            } else if (mi->op == AMD_S_BRANCH) {
+                has_unconditional = 1;
+                if (mi->num_uses > 0 && mi->operands[0].kind == MOP_LABEL) {
+                    uint32_t target = (uint32_t)mi->operands[0].imm;
+                    if (target >= F->first_block &&
+                        target < F->first_block + nb &&
+                        ra_nsuccs[bi] < 2) {
+                        RA_SUCCS(bi)[ra_nsuccs[bi]++] =
+                            (uint16_t)(target - F->first_block);
+                    }
+                }
+            } else if (mi->op == AMD_S_CBRANCH_SCC0 ||
+                       mi->op == AMD_S_CBRANCH_SCC1 ||
+                       mi->op == AMD_S_CBRANCH_EXECZ ||
+                       mi->op == AMD_S_CBRANCH_EXECNZ) {
+                if (mi->num_uses > 0 && mi->operands[0].kind == MOP_LABEL) {
+                    uint32_t target = (uint32_t)mi->operands[0].imm;
+                    if (target >= F->first_block &&
+                        target < F->first_block + nb &&
+                        ra_nsuccs[bi] < 2) {
+                        RA_SUCCS(bi)[ra_nsuccs[bi]++] =
+                            (uint16_t)(target - F->first_block);
+                    }
+                }
+            }
+        }
+
+        /* Fallthrough: if block doesn't end with an unconditional branch
+           or endpgm, the next block is a successor */
+        if (!has_unconditional && bi + 1 < nb && ra_nsuccs[bi] < 2) {
+            RA_SUCCS(bi)[ra_nsuccs[bi]++] = (uint16_t)(bi + 1);
+        }
+    }
+}
+
+/* Compute per-block def/use sets, then solve live_in/live_out via
+   backward dataflow iteration:
+     live_in[B]  = use[B] ∪ (live_out[B] − def[B])
+     live_out[B] = ∪ { live_in[S] : S ∈ successors(B) }
+   Iterates until fixpoint. */
+static void ra_compute_liveness(const amd_module_t *A, const mfunc_t *F,
+                                uint32_t nv)
+{
+    uint32_t nb = F->num_blocks;
+    uint32_t bv_words = ra_bv_words;
+    for (uint32_t bi = 0; bi < nb; bi++) {
+        memset(RA_BV(ra_blk_def, bi), 0, bv_words * sizeof(uint32_t));
+        memset(RA_BV(ra_blk_use, bi), 0, bv_words * sizeof(uint32_t));
+
+        const mblock_t *MB = &A->mblocks[F->first_block + bi];
+        for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+            const minst_t *mi = &A->minsts[MB->first_inst + ii];
+
+            for (uint8_t u = mi->num_defs;
+                 u < mi->num_defs + mi->num_uses && u < MINST_MAX_OPS; u++) {
+                uint16_t vr = operand_vreg(&mi->operands[u]);
+                if (vr != 0xFFFF && vr < nv && !bv_test(RA_BV(ra_blk_def, bi), vr))
+                    bv_set(RA_BV(ra_blk_use, bi), vr);
+            }
+            for (uint8_t d = 0; d < mi->num_defs && d < MINST_MAX_OPS; d++) {
+                uint16_t vr = operand_vreg(&mi->operands[d]);
+                if (vr != 0xFFFF && vr < nv)
+                    bv_set(RA_BV(ra_blk_def, bi), vr);
+            }
         }
     }
 
-    /* Rewrite virtual reg operands to physical */
+    for (uint32_t bi = 0; bi < nb; bi++) {
+        memset(RA_BV(ra_live_in, bi),  0, bv_words * sizeof(uint32_t));
+        memset(RA_BV(ra_live_out, bi), 0, bv_words * sizeof(uint32_t));
+    }
+
+    for (int pass = 0; pass < 200; pass++) {
+        int changed = 0;
+
+        for (uint32_t bi2 = nb; bi2 > 0; bi2--) {
+            uint32_t bi = bi2 - 1;
+
+            for (uint8_t s = 0; s < ra_nsuccs[bi]; s++) {
+                uint16_t succ = RA_SUCCS(bi)[s];
+                if (succ < nb)
+                    changed |= bv_or(RA_BV(ra_live_out, bi), RA_BV(ra_live_in, succ), bv_words);
+            }
+
+            for (uint32_t w = 0; w < bv_words; w++) {
+                uint32_t new_in = RA_BV(ra_blk_use, bi)[w] |
+                                  (RA_BV(ra_live_out, bi)[w] & ~RA_BV(ra_blk_def, bi)[w]);
+                if (new_in != RA_BV(ra_live_in, bi)[w]) {
+                    RA_BV(ra_live_in, bi)[w] = new_in;
+                    changed = 1;
+                }
+            }
+        }
+
+        if (!changed) break;
+    }
+}
+
+static void ra_build_ifg_from_liveness(const amd_module_t *A,
+                                       const mfunc_t *F,
+                                       uint32_t nv)
+{
+    uint32_t bv_words = ra_bv_words;
+    uint32_t *live = (uint32_t *)calloc(bv_words, sizeof(uint32_t));
+    if (!live) return;
+
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
         const mblock_t *MB = &A->mblocks[F->first_block + bi];
-        for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
-            uint32_t mi_idx = MB->first_inst + ii;
-            minst_t *mi = &A->minsts[mi_idx];
 
-            uint8_t total = mi->num_defs + mi->num_uses;
-            if (total > MINST_MAX_OPS) total = MINST_MAX_OPS;
+        memcpy(live, RA_BV(ra_live_out, bi), bv_words * sizeof(uint32_t));
 
-            for (uint8_t k = 0; k < total; k++) {
-                moperand_t *op = &mi->operands[k];
-                if (op->kind == MOP_VREG_S) {
-                    op->kind = MOP_SGPR;
-                    op->reg_num = A->reg_map[op->reg_num];
-                } else if (op->kind == MOP_VREG_V) {
-                    op->kind = MOP_VGPR;
-                    op->reg_num = A->reg_map[op->reg_num];
+        for (uint32_t ii = MB->num_insts; ii > 0; ii--) {
+            const minst_t *mi = &A->minsts[MB->first_inst + ii - 1];
+
+            /* For PSEUDO_COPY D = S: don't add D↔S interference even
+               though S is live at D's def.  This is what makes coalescing
+               possible --without it, copy-related pairs always interfere
+               and can never be merged. */
+            int is_copy = (mi->op == AMD_PSEUDO_COPY);
+            uint16_t copy_src = 0xFFFF;
+            if (is_copy && mi->num_uses >= 1)
+                copy_src = operand_vreg(&mi->operands[mi->num_defs]);
+
+            for (uint8_t d = 0; d < mi->num_defs && d < MINST_MAX_OPS; d++) {
+                uint16_t dv = operand_vreg(&mi->operands[d]);
+                if (dv == 0xFFFF || dv >= nv) continue;
+                uint16_t dn = ra_vreg_to_node[dv];
+                if (dn == 0xFFFF) continue;
+
+                for (uint32_t w = 0; w < bv_words; w++) {
+                    uint32_t bits = live[w];
+                    while (bits) {
+                        uint32_t lsb = bits & (uint32_t)(-(int32_t)bits);
+                        uint32_t bit_idx = w * 32;
+                        /* CTZ -- portable across MSVC/MinGW */
+                        { uint32_t tmp = lsb; while (!(tmp & 1)) { tmp >>= 1; bit_idx++; } }
+                        bits &= bits - 1;
+
+                        if (bit_idx >= nv) continue;
+                        uint16_t lv = (uint16_t)bit_idx;
+                        if (lv == dv) continue;
+                        if (is_copy && lv == copy_src) continue;
+                        uint16_t ln = ra_vreg_to_node[lv];
+                        if (ln == 0xFFFF) continue;
+
+                        /* Only interfere within same register file */
+                        if (ra_nodes[dn].file != ra_nodes[ln].file) continue;
+
+                        if (!ra_ifg_test(dn, ln)) {
+                            ra_ifg_set(dn, ln);
+                            ra_nodes[dn].degree++;
+                            ra_nodes[ln].degree++;
+                        }
+                    }
+                }
+
+                bv_clear(live, dv);
+            }
+
+            for (uint8_t u = mi->num_defs;
+                 u < mi->num_defs + mi->num_uses && u < MINST_MAX_OPS; u++) {
+                uint16_t uv = operand_vreg(&mi->operands[u]);
+                if (uv != 0xFFFF && uv < nv)
+                    bv_set(live, uv);
+            }
+        }
+    }
+
+    free(live);
+}
+
+static void regalloc_graphcolor(amd_module_t *A, uint32_t mf_idx)
+{
+    mfunc_t *F = &A->mfuncs[mf_idx];
+    uint32_t max_iters = 4;
+    int gc_success = 0;
+
+    if (F->num_blocks > RA_MAX_BLOCKS) {
+        /* Too many blocks --fall back to linear scan */
+        regalloc_linear(A, mf_idx);
+        return;
+    }
+
+    for (uint32_t iter = 0; iter < max_iters; iter++) {
+        uint32_t nv = A->vreg_count;
+        if (nv > RA_MAX_NODES) nv = RA_MAX_NODES;
+
+        /* Allocate ra_ifg + ra_nodes + ra_stack in one calloc, sized
+           to nv (upper bound on node count).  calloc zero-inits the
+           bitmatrix and node fields for free. */
+        {
+            size_t ifg_words = ((uint64_t)nv * nv + 31) / 32;
+            size_t total = ifg_words * sizeof(uint32_t)
+                         + nv * sizeof(ra_node_t)
+                         + nv * sizeof(uint32_t);
+            ra_mem = calloc(1, total);
+            if (!ra_mem) {
+                regalloc_linear(A, mf_idx);
+                return;
+            }
+            ra_ifg   = (uint32_t *)ra_mem;
+            ra_nodes = (ra_node_t *)((char *)ra_mem + ifg_words * sizeof(uint32_t));
+            ra_stack = (uint32_t *)((char *)ra_nodes + nv * sizeof(ra_node_t));
+            ra_stride = nv;
+        }
+
+        /* --- Build node table from all vregs used in this function --- */
+        ra_num_nodes = 0;
+        memset(ra_vreg_to_node, 0xFF, nv * sizeof(uint16_t));
+
+        for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+            const mblock_t *MB = &A->mblocks[F->first_block + bi];
+            for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+                const minst_t *mi = &A->minsts[MB->first_inst + ii];
+                uint8_t total = mi->num_defs + mi->num_uses;
+                if (total > MINST_MAX_OPS) total = MINST_MAX_OPS;
+                for (uint8_t k = 0; k < total; k++) {
+                    uint16_t vr = operand_vreg(&mi->operands[k]);
+                    if (vr != 0xFFFF && vr < nv) {
+                        if (ra_vreg_to_node[vr] == 0xFFFF &&
+                            ra_num_nodes < RA_MAX_NODES) {
+                            uint16_t nidx = (uint16_t)ra_num_nodes++;
+                            ra_nodes[nidx].vreg = vr;
+                            ra_nodes[nidx].degree = 0;
+                            ra_nodes[nidx].spill_cost = 1.0f;
+                            ra_nodes[nidx].color = 0xFFFF;
+                            ra_nodes[nidx].alias = nidx;
+                            ra_nodes[nidx].file = A->reg_file[vr];
+                            ra_nodes[nidx].spilled = 0;
+                            ra_nodes[nidx].in_graph = 1;
+                            ra_vreg_to_node[vr] = nidx;
+                        } else if (ra_vreg_to_node[vr] != 0xFFFF) {
+                            ra_nodes[ra_vreg_to_node[vr]].spill_cost += 1.0f;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ra_num_nodes == 0) { free(ra_mem); ra_mem = NULL; gc_success = 1; break; }
+
+        /* --- Allocate per-block liveness arrays --- */
+        {
+            uint32_t nb = F->num_blocks;
+            ra_bv_words = (nv + 31) / 32;
+            size_t bv_sz = (size_t)nb * ra_bv_words * sizeof(uint32_t);
+            size_t succ_sz = (size_t)nb * 2 * sizeof(uint16_t);
+            size_t nsucc_sz = (size_t)nb * sizeof(uint8_t);
+            size_t total = bv_sz * 4 + succ_sz + nsucc_sz;
+            ra_liveness_mem = calloc(1, total);
+            if (!ra_liveness_mem) {
+                free(ra_mem); ra_mem = NULL;
+                regalloc_linear(A, mf_idx);
+                return;
+            }
+            char *p = (char *)ra_liveness_mem;
+            ra_live_in  = (uint32_t *)p; p += bv_sz;
+            ra_live_out = (uint32_t *)p; p += bv_sz;
+            ra_blk_def  = (uint32_t *)p; p += bv_sz;
+            ra_blk_use  = (uint32_t *)p; p += bv_sz;
+            ra_succs    = (uint16_t *)p; p += succ_sz;
+            ra_nsuccs   = (uint8_t  *)p;
+        }
+
+        /* --- Build CFG and compute per-block liveness --- */
+        ra_build_cfg(A, F);
+        ra_compute_liveness(A, F, nv);
+
+        /* --- Build interference graph from liveness --- */
+        ra_build_ifg_from_liveness(A, F, nv);
+
+        /* --- Compute K (available physical regs per file) --- */
+        uint16_t sgpr_start = F->is_kernel ? F->first_alloc_sgpr : 0;
+        if (sgpr_start < AMD_KERN_RESERVED_SGPR && F->is_kernel)
+            sgpr_start = AMD_KERN_RESERVED_SGPR;
+        uint32_t K_sgpr = (AMD_MAX_SGPRS > sgpr_start) ? AMD_MAX_SGPRS - sgpr_start : 0;
+        uint32_t K_vgpr = (amdgpu_max_vgprs > 0 && amdgpu_max_vgprs < AMD_MAX_VGPRS)
+                           ? (uint32_t)amdgpu_max_vgprs : AMD_MAX_VGPRS;
+
+        /* --- Copy coalescing (conservative, Briggs criterion) ---
+           Only merge two non-interfering copy-related nodes if the
+           resulting node would have fewer than K neighbors with
+           degree >= K.  This guarantees the merge can't turn a
+           colorable graph into one that needs spills --important on
+           GPU where a spill means scratch memory (hundreds of cycles
+           vs 1 cycle for a register MOV).
+           */
+        for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+            const mblock_t *MB = &A->mblocks[F->first_block + bi];
+            for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+                uint32_t mi_idx = MB->first_inst + ii;
+                const minst_t *mi = &A->minsts[mi_idx];
+
+                if (mi->op != AMD_PSEUDO_COPY) continue;
+                if (mi->num_defs < 1 || mi->num_uses < 1) continue;
+
+                uint16_t dst_vr = operand_vreg(&mi->operands[0]);
+                uint16_t src_vr = operand_vreg(&mi->operands[1]);
+                if (dst_vr == 0xFFFF || src_vr == 0xFFFF) continue;
+
+                uint16_t dn = ra_vreg_to_node[dst_vr];
+                uint16_t sn = ra_vreg_to_node[src_vr];
+                if (dn == 0xFFFF || sn == 0xFFFF) continue;
+
+                dn = ra_find(dn);
+                sn = ra_find(sn);
+                if (dn == sn) continue;
+
+                if (ra_nodes[dn].file != ra_nodes[sn].file) continue;
+                if (ra_ifg_test(dn, sn)) continue;
+
+                /* Briggs test: count neighbors of the merged node that
+                   would have degree >= K.  A neighbor of the merged node
+                   is anything adjacent to a OR b (de-duped). */
+                uint32_t K = (ra_nodes[dn].file == 0) ? K_sgpr : K_vgpr;
+                uint32_t high_deg = 0;
+                for (uint32_t m = 0; m < ra_num_nodes; m++) {
+                    if (ra_find((uint16_t)m) != m) continue;
+                    if (m == (uint32_t)dn || m == (uint32_t)sn) continue;
+                    if (!ra_nodes[m].in_graph) continue;
+                    if (ra_nodes[m].file != ra_nodes[dn].file) continue;
+                    if (!ra_ifg_test(dn, m) && !ra_ifg_test(sn, m)) continue;
+                    uint32_t mdeg = ra_nodes[m].degree;
+                    if (ra_ifg_test(dn, m) && ra_ifg_test(sn, m) && mdeg > 0)
+                        mdeg--;
+                    if (mdeg >= K) high_deg++;
+                }
+
+                if (high_deg < K)
+                    ra_coalesce(dn, sn);
+            }
+        }
+
+        /* --- Recompute degrees after coalescing (only for representatives) --- */
+        for (uint32_t n = 0; n < ra_num_nodes; n++) {
+            if (ra_find((uint16_t)n) != n) { ra_nodes[n].in_graph = 0; continue; }
+            if (!ra_nodes[n].in_graph) continue;
+            uint32_t deg = 0;
+            for (uint32_t m = 0; m < ra_num_nodes; m++) {
+                if (m == n) continue;
+                if (ra_find((uint16_t)m) != m) continue;
+                if (!ra_nodes[m].in_graph) continue;
+                if (ra_ifg_test(n, m) && ra_nodes[m].file == ra_nodes[n].file)
+                    deg++;
+            }
+            ra_nodes[n].degree = deg;
+        }
+
+        /* --- Simplify: repeatedly remove nodes with degree < K --- */
+        ra_stack_top = 0;
+        uint32_t nodes_left = 0;
+        for (uint32_t n = 0; n < ra_num_nodes; n++) {
+            if (ra_nodes[n].in_graph) nodes_left++;
+        }
+
+        while (nodes_left > 0) {
+            int found = 0;
+            for (uint32_t n = 0; n < ra_num_nodes; n++) {
+                if (!ra_nodes[n].in_graph) continue;
+                uint32_t K = (ra_nodes[n].file == 0) ? K_sgpr : K_vgpr;
+                if (ra_nodes[n].degree < K) {
+                    ra_nodes[n].in_graph = 0;
+                    ra_stack[ra_stack_top++] = n;
+                    nodes_left--;
+                    for (uint32_t m = 0; m < ra_num_nodes; m++) {
+                        if (!ra_nodes[m].in_graph) continue;
+                        if (ra_ifg_test(n, m) &&
+                            ra_nodes[m].file == ra_nodes[n].file &&
+                            ra_nodes[m].degree > 0)
+                            ra_nodes[m].degree--;
+                    }
+                    found = 1;
+                    break;
                 }
             }
 
-            /* Convert PSEUDO_COPY to actual MOV */
-            if (mi->op == AMD_PSEUDO_COPY) {
-                if (mi->operands[0].kind == MOP_VGPR)
-                    mi->op = AMD_V_MOV_B32;
-                else
-                    mi->op = AMD_S_MOV_B32;
+            if (!found) {
+                /* No simplify candidate --pick lowest spill_cost/degree
+                   as potential spill (optimistic: it might still color).
+                   Nodes with many uses are expensive to spill; nodes with
+                   high degree free the most neighbors when removed. */
+                uint32_t best = 0;
+                float best_ratio = 1e30f;
+                int have_best = 0;
+                for (uint32_t n = 0; n < ra_num_nodes; n++) {
+                    if (!ra_nodes[n].in_graph) continue;
+                    float ratio = ra_nodes[n].spill_cost
+                                / (float)(ra_nodes[n].degree + 1);
+                    if (!have_best || ratio < best_ratio) {
+                        best = n;
+                        best_ratio = ratio;
+                        have_best = 1;
+                    }
+                }
+                if (!have_best) break;
+                ra_nodes[best].in_graph = 0;
+                ra_stack[ra_stack_top++] = best;
+                nodes_left--;
+                for (uint32_t m = 0; m < ra_num_nodes; m++) {
+                    if (!ra_nodes[m].in_graph) continue;
+                    if (ra_ifg_test(best, m) &&
+                        ra_nodes[m].file == ra_nodes[best].file &&
+                        ra_nodes[m].degree > 0)
+                        ra_nodes[m].degree--;
+                }
             }
         }
+
+        /* --- Select: pop stack, assign colors --- */
+        uint16_t max_sgpr = 0, max_vgpr = 0;
+        int any_spilled = 0;
+
+        /* Bitvectors for used colors among neighbors */
+        static uint32_t used_sgpr[(AMD_MAX_SGPRS + 31) / 32];
+        static uint32_t used_vgpr[(AMD_MAX_VGPRS + 31) / 32];
+
+        while (ra_stack_top > 0) {
+            uint32_t n = ra_stack[--ra_stack_top];
+            uint16_t rep = ra_find((uint16_t)n);
+            if (rep != n) {
+                /* Coalesced away --will get color from representative */
+                continue;
+            }
+
+            /* Collect colors used by already-colored neighbors.
+               Check interference against original node indices (what the
+               matrix was built with), then resolve to the representative
+               to get the actual assigned color.  An original edge n-m
+               means n interferes with whatever m got coalesced into. */
+            if (ra_nodes[n].file == 0) {
+                memset(used_sgpr, 0, sizeof(used_sgpr));
+                for (uint32_t m = 0; m < ra_num_nodes; m++) {
+                    if (!ra_ifg_test(n, m)) continue;
+                    uint16_t mr = ra_find((uint16_t)m);
+                    if (mr == (uint16_t)n) continue; /* coalesced into us */
+                    if (ra_nodes[mr].color != 0xFFFF && ra_nodes[mr].file == 0) {
+                        uint16_t c = ra_nodes[mr].color;
+                        used_sgpr[c / 32] |= 1u << (c % 32);
+                    }
+                }
+                uint16_t picked = 0xFFFF;
+                for (uint16_t r = sgpr_start; r < AMD_MAX_SGPRS; r++) {
+                    if (!(used_sgpr[r / 32] & (1u << (r % 32)))) {
+                        picked = r;
+                        break;
+                    }
+                }
+                if (picked != 0xFFFF) {
+                    ra_nodes[n].color = picked;
+                    if (picked + 1 > max_sgpr) max_sgpr = picked + 1;
+                } else {
+                    ra_nodes[n].spilled = 1;
+                    any_spilled = 1;
+                }
+            } else {
+                memset(used_vgpr, 0, sizeof(used_vgpr));
+                for (uint32_t m = 0; m < ra_num_nodes; m++) {
+                    if (!ra_ifg_test(n, m)) continue;
+                    uint16_t mr = ra_find((uint16_t)m);
+                    if (mr == (uint16_t)n) continue;
+                    if (ra_nodes[mr].color != 0xFFFF && ra_nodes[mr].file == 1) {
+                        uint16_t c = ra_nodes[mr].color;
+                        used_vgpr[c / 32] |= 1u << (c % 32);
+                    }
+                }
+                uint16_t picked = 0xFFFF;
+                for (uint16_t r = 0; r < AMD_MAX_VGPRS; r++) {
+                    if (!(used_vgpr[r / 32] & (1u << (r % 32)))) {
+                        picked = r;
+                        break;
+                    }
+                }
+                if (picked != 0xFFFF) {
+                    ra_nodes[n].color = picked;
+                    if (picked + 1 > max_vgpr) max_vgpr = picked + 1;
+                } else {
+                    ra_nodes[n].spilled = 1;
+                    any_spilled = 1;
+                }
+            }
+        }
+
+        for (uint32_t n = 0; n < ra_num_nodes; n++) {
+            uint16_t rep = ra_find((uint16_t)n);
+            if (rep != n) {
+                ra_nodes[n].color = ra_nodes[rep].color;
+                ra_nodes[n].spilled = ra_nodes[rep].spilled;
+            }
+        }
+
+        /* --- Spill code insertion ---
+           For each block, expand instructions into a full-function output
+           buffer, inserting scratch_load before uses and scratch_store after
+           defs of spilled vregs.  Then shift the tail once and copy all
+           expanded blocks back in a single pass. */
+        if (any_spilled) {
+            static uint32_t spill_vreg[RA_MAX_NODES];
+            static uint8_t  spill_file[RA_MAX_NODES];
+            static uint32_t spill_off[RA_MAX_NODES];
+            uint32_t num_spills = 0;
+
+            for (uint32_t n = 0; n < ra_num_nodes; n++) {
+                if (!ra_nodes[n].spilled) continue;
+                if (num_spills >= RA_MAX_NODES) break;
+                spill_vreg[num_spills] = ra_nodes[n].vreg;
+                spill_file[num_spills] = ra_nodes[n].file;
+                spill_off[num_spills] = F->scratch_bytes;
+                F->scratch_bytes += 4;
+                num_spills++;
+            }
+
+            /* Full-function output buffer --sized to hold all instructions
+               across all blocks with room for spill loads/stores.
+               Single-pass: expand all blocks into this buffer, then
+               bulk-copy back once at the end. */
+            uint32_t total_insts = 0;
+            for (uint32_t bi2 = 0; bi2 < F->num_blocks; bi2++)
+                total_insts += A->mblocks[F->first_block + bi2].num_insts;
+            /* worst case: each inst gets a load+store per spill, plus
+               SGPR spills add an extra intermediary op each */
+            size_t out_cap = (size_t)total_insts * (1 + 3 * num_spills) + 16;
+            if (out_cap > AMD_MAX_MINSTS) out_cap = AMD_MAX_MINSTS;
+            minst_t *ra_output = (minst_t *)malloc(out_cap * sizeof(minst_t));
+            if (!ra_output) break;
+
+            uint32_t *blk_out_start = (uint32_t *)malloc(F->num_blocks * sizeof(uint32_t));
+            uint32_t *blk_out_count = (uint32_t *)malloc(F->num_blocks * sizeof(uint32_t));
+            if (!blk_out_start || !blk_out_count) {
+                free(ra_output); free(blk_out_start); free(blk_out_count);
+                break;
+            }
+            uint32_t out_count = 0;
+
+            for (uint32_t bi2 = 0; bi2 < F->num_blocks; bi2++) {
+                mblock_t *MB = &A->mblocks[F->first_block + bi2];
+                blk_out_start[bi2] = out_count;
+
+                for (uint32_t ii2 = 0; ii2 < MB->num_insts; ii2++) {
+                    minst_t orig = A->minsts[MB->first_inst + ii2];
+
+                    for (uint32_t si = 0; si < num_spills; si++) {
+                        uint32_t sv = spill_vreg[si];
+                        int has_use = 0;
+                        for (uint8_t u = orig.num_defs;
+                             u < orig.num_defs + orig.num_uses && u < MINST_MAX_OPS; u++) {
+                            if (operand_vreg(&orig.operands[u]) == sv) has_use = 1;
+                        }
+                        if (has_use) {
+                            uint32_t new_vr = A->vreg_count;
+                            if (new_vr < AMD_MAX_VREGS) {
+                                A->vreg_count++;
+
+                                if (spill_file[si] == 0) {
+                                    /* SGPR spill reload: scratch is vector memory,
+                                       so load into a temp VGPR then readfirstlane
+                                       into the SGPR.
+                                       scratch_load_dword vTmp, off, spill_off
+                                       v_readfirstlane_b32 sNew, vTmp */
+                                    uint32_t vtmp = A->vreg_count;
+                                    if (vtmp >= AMD_MAX_VREGS) goto skip_reload;
+                                    A->reg_file[vtmp] = 1; /* VGPR */
+                                    A->vreg_count++;
+
+                                    A->reg_file[new_vr] = 0; /* SGPR */
+
+                                    for (uint8_t u = orig.num_defs;
+                                         u < orig.num_defs + orig.num_uses && u < MINST_MAX_OPS; u++) {
+                                        if (operand_vreg(&orig.operands[u]) == sv)
+                                            orig.operands[u].reg_num = (uint16_t)new_vr;
+                                    }
+
+                                    /* scratch_load_dword vTmp */
+                                    if (out_count < out_cap) {
+                                        minst_t *ld = &ra_output[out_count++];
+                                        memset(ld, 0, sizeof(minst_t));
+                                        ld->op = AMD_SCRATCH_LOAD_DWORD;
+                                        ld->num_defs = 1;
+                                        ld->num_uses = 2;
+                                        ld->operands[0].kind = MOP_VREG_V;
+                                        ld->operands[0].reg_num = (uint16_t)vtmp;
+                                        ld->operands[1].kind = MOP_IMM;
+                                        ld->operands[1].imm = 0;
+                                        ld->operands[2].kind = MOP_IMM;
+                                        ld->operands[2].imm = (int32_t)spill_off[si];
+                                    }
+                                    /* v_readfirstlane_b32 sNew, vTmp */
+                                    if (out_count < out_cap) {
+                                        minst_t *rfl = &ra_output[out_count++];
+                                        memset(rfl, 0, sizeof(minst_t));
+                                        rfl->op = AMD_V_READFIRSTLANE_B32;
+                                        rfl->num_defs = 1;
+                                        rfl->num_uses = 1;
+                                        rfl->operands[0].kind = MOP_VREG_S;
+                                        rfl->operands[0].reg_num = (uint16_t)new_vr;
+                                        rfl->operands[1].kind = MOP_VREG_V;
+                                        rfl->operands[1].reg_num = (uint16_t)vtmp;
+                                    }
+                                } else {
+                                    A->reg_file[new_vr] = 1; /* VGPR */
+
+                                    for (uint8_t u = orig.num_defs;
+                                         u < orig.num_defs + orig.num_uses && u < MINST_MAX_OPS; u++) {
+                                        if (operand_vreg(&orig.operands[u]) == sv)
+                                            orig.operands[u].reg_num = (uint16_t)new_vr;
+                                    }
+
+                                    if (out_count < out_cap) {
+                                        minst_t *ld = &ra_output[out_count++];
+                                        memset(ld, 0, sizeof(minst_t));
+                                        ld->op = AMD_SCRATCH_LOAD_DWORD;
+                                        ld->num_defs = 1;
+                                        ld->num_uses = 2;
+                                        ld->operands[0].kind = MOP_VREG_V;
+                                        ld->operands[0].reg_num = (uint16_t)new_vr;
+                                        ld->operands[1].kind = MOP_IMM;
+                                        ld->operands[1].imm = 0;
+                                        ld->operands[2].kind = MOP_IMM;
+                                        ld->operands[2].imm = (int32_t)spill_off[si];
+                                    }
+                                }
+                            }
+                            skip_reload:;
+                        }
+                    }
+
+                    if (out_count < out_cap)
+                        ra_output[out_count++] = orig;
+
+                    for (uint32_t si = 0; si < num_spills; si++) {
+                        uint32_t sv = spill_vreg[si];
+                        int has_def = 0;
+                        for (uint8_t d = 0; d < orig.num_defs && d < MINST_MAX_OPS; d++) {
+                            if (operand_vreg(&orig.operands[d]) == sv) has_def = 1;
+                        }
+                        if (has_def) {
+                            if (spill_file[si] == 0) {
+                                /* SGPR spill store: move SGPR into a temp
+                                   VGPR, then scratch_store from it.
+                                   v_mov_b32 vTmp, sDef
+                                   scratch_store_dword vOff, vTmp, spill_off */
+                                uint32_t vtmp = A->vreg_count;
+                                if (vtmp >= AMD_MAX_VREGS) continue;
+                                A->reg_file[vtmp] = 1; /* VGPR */
+                                A->vreg_count++;
+
+                                /* v_mov_b32 vTmp, sDef */
+                                if (out_count < out_cap) {
+                                    minst_t *mv = &ra_output[out_count++];
+                                    memset(mv, 0, sizeof(minst_t));
+                                    mv->op = AMD_V_MOV_B32;
+                                    mv->num_defs = 1;
+                                    mv->num_uses = 1;
+                                    mv->operands[0].kind = MOP_VREG_V;
+                                    mv->operands[0].reg_num = (uint16_t)vtmp;
+                                    mv->operands[1].kind = MOP_VREG_S;
+                                    mv->operands[1].reg_num = (uint16_t)sv;
+                                }
+                                /* scratch_store_dword vOff, vTmp, off */
+                                if (out_count < out_cap) {
+                                    minst_t *st = &ra_output[out_count++];
+                                    memset(st, 0, sizeof(minst_t));
+                                    st->op = AMD_SCRATCH_STORE_DWORD;
+                                    st->num_defs = 0;
+                                    st->num_uses = 3;
+                                    st->operands[0].kind = MOP_IMM;
+                                    st->operands[0].imm = 0;
+                                    st->operands[1].kind = MOP_VREG_V;
+                                    st->operands[1].reg_num = (uint16_t)vtmp;
+                                    st->operands[2].kind = MOP_IMM;
+                                    st->operands[2].imm = (int32_t)spill_off[si];
+                                }
+                            } else {
+                                if (out_count < out_cap) {
+                                    minst_t *st = &ra_output[out_count++];
+                                    memset(st, 0, sizeof(minst_t));
+                                    st->op = AMD_SCRATCH_STORE_DWORD;
+                                    st->num_defs = 0;
+                                    st->num_uses = 3;
+                                    st->operands[0].kind = MOP_IMM;
+                                    st->operands[0].imm = 0;
+                                    st->operands[1].kind = MOP_VREG_V;
+                                    st->operands[1].reg_num = (uint16_t)sv;
+                                    st->operands[2].kind = MOP_IMM;
+                                    st->operands[2].imm = (int32_t)spill_off[si];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                blk_out_count[bi2] = out_count - blk_out_start[bi2];
+            }
+
+            /* Single bulk-copy: compute total delta, shift tail once,
+               then copy all expanded blocks into the instruction array. */
+            uint32_t old_total = 0;
+            for (uint32_t bi2 = 0; bi2 < F->num_blocks; bi2++)
+                old_total += A->mblocks[F->first_block + bi2].num_insts;
+
+            int32_t total_delta = (int32_t)out_count - (int32_t)old_total;
+            uint32_t func_end = A->mblocks[F->first_block].first_inst + old_total;
+            uint32_t tail = A->num_minsts - func_end;
+
+            if (total_delta != 0 &&
+                A->num_minsts + (uint32_t)total_delta <= AMD_MAX_MINSTS) {
+                if (tail > 0) {
+                    memmove(&A->minsts[(uint32_t)((int32_t)func_end + total_delta)],
+                            &A->minsts[func_end],
+                            tail * sizeof(minst_t));
+                }
+                A->num_minsts = (uint32_t)((int32_t)A->num_minsts + total_delta);
+            }
+
+            uint32_t write_pos = A->mblocks[F->first_block].first_inst;
+            for (uint32_t bi2 = 0; bi2 < F->num_blocks; bi2++) {
+                mblock_t *MB2 = &A->mblocks[F->first_block + bi2];
+                MB2->first_inst = write_pos;
+                MB2->num_insts = blk_out_count[bi2];
+                memcpy(&A->minsts[write_pos],
+                       &ra_output[blk_out_start[bi2]],
+                       blk_out_count[bi2] * sizeof(minst_t));
+                write_pos += blk_out_count[bi2];
+            }
+
+            for (uint32_t later = F->first_block + F->num_blocks;
+                 later < A->num_mblocks; later++)
+                A->mblocks[later].first_inst =
+                    (uint32_t)((int32_t)A->mblocks[later].first_inst + total_delta);
+
+            free(ra_output);
+            free(blk_out_start);
+            free(blk_out_count);
+
+            free(ra_liveness_mem); ra_liveness_mem = NULL;
+            free(ra_mem); ra_mem = NULL;
+            continue;
+        }
+
+        /* --- Write reg_map from coloring --- */
+        for (uint32_t n = 0; n < ra_num_nodes; n++) {
+            uint32_t vreg = ra_nodes[n].vreg;
+            uint16_t color = ra_nodes[n].color;
+            if (color != 0xFFFF && vreg < AMD_MAX_VREGS)
+                A->reg_map[vreg] = color;
+            else if (vreg < AMD_MAX_VREGS)
+                A->reg_map[vreg] = 0;
+        }
+
+        F->num_sgprs = max_sgpr;
+        F->num_vgprs = max_vgpr;
+        free(ra_liveness_mem); ra_liveness_mem = NULL;
+        free(ra_mem); ra_mem = NULL;
+        gc_success = 1;
+        break; /* success, no spills */
     }
 
-    /* Dead copy elimination: kill MOVs where src == dst.
-       These appear when regalloc assigns the same phys reg to both sides
-       of a copy. Harmless but noisy — like a postman delivering a letter
-       back to the sender. */
-    for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
-        const mblock_t *MB = &A->mblocks[F->first_block + bi];
-        for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
-            uint32_t mi_idx = MB->first_inst + ii;
-            minst_t *mi = &A->minsts[mi_idx];
+    if (!gc_success) {
+        /* Spill iterations exhausted --fall back to linear scan */
+        regalloc_linear(A, mf_idx);
+        return;
+    }
 
-            if ((mi->op == AMD_V_MOV_B32 || mi->op == AMD_S_MOV_B32) &&
-                mi->num_defs == 1 && mi->num_uses == 1 &&
-                mi->operands[0].kind == mi->operands[1].kind &&
-                mi->operands[0].reg_num == mi->operands[1].reg_num) {
-                /* Convert to NOP — the emitter already handles these */
-                mi->op = AMD_PSEUDO_DEF;
-                mi->num_defs = 0;
-                mi->num_uses = 0;
-            }
-        }
+    finalize_reg_counts(F);
+    rewrite_operands(A, F);
+    dead_copy_elim(A, F);
+}
+
+/* Global flag: set by --no-graphcolor to force linear scan */
+int amdgpu_force_linear_scan = 0;
+/* If non-zero, cap available VGPRs for regalloc (forces spills for testing) */
+int amdgpu_max_vgprs = 0;
+
+static void regalloc_function(amd_module_t *A, uint32_t mf_idx)
+{
+    if (amdgpu_force_linear_scan || A->vreg_count > RA_MAX_NODES) {
+        regalloc_linear(A, mf_idx);
+    } else {
+        regalloc_graphcolor(A, mf_idx);
     }
 }
 

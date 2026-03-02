@@ -33,7 +33,8 @@ TCFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O0 -g \
 TSRC    = tests/tmain.c tests/tsmoke.c tests/tcomp.c tests/tenc.c \
           tests/ttabs.c tests/ttypes.c tests/terrs.c tests/tphase.c \
           tests/tdce.c \
-          tests/tcfold.c
+          tests/tcfold.c \
+          tests/tregalloc.c
 TOBJS   = $(TSRC:.c=.o)
 COBJS   = src/ir/bir.o src/ir/bir_print.o src/ir/bir_lower.o src/ir/bir_mem2reg.o src/ir/bir_cfold.o src/ir/bir_dce.o \
           src/amdgpu/encode.o src/amdgpu/enc_tab.o src/amdgpu/isel.o src/amdgpu/emit.o \

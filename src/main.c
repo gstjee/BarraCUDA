@@ -74,6 +74,8 @@ static void usage(const char *prog)
         "  --amdgpu-bin  Compile to AMDGPU ELF code object (.hsaco)\n"
         "  --gfx1030     Target RDNA 2 (gfx1030)\n"
         "  --gfx1200     Target RDNA 4 (gfx1200)\n"
+        "  --no-graphcolor  Force linear scan register allocation\n"
+        "  --max-vgprs N    Cap VGPR count for regalloc (forces spills)\n"
         "  --tensix      Compile to TT-Metalium C++ (Tensix SFPU)\n"
         "  -o <file>     Output file (for --amdgpu-bin, --tensix)\n"
         "  --help        Show this message\n"
@@ -183,6 +185,10 @@ int main(int argc, char *argv[])
             no_cfold = 1;
         else if (strcmp(argv[i], "--no-dce") == 0)
             no_dce = 1;
+        else if (strcmp(argv[i], "--no-graphcolor") == 0)
+            amdgpu_force_linear_scan = 1;
+        else if (strcmp(argv[i], "--max-vgprs") == 0 && i + 1 < argc)
+            amdgpu_max_vgprs = atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
