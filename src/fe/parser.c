@@ -368,6 +368,9 @@ static int looks_like_cast(parser_t *P)
     if (t == TOK_IDENT && peek_type(P, 2) == TOK_RPAREN &&
         can_start_unary(peek_type(P, 3)))
         return 1;
+    /* (ident*) or (ident**) — pointer cast to struct/vector type */
+    if (t == TOK_IDENT && peek_type(P, 2) == TOK_STAR)
+        return 1;
     return 0;
 }
 
@@ -693,6 +696,8 @@ static uint32_t parse_type_spec(parser_t *P, uint16_t *quals, uint16_t *cuda)
                    ct == TOK_VOLATILE || ct == TOK_CONSTEXPR) {
             *quals |= storage_flag_for(ct);
             advance(P);
+            if (ct == TOK_EXTERN && cur_type(P) == TOK_STRING_LIT)
+                advance(P);  /* skip "C" / "C++" linkage spec */
         } else {
             break;
         }
@@ -1019,6 +1024,27 @@ static uint32_t parse_declaration(parser_t *P)
     while (cur_type(P) == TOK_STAR) { advance(P); ptr_depth++; }
     while (cur_type(P) == TOK_CONST || cur_type(P) == TOK_AMP ||
            cur_type(P) == TOK_CU_RESTRICT) { advance(P); }
+
+    /* __launch_bounds__ in suffix position (tinygrad style) */
+    if (cur_type(P) == TOK_CU_LAUNCH_BOUNDS) {
+        advance(P);
+        if (cur_type(P) == TOK_LPAREN) {
+            advance(P);
+            uint32_t max_expr = parse_expr(P, 21);
+            if (max_expr && P->nodes[max_expr].type == AST_INT_LIT)
+                P->lb_max_pending = (uint32_t)parse_int_text(
+                    P->src + P->nodes[max_expr].d.text.offset,
+                    (int)P->nodes[max_expr].d.text.len);
+            if (match(P, TOK_COMMA)) {
+                uint32_t min_expr = parse_expr(P, 21);
+                if (min_expr && P->nodes[min_expr].type == AST_INT_LIT)
+                    P->lb_min_pending = (uint32_t)parse_int_text(
+                        P->src + P->nodes[min_expr].d.text.offset,
+                        (int)P->nodes[min_expr].d.text.len);
+            }
+            expect(P, TOK_RPAREN);
+        }
+    }
 
     if (cur_type(P) == TOK_IDENT || cur_type(P) == TOK_TILDE
         || cur_type(P) == TOK_OPERATOR) {

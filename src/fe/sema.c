@@ -1017,6 +1017,17 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
                 sema_error(S, node, "'__bfloat162float' expects 1 arg, got %d", nargs);
             return annotate(S, node, st_float(S));
         }
+        /* ---- Bit-cast builtins ---- */
+        if (strcmp(cname, "__int_as_float") == 0) {
+            if (nargs != 1)
+                sema_error(S, node, "'__int_as_float' expects 1 arg, got %d", nargs);
+            return annotate(S, node, st_float(S));
+        }
+        if (strcmp(cname, "__float_as_int") == 0) {
+            if (nargs != 1)
+                sema_error(S, node, "'__float_as_int' expects 1 arg, got %d", nargs);
+            return annotate(S, node, st_int(S));
+        }
 
         for (int i = 0; cuda_builtins[i].name; i++) {
             if (strcmp(cname, cuda_builtins[i].name) != 0) continue;

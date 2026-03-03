@@ -1415,6 +1415,23 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             set_op(L, inst, 0, val);
             return BIR_MAKE_VAL(inst);
         }
+        /* ---- Bit-cast builtins ---- */
+        if (strcmp(cname, "__int_as_float") == 0) {
+            uint32_t an = ND(L, callee_n)->next_sibling;
+            uint32_t val = lower_expr(L, an);
+            uint32_t f32 = bir_type_float(L->M, 32);
+            uint32_t inst = emit(L, BIR_BITCAST, f32, 1, 0);
+            set_op(L, inst, 0, val);
+            return BIR_MAKE_VAL(inst);
+        }
+        if (strcmp(cname, "__float_as_int") == 0) {
+            uint32_t an = ND(L, callee_n)->next_sibling;
+            uint32_t val = lower_expr(L, an);
+            uint32_t i32 = bir_type_int(L->M, 32);
+            uint32_t inst = emit(L, BIR_BITCAST, i32, 1, 0);
+            set_op(L, inst, 0, val);
+            return BIR_MAKE_VAL(inst);
+        }
 
         /* ---- Math builtins: unary ---- */
         {
