@@ -13,6 +13,7 @@
 const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     /* SOP2 */
     [AMD_S_ADD_U32]         = { AMD_FMT_SOP2, 0x00, "s_add_u32"         },
+    [AMD_S_ADD_I32]         = { AMD_FMT_SOP2, 0x02, "s_add_i32"         },
     [AMD_S_SUB_U32]         = { AMD_FMT_SOP2, 0x01, "s_sub_u32"         },
     [AMD_S_MUL_I32]         = { AMD_FMT_SOP2, 0x2C, "s_mul_i32"         },
     [AMD_S_AND_B32]         = { AMD_FMT_SOP2, 0x16, "s_and_b32"         },
@@ -188,6 +189,7 @@ const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
 const amd_enc_entry_t amd_enc_table_gfx10[AMD_OP_COUNT] = {
     /* SOP2 — extensively renumbered from GFX11 */
     [AMD_S_ADD_U32]         = { AMD_FMT_SOP2, 0x00, "s_add_u32"         },
+    [AMD_S_ADD_I32]         = { AMD_FMT_SOP2, 0x02, "s_add_i32"         },
     [AMD_S_SUB_U32]         = { AMD_FMT_SOP2, 0x01, "s_sub_u32"         },
     [AMD_S_MUL_I32]         = { AMD_FMT_SOP2, 0x24, "s_mul_i32"         },
     [AMD_S_AND_B32]         = { AMD_FMT_SOP2, 0x0E, "s_and_b32"         },
@@ -367,6 +369,7 @@ const amd_enc_entry_t amd_enc_table_gfx10[AMD_OP_COUNT] = {
 const amd_enc_entry_t amd_enc_table_gfx9[AMD_OP_COUNT] = {
     /* SOP2 — GFX9 interleaves _b32/_b64 as consecutive opcodes */
     [AMD_S_ADD_U32]         = { AMD_FMT_SOP2, 0x00, "s_add_u32"         },
+    [AMD_S_ADD_I32]         = { AMD_FMT_SOP2, 0x02, "s_add_i32"         },
     [AMD_S_SUB_U32]         = { AMD_FMT_SOP2, 0x01, "s_sub_u32"         },
     [AMD_S_MUL_I32]         = { AMD_FMT_SOP2, 0x24, "s_mul_i32"         },
     [AMD_S_AND_B32]         = { AMD_FMT_SOP2, 0x0C, "s_and_b32"         },
@@ -431,9 +434,10 @@ const amd_enc_entry_t amd_enc_table_gfx9[AMD_OP_COUNT] = {
     [AMD_S_LOAD_DWORDX2]     = { AMD_FMT_SMEM, 0x01, "s_load_dwordx2"     },
     [AMD_S_LOAD_DWORDX4]     = { AMD_FMT_SMEM, 0x02, "s_load_dwordx4"     },
 
-    /* VOP2 — v_add_u32 becomes v_add_co_u32 (writes VCC, no non-carry variant) */
-    [AMD_V_ADD_U32]          = { AMD_FMT_VOP2, 0x19, "v_add_co_u32"       },
-    [AMD_V_SUB_U32]          = { AMD_FMT_VOP2, 0x1A, "v_sub_co_u32"       },
+    /* VOP2 — GFX9 added v_add_u32 (0x34) / v_sub_u32 (0x35) without carry.
+       0x19/0x1A are the carry variants (v_add_co_u32) that clobber VCC. */
+    [AMD_V_ADD_U32]          = { AMD_FMT_VOP2, 0x34, "v_add_u32"          },
+    [AMD_V_SUB_U32]          = { AMD_FMT_VOP2, 0x35, "v_sub_u32"          },
     [AMD_V_MUL_LO_U32]      = { AMD_FMT_VOP3, 0x285,"v_mul_lo_u32"       },
     [AMD_V_AND_B32]          = { AMD_FMT_VOP2, 0x13, "v_and_b32"          },
     [AMD_V_OR_B32]           = { AMD_FMT_VOP2, 0x14, "v_or_b32"           },
@@ -538,6 +542,34 @@ const amd_enc_entry_t amd_enc_table_gfx9[AMD_OP_COUNT] = {
     /* FLAT_SCR — same opcodes as FLAT_GBL, differentiated by SEG field */
     [AMD_SCRATCH_LOAD_DWORD]     = { AMD_FMT_FLAT_SCR, 0x14, "scratch_load_dword"     },
     [AMD_SCRATCH_STORE_DWORD]    = { AMD_FMT_FLAT_SCR, 0x1C, "scratch_store_dword"    },
+
+    /* VOP3P-MAI — MFMA matrix ops. Opcodes from llvm-mc, format from ISA PDF.
+       These only exist on CDNA, which is why they're here and not upstairs
+       with the RDNA tables. RDNA users can have matrix envy in silence. */
+    [AMD_V_MFMA_F32_4X4X4_F16]      = { AMD_FMT_VOP3P_MAI, 0x4A, "v_mfma_f32_4x4x4f16"      },
+    [AMD_V_MFMA_F32_16X16X16_F16]   = { AMD_FMT_VOP3P_MAI, 0x4D, "v_mfma_f32_16x16x16f16"    },
+    [AMD_V_MFMA_F32_32X32X8_F16]    = { AMD_FMT_VOP3P_MAI, 0x4C, "v_mfma_f32_32x32x8f16"     },
+    [AMD_V_MFMA_F32_4X4X4_BF16_1K]  = { AMD_FMT_VOP3P_MAI, 0x5F, "v_mfma_f32_4x4x4bf16_1k"  },
+    [AMD_V_MFMA_F32_16X16X16_BF16_1K]={ AMD_FMT_VOP3P_MAI, 0x61, "v_mfma_f32_16x16x16bf16_1k"},
+    [AMD_V_MFMA_F32_32X32X8_BF16_1K]= { AMD_FMT_VOP3P_MAI, 0x60, "v_mfma_f32_32x32x8bf16_1k" },
+    [AMD_V_MFMA_F32_4X4X1_F32]      = { AMD_FMT_VOP3P_MAI, 0x42, "v_mfma_f32_4x4x1f32"      },
+    [AMD_V_MFMA_F32_16X16X4_F32]    = { AMD_FMT_VOP3P_MAI, 0x45, "v_mfma_f32_16x16x4f32"     },
+    [AMD_V_MFMA_F32_32X32X2_F32]    = { AMD_FMT_VOP3P_MAI, 0x44, "v_mfma_f32_32x32x2f32"     },
+    [AMD_V_MFMA_I32_4X4X4_I8]       = { AMD_FMT_VOP3P_MAI, 0x52, "v_mfma_i32_4x4x4i8"       },
+    [AMD_V_MFMA_I32_16X16X16_I8]    = { AMD_FMT_VOP3P_MAI, 0x55, "v_mfma_i32_16x16x16i8"     },
+    [AMD_V_MFMA_I32_32X32X8_I8]     = { AMD_FMT_VOP3P_MAI, 0x54, "v_mfma_i32_32x32x8i8"      },
+    /* FP8/BF8 — gfx942 CDNA3. Tastes like mixed-precision sushi. */
+    [AMD_V_MFMA_F32_16X16X32_FP8_FP8] = { AMD_FMT_VOP3P_MAI, 0x73, "v_mfma_f32_16x16x32_fp8_fp8" },
+    [AMD_V_MFMA_F32_16X16X32_FP8_BF8] = { AMD_FMT_VOP3P_MAI, 0x72, "v_mfma_f32_16x16x32_fp8_bf8" },
+    [AMD_V_MFMA_F32_16X16X32_BF8_FP8] = { AMD_FMT_VOP3P_MAI, 0x71, "v_mfma_f32_16x16x32_bf8_fp8" },
+    [AMD_V_MFMA_F32_16X16X32_BF8_BF8] = { AMD_FMT_VOP3P_MAI, 0x70, "v_mfma_f32_16x16x32_bf8_bf8" },
+    [AMD_V_MFMA_F32_32X32X16_FP8_FP8] = { AMD_FMT_VOP3P_MAI, 0x77, "v_mfma_f32_32x32x16_fp8_fp8" },
+    [AMD_V_MFMA_F32_32X32X16_FP8_BF8] = { AMD_FMT_VOP3P_MAI, 0x76, "v_mfma_f32_32x32x16_fp8_bf8" },
+    [AMD_V_MFMA_F32_32X32X16_BF8_FP8] = { AMD_FMT_VOP3P_MAI, 0x75, "v_mfma_f32_32x32x16_bf8_fp8" },
+    [AMD_V_MFMA_F32_32X32X16_BF8_BF8] = { AMD_FMT_VOP3P_MAI, 0x74, "v_mfma_f32_32x32x16_bf8_bf8" },
+    /* F64 — for when your matrix really needs 52 bits of mantissa */
+    [AMD_V_MFMA_F64_4X4X4_F64]        = { AMD_FMT_VOP3P_MAI, 0x6F, "v_mfma_f64_4x4x4f64"         },
+    [AMD_V_MFMA_F64_16X16X4_F64]      = { AMD_FMT_VOP3P_MAI, 0x6E, "v_mfma_f64_16x16x4f64"       },
 
     /* Pseudo */
     [AMD_PSEUDO_PHI]             = { AMD_FMT_PSEUDO, 0, "PSEUDO_PHI"  },

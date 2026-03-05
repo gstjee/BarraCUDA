@@ -393,7 +393,8 @@ static uint32_t resolve_typespec(sema_ctx_t *S, uint32_t node, int ptr_depth)
         if (strcmp(tname, "uint8_t") == 0)      { base = st_uchar(S); break; }
         if (strcmp(tname, "int8_t") == 0)       { base = st_schar(S); break; }
         if (strcmp(tname, "__half") == 0
-            || strcmp(tname, "half") == 0)       { base = intern_type(S, STYPE_HALF, 0, 0, 0, 0); break; }
+            || strcmp(tname, "half") == 0
+            || strcmp(tname, "_Float16") == 0)   { base = intern_type(S, STYPE_HALF, 0, 0, 0, 0); break; }
         if (strcmp(tname, "__nv_bfloat16") == 0
             || strcmp(tname, "nv_bfloat16") == 0
             || strcmp(tname, "__bfloat16") == 0) { base = intern_type(S, STYPE_BF16, 0, 0, 0, 0); break; }
@@ -1027,6 +1028,15 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
             if (nargs != 1)
                 sema_error(S, node, "'__float_as_int' expects 1 arg, got %d", nargs);
             return annotate(S, node, st_int(S));
+        }
+
+        /* ---- MFMA intrinsics (CDNA matrix ops) ---- */
+        if (strncmp(cname, "__builtin_amdgcn_mfma_", 22) == 0) {
+            if (nargs != 3)
+                sema_error(S, node, "'%s' expects 3 args, got %d", cname, nargs);
+            /* Return type = accumulator type (arg[2]) */
+            uint32_t rt = (nargs >= 3) ? arg_types[2] : st_float(S);
+            return annotate(S, node, rt);
         }
 
         for (int i = 0; cuda_builtins[i].name; i++) {

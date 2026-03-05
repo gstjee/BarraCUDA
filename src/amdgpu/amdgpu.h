@@ -5,7 +5,7 @@
 
 /*
  * AMDGPU backend for BarraCUDA.
- * Targets CDNA 2 (gfx90a), RDNA 2 (gfx1030), RDNA 3 (gfx1100), RDNA 4 (gfx1200).
+ * Targets CDNA 2/3 (gfx90a/gfx942), RDNA 2 (gfx1030), RDNA 3 (gfx1100), RDNA 4 (gfx1200).
  * Compiles BIR SSA to AMDGCN machine IR, then emits assembly text
  * or binary ELF code objects (.hsaco).
  * Built with the quiet confidence of someone who reads ISA manuals for fun.
@@ -17,6 +17,7 @@
 
 typedef enum {
     AMD_TARGET_GFX90A,    /* CDNA 2 (MI250, Wave64) */
+    AMD_TARGET_GFX942,    /* CDNA 3 (MI300X, Wave64) */
     AMD_TARGET_GFX1030,   /* RDNA 2 */
     AMD_TARGET_GFX1100,   /* RDNA 3 */
     AMD_TARGET_GFX1200,   /* RDNA 4 */
@@ -29,15 +30,11 @@ typedef enum {
 #define AMD_WAVE_SIZE       32
 #define AMD_WAVE64          64
 
-/* Pre-loaded SGPRs for kernels */
-#define AMD_SGPR_DISPATCH_LO  0   /* s0: dispatch packet ptr lo */
-#define AMD_SGPR_DISPATCH_HI  1   /* s1: dispatch packet ptr hi */
-#define AMD_SGPR_KERNARG_LO   2   /* s2: kernarg segment ptr lo */
-#define AMD_SGPR_KERNARG_HI   3   /* s3: kernarg segment ptr hi */
-#define AMD_SGPR_WORKGROUP_X  4   /* s4: workgroup ID X */
-#define AMD_SGPR_WORKGROUP_Y  5   /* s5: workgroup ID Y */
-#define AMD_SGPR_WORKGROUP_Z  6   /* s6: workgroup ID Z */
-#define AMD_KERN_RESERVED_SGPR 7  /* first allocatable SGPR in kernels */
+/* Pre-loaded SGPRs — layout depends on kernel needs.
+ * Default (no dispatch_ptr): s[0:1]=kernarg, s2+=TGID → reserved=3
+ * With dispatch_ptr:         s[0:1]=dispatch, s[2:3]=kernarg, s4+=TGID → reserved=5
+ * Actual positions computed per-kernel in isel. */
+#define AMD_KERN_MIN_RESERVED  2  /* absolute floor: kernarg pair */
 
 /* Pre-loaded VGPRs */
 #define AMD_VGPR_THREAD_X     0   /* v0: thread ID X */
@@ -54,6 +51,7 @@ typedef enum {
 #define EM_AMDGPU                224
 #define ELFOSABI_AMDGPU_HSA      64
 #define EF_AMDGPU_MACH_AMDGCN_GFX90A   0x3F
+#define EF_AMDGPU_MACH_AMDGCN_GFX942   0x4C
 #define EF_AMDGPU_MACH_AMDGCN_GFX1030  0x36
 #define EF_AMDGPU_MACH_AMDGCN_GFX1100  0x41
 #define EF_AMDGPU_MACH_AMDGCN_GFX1200  0x48
@@ -74,6 +72,7 @@ typedef enum {
     AMD_FMT_DS,         /* data share (LDS) */
     AMD_FMT_FLAT_GBL,   /* flat/global memory */
     AMD_FMT_FLAT_SCR,   /* flat/scratch memory */
+    AMD_FMT_VOP3P_MAI,  /* MFMA matrix instructions (64-bit, CDNA only) */
     AMD_FMT_PSEUDO,     /* pseudo-instruction (eliminated before emit) */
     AMD_FMT_COUNT
 } amd_fmt_t;
@@ -83,6 +82,7 @@ typedef enum {
 typedef enum {
     /* -- SOP2: scalar two-input -- */
     AMD_S_ADD_U32,
+    AMD_S_ADD_I32,
     AMD_S_SUB_U32,
     AMD_S_MUL_I32,
     AMD_S_AND_B32,
@@ -258,6 +258,32 @@ typedef enum {
     AMD_SCRATCH_LOAD_DWORD,
     AMD_SCRATCH_STORE_DWORD,
 
+    /* -- VOP3P-MAI: Matrix Fused Multiply-Add (CDNA only) -- */
+    AMD_V_MFMA_F32_4X4X4_F16,
+    AMD_V_MFMA_F32_16X16X16_F16,
+    AMD_V_MFMA_F32_32X32X8_F16,
+    AMD_V_MFMA_F32_4X4X4_BF16_1K,
+    AMD_V_MFMA_F32_16X16X16_BF16_1K,
+    AMD_V_MFMA_F32_32X32X8_BF16_1K,
+    AMD_V_MFMA_F32_4X4X1_F32,
+    AMD_V_MFMA_F32_16X16X4_F32,
+    AMD_V_MFMA_F32_32X32X2_F32,
+    AMD_V_MFMA_I32_4X4X4_I8,
+    AMD_V_MFMA_I32_16X16X16_I8,
+    AMD_V_MFMA_I32_32X32X8_I8,
+    /* FP8/BF8 mixed-precision (gfx942 CDNA3) */
+    AMD_V_MFMA_F32_16X16X32_FP8_FP8,
+    AMD_V_MFMA_F32_16X16X32_FP8_BF8,
+    AMD_V_MFMA_F32_16X16X32_BF8_FP8,
+    AMD_V_MFMA_F32_16X16X32_BF8_BF8,
+    AMD_V_MFMA_F32_32X32X16_FP8_FP8,
+    AMD_V_MFMA_F32_32X32X16_FP8_BF8,
+    AMD_V_MFMA_F32_32X32X16_BF8_FP8,
+    AMD_V_MFMA_F32_32X32X16_BF8_BF8,
+    /* F64 matrix (gfx942 CDNA3) */
+    AMD_V_MFMA_F64_4X4X4_F64,
+    AMD_V_MFMA_F64_16X16X4_F64,
+
     /* -- Pseudo-instructions (eliminated before emit) -- */
     AMD_PSEUDO_PHI,
     AMD_PSEUDO_COPY,
@@ -328,7 +354,8 @@ typedef struct {
     uint16_t is_kernel;        /* 1 for __global__ */
     uint16_t wavefront_size;   /* 32 */
     uint16_t first_alloc_sgpr; /* first SGPR available to regalloc (after param pairs) */
-    uint16_t pad0;
+    uint8_t  needs_dispatch;   /* 1 if kernel uses blockDim/gridDim (dispatch_ptr) */
+    uint8_t  max_dim;          /* highest dim used: 0=x, 1=xy, 2=xyz */
     uint32_t launch_bounds_max; /* 0 = unconstrained. >0 = programmer's optimistic thread count */
     uint32_t launch_bounds_min; /* 0 = not set */
 } mfunc_t;

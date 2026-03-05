@@ -100,6 +100,8 @@ static const char *op_names[BIR_OP_COUNT] = {
     [BIR_FMAX]          = "fmax",
     [BIR_FMIN]          = "fmin",
 
+    [BIR_MFMA]          = "mfma",
+
     [BIR_CALL]          = "call",
     [BIR_SELECT]        = "select",
     [BIR_INLINE_ASM]    = "inline_asm",

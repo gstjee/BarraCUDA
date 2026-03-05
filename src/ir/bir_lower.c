@@ -399,7 +399,8 @@ static uint32_t resolve_type(lower_t *L, uint32_t node, int ptr_depth,
             base = bound;
         else if (strcmp(name, "size_t") == 0)
             base = bir_type_int(L->M, 64);
-        else if (strcmp(name, "__half") == 0 || strcmp(name, "half") == 0)
+        else if (strcmp(name, "__half") == 0 || strcmp(name, "half") == 0
+                 || strcmp(name, "_Float16") == 0)
             base = bir_type_float(L->M, 16);
         else if (strcmp(name, "__nv_bfloat16") == 0
                  || strcmp(name, "nv_bfloat16") == 0
@@ -1600,6 +1601,130 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 set_op(L, o, 0, BIR_MAKE_VAL(ax)); set_op(L, o, 1, BIR_MAKE_VAL(ay));
                 uint32_t r = emit(L, BIR_BITCAST, f32, 1, 0);
                 set_op(L, r, 0, BIR_MAKE_VAL(o));
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
+        /* ---- MFMA intrinsics (CDNA matrix multiply) ---- */
+        if (strncmp(cname, "__builtin_amdgcn_mfma_", 22) == 0) {
+            static const struct { const char *sfx; uint8_t var; } mfma_tab[] = {
+                {"f32_4x4x4_f16",       0},
+                {"f32_16x16x16_f16",     1},
+                {"f32_32x32x8_f16",      2},
+                {"f32_4x4x4_bf16_1k",    3},
+                {"f32_16x16x16_bf16_1k", 4},
+                {"f32_32x32x8_bf16_1k",  5},
+                {"f32_4x4x1_f32",        6},
+                {"f32_16x16x4_f32",      7},
+                {"f32_32x32x2_f32",      8},
+                {"i32_4x4x4_i8",         9},
+                {"i32_16x16x16_i8",     10},
+                {"i32_32x32x8_i8",      11},
+                /* FP8/BF8 mixed-precision (gfx942) */
+                {"f32_16x16x32_fp8_fp8", 12},
+                {"f32_16x16x32_fp8_bf8", 13},
+                {"f32_16x16x32_bf8_fp8", 14},
+                {"f32_16x16x32_bf8_bf8", 15},
+                {"f32_32x32x16_fp8_fp8", 16},
+                {"f32_32x32x16_fp8_bf8", 17},
+                {"f32_32x32x16_bf8_fp8", 18},
+                {"f32_32x32x16_bf8_bf8", 19},
+                /* F64 matrix */
+                {"f64_4x4x4f64",        20},
+                {"f64_16x16x4f64",      21},
+            };
+            const char *sfx = cname + 22;
+            for (int mi = 0; mi < 22; mi++) {
+                if (strcmp(sfx, mfma_tab[mi].sfx) != 0) continue;
+                /* 3 args: A, B, C(accum) */
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t a0 = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t a1 = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t a2 = lower_expr(L, an);
+                uint32_t rt = ref_type(L, a2); /* return type = accum type */
+                uint32_t r = emit(L, BIR_MFMA, rt, 3, mfma_tab[mi].var);
+                set_op(L, r, 0, a0);
+                set_op(L, r, 1, a1);
+                set_op(L, r, 2, a2);
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
+        /* ---- __ockl_* thread model (tinygrad's preferred API) ---- */
+        if (strncmp(cname, "__ockl_get_", 11) == 0) {
+            static const struct { const char *sfx; uint16_t op; } ockl[] = {
+                {"local_id",   BIR_THREAD_ID},
+                {"group_id",   BIR_BLOCK_ID},
+                {"local_size", BIR_BLOCK_DIM},
+                {"num_groups", BIR_GRID_DIM},
+            };
+            const char *rest = cname + 11;
+            for (int oi = 0; oi < 4; oi++) {
+                if (strcmp(rest, ockl[oi].sfx) != 0) continue;
+                /* arg is literal dim (0/1/2) */
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                int dim = 0;
+                if (an && ND(L, an)->type == AST_INT_LIT)
+                    dim = (int)parse_int_text(
+                        L->src + ND(L, an)->d.text.offset,
+                        (int)ND(L, an)->d.text.len);
+                uint32_t i32 = bir_type_int(L->M, 32);
+                uint32_t r = emit(L, ockl[oi].op, i32, 0, (uint8_t)dim);
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
+        /* ---- __ocml_* math builtins (AMD's libm naming) ---- */
+        if (strncmp(cname, "__ocml_", 7) == 0) {
+            const char *rest = cname + 7;
+            /* Unary direct: no prescale needed */
+            static const struct { const char *n; size_t len; uint16_t op; } ou[] = {
+                {"exp2",  4, BIR_EXP2},  {"log2",  4, BIR_LOG2},
+                {"sqrt",  4, BIR_SQRT},  {"fabs",  4, BIR_FABS},
+                {"floor", 5, BIR_FLOOR}, {"ceil",  4, BIR_CEIL},
+                {"trunc", 5, BIR_FTRUNC},{"rint",  4, BIR_RNDNE},
+            };
+            for (int oi = 0; oi < 8; oi++) {
+                if (strncmp(rest, ou[oi].n, ou[oi].len) == 0
+                    && rest[ou[oi].len] == '_') {
+                    uint32_t an = ND(L, callee_n)->next_sibling;
+                    uint32_t v = lower_expr(L, an);
+                    uint32_t rt = ref_type(L, v);
+                    uint32_t r = emit(L, ou[oi].op, rt, 1, 0);
+                    set_op(L, r, 0, v);
+                    return BIR_MAKE_VAL(r);
+                }
+            }
+            /* Binary direct */
+            static const struct { const char *n; size_t len; uint16_t op; } ob[] = {
+                {"fmax", 4, BIR_FMAX}, {"fmin", 4, BIR_FMIN},
+            };
+            for (int oi = 0; oi < 2; oi++) {
+                if (strncmp(rest, ob[oi].n, ob[oi].len) == 0
+                    && rest[ob[oi].len] == '_') {
+                    uint32_t an = ND(L, callee_n)->next_sibling;
+                    uint32_t a0 = lower_expr(L, an);
+                    an = ND(L, an)->next_sibling;
+                    uint32_t a1 = lower_expr(L, an);
+                    uint32_t rt = ref_type(L, a0);
+                    uint32_t r = emit(L, ob[oi].op, rt, 2, 0);
+                    set_op(L, r, 0, a0); set_op(L, r, 1, a1);
+                    return BIR_MAKE_VAL(r);
+                }
+            }
+            /* sin/cos: HW wants input in turns, so prescale by 1/(2pi) */
+            if (strncmp(rest, "sin_", 4) == 0 || strncmp(rest, "cos_", 4) == 0) {
+                uint16_t sop = (rest[0] == 's') ? BIR_SIN : BIR_COS;
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t rt = ref_type(L, v);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, rt, 0.15915494309189535));
+                uint32_t m = emit(L, BIR_FMUL, rt, 2, 0);
+                set_op(L, m, 0, v); set_op(L, m, 1, k);
+                uint32_t r = emit(L, sop, rt, 1, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(m));
                 return BIR_MAKE_VAL(r);
             }
         }

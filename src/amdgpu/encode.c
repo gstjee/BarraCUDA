@@ -79,7 +79,7 @@ static void emit_dword(amd_module_t *A, uint32_t dw)
 
 const amd_enc_entry_t *get_enc_table(const amd_module_t *A)
 {
-    if (A->target <= AMD_TARGET_GFX90A)
+    if (A->target <= AMD_TARGET_GFX942)
         return amd_enc_table_gfx9;
     if (A->target <= AMD_TARGET_GFX1030)
         return amd_enc_table_gfx10;
@@ -192,7 +192,7 @@ static void encode_smem(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
     if (mi->num_uses > 1)
         offset = mi->operands[mi->num_defs + 1].imm;
 
-    if (A->target <= AMD_TARGET_GFX90A) {
+    if (A->target <= AMD_TARGET_GFX942) {
         /* GFX9 SMEM: 2 dwords
            DW0: [31:26]=110000 [25:18]=OP [17]=IMM [16]=GLC [12:6]=SDATA [5:0]=SBASE
            DW1: [20:0]=OFFSET (when IMM=1) */
@@ -273,7 +273,7 @@ static void encode_vop3(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
                     encode_vsrc(&mi->operands[mi->num_defs + 2], &literal, &need_lit) : 0;
 
     uint32_t dw0, dw1;
-    if (A->target <= AMD_TARGET_GFX90A) {
+    if (A->target <= AMD_TARGET_GFX942) {
         /* GFX9: DW0: [31:26]=110100 [25:16]=OP [7:0]=VDST */
         dw0 = (0x34u << 26) | ((uint32_t)(hw_op & 0x3FF) << 16) |
               (uint32_t)vdst;
@@ -385,7 +385,7 @@ static void encode_flat_global(amd_module_t *A, const minst_t *mi, uint16_t hw_o
         emit_dword(A, dw0);
         emit_dword(A, dw1);
         emit_dword(A, dw2);
-    } else if (A->target <= AMD_TARGET_GFX90A) {
+    } else if (A->target <= AMD_TARGET_GFX942) {
         /* GFX9 FLAT/GLOBAL: 2 dwords (64-bit)
            DW0: [31:26]=0x37 [24:18]=OP(7b) [16]=GLC
                 [15:14]=SEG [12:0]=OFFSET(13b signed)
@@ -438,6 +438,35 @@ static void encode_flat_global(amd_module_t *A, const minst_t *mi, uint16_t hw_o
     }
 }
 
+static void encode_vop3p_mai(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
+{
+    /* VOP3P-MAI: 64-bit encoding for MFMA matrix instructions.
+       DW0: [31:23]=0x1A7(prefix) [22:16]=OP(7b) [15]=ACC_CD [14:11]=ABID
+            [10:8]=CBSZ [7:0]=VDST
+       DW1: [63:61]=BLGP [60]=SRC1_ACC [59]=SRC0_ACC [58:50]=SRC2
+            [49:41]=SRC1 [40:32]=SRC0
+       On gfx942, unified VGPR file means ACC flags are 0. Lovely. */
+    uint8_t vdst = (mi->num_defs > 0 && mi->operands[0].kind == MOP_VGPR) ?
+                   (uint8_t)mi->operands[0].reg_num : 0;
+    uint32_t literal = 0;
+    int need_lit = 0;
+    uint16_t src0 = (mi->num_uses > 0) ?
+        encode_vsrc(&mi->operands[mi->num_defs], &literal, &need_lit) : 0;
+    uint16_t src1 = (mi->num_uses > 1) ?
+        encode_vsrc(&mi->operands[mi->num_defs + 1], &literal, &need_lit) : 0;
+    uint16_t src2 = (mi->num_uses > 2) ?
+        encode_vsrc(&mi->operands[mi->num_defs + 2], &literal, &need_lit) : 0;
+
+    /* gfx942: ACC_CD=0 (VGPR dest), CBSZ=0, ABID=0, BLGP=0,
+       SRC0_ACC=0, SRC1_ACC=0 — unified register file, no AGPR faff */
+    uint32_t dw0 = (0x1A7u << 23) | ((uint32_t)(hw_op & 0x7F) << 16) |
+                   (uint32_t)vdst;
+    uint32_t dw1 = ((src2 & 0x1FF) << 18) | ((src1 & 0x1FF) << 9) |
+                   (src0 & 0x1FF);
+    emit_dword(A, dw0);
+    emit_dword(A, dw1);
+}
+
 /* ---- Function Encoder ---- */
 
 /* Instruction offsets for branch fixup */
@@ -480,6 +509,7 @@ void encode_function(amd_module_t *A, uint32_t mf_idx)
                 }
                 break;
             case AMD_FMT_SMEM: case AMD_FMT_VOP3: case AMD_FMT_DS:
+            case AMD_FMT_VOP3P_MAI:
                 offset += 8;
                 break;
             case AMD_FMT_FLAT_GBL: case AMD_FMT_FLAT_SCR:
@@ -531,6 +561,8 @@ void encode_function(amd_module_t *A, uint32_t mf_idx)
             case AMD_FMT_VOP3: encode_vop3(A, mi, enc->hw_opcode); break;
             case AMD_FMT_VOPC: encode_vopc(A, mi, enc->hw_opcode); break;
             case AMD_FMT_DS:   encode_ds(A, mi, enc->hw_opcode);   break;
+            case AMD_FMT_VOP3P_MAI:
+                encode_vop3p_mai(A, mi, enc->hw_opcode); break;
             case AMD_FMT_FLAT_GBL:
             case AMD_FMT_FLAT_SCR:
                 encode_flat_global(A, mi, enc->hw_opcode);
