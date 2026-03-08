@@ -135,11 +135,13 @@ int bc_eload(const char *path)
         if (line[0] != 'E') continue;
         int eid = 0;
         int i = 1;
+        int ndig = 0;
         while (i < 4 && isdigit((unsigned char)line[i])) {
             eid = eid * 10 + (line[i] - '0');
             i++;
+            ndig++;
         }
-        if (line[i] != '=' || eid <= 0 || eid >= BC_EID_MAX) continue;
+        if (ndig == 0 || line[i] != '=' || eid >= BC_EID_MAX) continue;
         i++; /* skip '=' */
 
         /* Copy message text into xlat_buf */
