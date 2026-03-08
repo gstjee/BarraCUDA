@@ -193,11 +193,9 @@ Fix the known gaps: integer literal suffixes, `const`, parameter reassignment. T
 
 ### Medium Term: Optimisation
 
-The generated code works but isn't winning any benchmarks. Priorities:
+The generated code works but isn't winning any benchmarks. Done so far: instruction scheduling, constant folding, dead code elimination. Priorities:
 
-- Instruction scheduling (hide memory latency)
 - Better register allocation (currently linear scan, consider graph colouring)
-- Constant folding (dead code elimination: done)
 - Loop-invariant code motion
 - Occupancy tuning based on register pressure
 
@@ -214,7 +212,7 @@ The IR (BIR) is target-independent. The backend is cleanly separated. Adding a n
 
 **Issues and PRs in any language are welcome** — just include an English translation alongside. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide on style, naming, and where to help.
 
-The HLASM-style short identifiers (`ra_gc`, `mk_hash`, `enc_vop3`) are culturally neutral by accident,there's nothing English about a 5-character label. If you've found a bug or have an idea, write it up in whatever language you think in.
+The HLASM-style short identifiers (`ra_gc`, `mk_hash`, `enc_vop3`) are culturally neutral by accident, there's nothing English about a 5-character label. If you've found a bug or have an idea, write it up in whatever language you think in.
 
 ## Changelog
 
