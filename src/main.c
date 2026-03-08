@@ -8,6 +8,7 @@
 #include "bir_dce.h"
 #include "amdgpu.h"
 #include "sched.h"
+#include "verify.h"
 #include "tensix.h"
 #include <stdlib.h>
 
@@ -393,16 +394,33 @@ int main(int argc, char *argv[])
                              "%s", amd_chip);
                     int arc = amdgpu_compile(bir_module, amd);
                     if (arc == BC_OK) {
+                        vfy_res_t v1 = bc_vfy(amd, VFY_ISEL);
+                        if (v1.errs) {
+                            fprintf(stderr, "verify: %u error(s) after isel\n",
+                                    v1.errs);
+                            arc = BC_ERR_VERIFY;
+                        }
+                    }
+                    if (arc == BC_OK) {
                         if (!no_sched)
                             amdgpu_sched(amd);
                         amdgpu_regalloc(amd);
+                        vfy_res_t v2 = bc_vfy(amd, VFY_RA);
+                        if (v2.errs) {
+                            fprintf(stderr, "verify: %u error(s) after regalloc\n",
+                                    v2.errs);
+                            arc = BC_ERR_VERIFY;
+                        }
+                    }
+                    if (arc == BC_OK) {
                         if (mode_amdgpu_bin)
                             amdgpu_emit_elf(amd,
                                 output_file ? output_file : "a.hsaco");
                         else
                             amdgpu_emit_asm(amd, stdout);
                     } else {
-                        fprintf(stderr, "error: AMDGPU compilation failed\n");
+                        if (arc != BC_ERR_VERIFY)
+                            fprintf(stderr, "error: AMDGPU compilation failed\n");
                         rc = arc;
                     }
                     free(amd);

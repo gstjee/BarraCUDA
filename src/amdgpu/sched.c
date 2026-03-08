@@ -99,7 +99,7 @@ static int is_pseudo_start(uint16_t op)
 static int is_global_load(uint16_t op)
 {
     return op == AMD_GLOBAL_LOAD_DWORD || op == AMD_GLOBAL_LOAD_DWORDX2 ||
-           op == AMD_SCRATCH_LOAD_DWORD;
+           op == AMD_SCRATCH_LOAD_DWORD || op == AMD_FLAT_LOAD_DWORD;
 }
 
 static int is_scalar_load(uint16_t op)
@@ -120,7 +120,8 @@ static int is_ds_load(uint16_t op)
 static int is_store(uint16_t op)
 {
     return op == AMD_GLOBAL_STORE_DWORD || op == AMD_GLOBAL_STORE_DWORDX2 ||
-           op == AMD_SCRATCH_STORE_DWORD || op == AMD_DS_WRITE_B32;
+           op == AMD_SCRATCH_STORE_DWORD || op == AMD_DS_WRITE_B32 ||
+           op == AMD_FLAT_STORE_DWORD;
 }
 
 /* SOP2 instructions that implicitly set SCC */
@@ -227,7 +228,20 @@ static int build_dag(uint16_t n)
         nd->is_pinned_start = (uint8_t)is_pseudo_start(op);
         nd->is_pinned_end = (uint8_t)is_terminator(op);
         nd->is_store = (uint8_t)is_store(op);
-        nd->is_barrier = (op == AMD_S_BARRIER) ? 1 : 0;
+        /* Exec mask modifiers are scheduling barriers — every vector
+         * instruction implicitly depends on which lanes are active.
+         * Moving a flat_store past an exec restore turns it into a NOP
+         * (exec=0), which is how we learned this the hard way. */
+        nd->is_barrier = 0;
+        if (op == AMD_S_BARRIER ||
+            op == AMD_S_AND_SAVEEXEC_B32 ||
+            op == AMD_S_AND_SAVEEXEC_B64)
+            nd->is_barrier = 1;
+        for (uint8_t d = 0; !nd->is_barrier && d < mi->num_defs; d++) {
+            if (mi->operands[d].kind == MOP_SPECIAL &&
+                mi->operands[d].imm == AMD_SPEC_EXEC)
+                nd->is_barrier = 1;
+        }
         nd->is_load = 0;
         nd->wait_kind = 0;
         nd->epoch = cur_epoch;
@@ -271,9 +285,9 @@ static int build_dag(uint16_t n)
                 track_def(op_key(mop), i);
         }
 
-        /* Multi-dword loads define consecutive physical registers */
-        if (op == AMD_S_LOAD_DWORDX2 && mi->num_defs > 0 &&
-            mi->operands[0].kind == MOP_SGPR)
+        /* 64-bit scalar ops define consecutive physical SGPRs */
+        if ((op == AMD_S_MOV_B64 || op == AMD_S_LOAD_DWORDX2) &&
+            mi->num_defs > 0 && mi->operands[0].kind == MOP_SGPR)
             track_def(PHYS_SGPR_KEY(mi->operands[0].reg_num + 1), i);
         if (op == AMD_S_LOAD_DWORDX4 && mi->num_defs > 0 &&
             mi->operands[0].kind == MOP_SGPR) {
@@ -311,8 +325,9 @@ static int build_dag(uint16_t n)
         if (op == AMD_S_CBRANCH_EXECZ || op == AMD_S_CBRANCH_EXECNZ)
             track_use(SPEC_KEY(AMD_SPEC_EXEC), i);
 
-        /* s_and_saveexec_b32 reads and writes EXEC */
-        if (op == AMD_S_AND_SAVEEXEC_B32) {
+        /* s_and_saveexec reads and writes EXEC */
+        if (op == AMD_S_AND_SAVEEXEC_B32 ||
+            op == AMD_S_AND_SAVEEXEC_B64) {
             track_use(SPEC_KEY(AMD_SPEC_EXEC), i);
             track_def(SPEC_KEY(AMD_SPEC_EXEC), i);
             track_def(SPEC_KEY(AMD_SPEC_SCC), i);
@@ -552,6 +567,12 @@ static uint32_t schedule_block(const minst_t *insts, uint32_t n,
 
         uint8_t needs_wait[3] = {0, 0, 0};
         uint8_t total_ops = mi->num_defs + mi->num_uses;
+
+        /* CDNA flat scratch: fence preceding stores before private load.
+         * Flat stores are async -- the private aperture can't snoop
+         * the write buffer, so we must drain vmcnt first. */
+        if (mi->op == AMD_FLAT_LOAD_DWORD)
+            needs_wait[WAIT_VMEM] = 1;
 
         for (uint8_t u = mi->num_defs; u < total_ops; u++) {
             const moperand_t *mop = &mi->operands[u];

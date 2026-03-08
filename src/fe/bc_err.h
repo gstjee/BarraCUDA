@@ -8,6 +8,8 @@
 #ifndef BARRACUDA_BC_ERR_H
 #define BARRACUDA_BC_ERR_H
 
+#include <stdint.h>
+
 /* ---- Error ID Ranges ----
  * E001-E019  Lexer
  * E020-E039  Parser
@@ -82,10 +84,19 @@ typedef enum {
     BC_E111 = 111  /* not an lvalue */
 } bc_eid_t;
 
-/* Returns format string for eid — loaded translation or compiled-in English */
+/* Returns format string for eid -- loaded translation or compiled-in English */
 const char *bc_efmt(bc_eid_t eid);
 
-/* Load external translation file. Returns 0 on success. No-op if path NULL. */
+/* Load external translation file. Returns 0 on success. No-op if path NULL.
+ * Parses both ENNN= (compiler errors) and ANNN= (ABEND messages, hex IDs). */
 int bc_eload(const char *path);
+
+/* ---- ABEND Messages ----
+ * Keyed by uint16_t ABEND code (0x001..0x0FF).
+ * Lang files use hex: "A0C4=memory access violation" etc. */
+
+#define AB_AID_MAX 256
+
+const char *ab_afmt(uint16_t code);
 
 #endif /* BARRACUDA_BC_ERR_H */

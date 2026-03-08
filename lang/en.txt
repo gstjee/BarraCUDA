@@ -64,3 +64,14 @@ E108=parameter not addressable
 E109=not an lvalue (prefix)
 E110=unknown field in lvalue
 E111=not an lvalue
+
+# ---- ABEND Messages (hex IDs) ----
+A0C1=illegal GPU instruction
+A0C4=memory access violation (page not mapped)
+A0C5=addressing exception (unmapped address)
+A0C7=data exception (alignment or arithmetic fault)
+A0CB=GPU hardware error (machine check)
+A001=kernel dispatch failure
+A002=kernel timeout exceeded
+A003=GPU memory exhaustion
+A0FF=unknown GPU fault

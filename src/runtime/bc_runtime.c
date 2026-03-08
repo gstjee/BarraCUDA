@@ -576,6 +576,12 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
     D->signal_wait(signal, HSA_SIGNAL_CONDITION_LT, 1,
                    UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
 
+    /* If a GPU fault occurred, the ABEND callback (ab_fcb in bc_abend.c)
+     * has already fired and printed the dump to stderr. The signal_wait
+     * returns normally even after a fault -- the CP still signals
+     * completion, it's just that the results are garbage. Callers who
+     * set up an ab_ctx_t via ab_init/ab_snag can check A->faulted. */
+
     D->signal_destroy(signal);
     D->mem_free(kernarg_buf);
 

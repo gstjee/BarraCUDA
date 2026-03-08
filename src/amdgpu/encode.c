@@ -25,10 +25,11 @@ static uint8_t encode_ssrc(const moperand_t *op, uint32_t *literal, int *need_li
     case MOP_SGPR:   return (uint8_t)op->reg_num;
     case MOP_SPECIAL:
         switch (op->imm) {
-        case AMD_SPEC_VCC:  return 106;  /* VCC_LO */
-        case AMD_SPEC_EXEC: return 126;  /* EXEC_LO */
-        case AMD_SPEC_SCC:  return 253;
-        case AMD_SPEC_M0:   return 124;
+        case AMD_SPEC_VCC:       return 106;  /* VCC_LO */
+        case AMD_SPEC_EXEC:      return 126;  /* EXEC_LO */
+        case AMD_SPEC_SCC:       return 253;
+        case AMD_SPEC_M0:        return 124;
+        case AMD_SPEC_PRIV_BASE: return 0xED; /* src_private_base */
         default: return 0;
         }
     case MOP_IMM:
@@ -338,6 +339,7 @@ static void encode_flat_global(amd_module_t *A, const minst_t *mi, uint16_t hw_o
     int32_t offset = 0;
     const amd_enc_entry_t *tbl = get_enc_table(A);
     int is_scratch = (tbl[mi->op].fmt == AMD_FMT_FLAT_SCR);
+    int is_flat = (tbl[mi->op].fmt == AMD_FMT_FLAT);
 
     /* Extract def: VDST */
     if (mi->num_defs > 0 && mi->operands[0].kind == MOP_VGPR)
@@ -386,12 +388,12 @@ static void encode_flat_global(amd_module_t *A, const minst_t *mi, uint16_t hw_o
         emit_dword(A, dw1);
         emit_dword(A, dw2);
     } else if (A->target <= AMD_TARGET_GFX942) {
-        /* GFX9 FLAT/GLOBAL: 2 dwords (64-bit)
+        /* GFX9 FLAT/GLOBAL/SCRATCH: 2 dwords (64-bit)
            DW0: [31:26]=0x37 [24:18]=OP(7b) [16]=GLC
                 [15:14]=SEG [12:0]=OFFSET(13b signed)
            DW1: [31:24]=VDST [23:16]=SADDR [15:8]=DATA [7:0]=ADDR
-           Null SADDR=0x7F */
-        uint8_t seg = is_scratch ? 1 : 2;
+           Null SADDR=0x7F. SEG: 0=flat 1=scratch 2=global */
+        uint8_t seg = is_flat ? 0 : (is_scratch ? 1 : 2);
         if (saddr == 0x7C) saddr = 0x7F;
 
         uint32_t off_lo = (uint32_t)offset & 0x1FFF;
@@ -512,7 +514,7 @@ void encode_function(amd_module_t *A, uint32_t mf_idx)
             case AMD_FMT_VOP3P_MAI:
                 offset += 8;
                 break;
-            case AMD_FMT_FLAT_GBL: case AMD_FMT_FLAT_SCR:
+            case AMD_FMT_FLAT_GBL: case AMD_FMT_FLAT_SCR: case AMD_FMT_FLAT:
                 offset += (A->target >= AMD_TARGET_GFX1200) ? 12 : 8;
                 break;
             case AMD_FMT_PSEUDO:
@@ -521,6 +523,18 @@ void encode_function(amd_module_t *A, uint32_t mf_idx)
                 offset += 4;
                 break;
             }
+        }
+    }
+
+    /* Copy offsets into module for .debug_bc emission */
+    for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+        uint32_t mb_idx = F->first_block + bi;
+        if (mb_idx >= AMD_MAX_MBLOCKS) break;
+        const mblock_t *MB = &A->mblocks[mb_idx];
+        for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+            uint32_t mi_idx = MB->first_inst + ii;
+            if (mi_idx < AMD_MAX_MINSTS)
+                A->inst_off[mi_idx] = inst_offsets[mi_idx];
         }
     }
 
@@ -565,6 +579,7 @@ void encode_function(amd_module_t *A, uint32_t mf_idx)
                 encode_vop3p_mai(A, mi, enc->hw_opcode); break;
             case AMD_FMT_FLAT_GBL:
             case AMD_FMT_FLAT_SCR:
+            case AMD_FMT_FLAT:
                 encode_flat_global(A, mi, enc->hw_opcode);
                 break;
             case AMD_FMT_PSEUDO:

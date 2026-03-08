@@ -63,3 +63,14 @@ E108=kaore e taea te toro atu ki te taupa
 E109=ehara i te uara-taha (mua)
 E110=he mara kore mohio kei roto i te uara-taha
 E111=ehara i te uara-taha
+
+# ---- ABEND (hex IDs) ----
+A0C1=he tohutohu GPU kore ture
+A0C4=he takahi whakamaru mahara (wharangi kore mahere)
+A0C5=he rerekeetanga waahitau (waahitau kore mahere)
+A0C7=he rerekeetanga raraunga (tiiaroaro, taatai raanei)
+A0CB=he hapa puuhanga GPU (tirotiro mihini)
+A001=i rahua te tuku kaupapa
+A002=kua pau te waa o te kaupapa
+A003=kua pau te mahara GPU
+A0FF=he hapa GPU kaore i moohiotia
