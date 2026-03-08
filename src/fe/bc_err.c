@@ -81,6 +81,27 @@ static const char *bc_dflt[BC_EID_MAX] = {
     /* E112-E129 */
 };
 
+/* ---- ABEND compiled-in defaults ----
+ * Keyed by hex code (0x001..0x0FF). Sparse, most slots NULL. */
+
+static const char *ab_dflt[AB_AID_MAX];
+static int ab_dflt_init;
+
+static void ab_dset(void)
+{
+    if (ab_dflt_init) return;
+    ab_dflt_init = 1;
+    ab_dflt[0x0C1] = "illegal GPU instruction";
+    ab_dflt[0x0C4] = "memory access violation (page not mapped)";
+    ab_dflt[0x0C5] = "addressing exception (unmapped address)";
+    ab_dflt[0x0C7] = "data exception (alignment or arithmetic fault)";
+    ab_dflt[0x0CB] = "GPU hardware error (machine check)";
+    ab_dflt[0x001] = "kernel dispatch failure";
+    ab_dflt[0x002] = "kernel timeout exceeded";
+    ab_dflt[0x003] = "GPU memory exhaustion";
+    ab_dflt[0x0FF] = "unknown GPU fault";
+}
+
 /* ---- Translation overlay ---- */
 
 #define XLAT_BUF_SZ  32768
@@ -88,6 +109,7 @@ static const char *bc_dflt[BC_EID_MAX] = {
 
 static char        xlat_buf[XLAT_BUF_SZ];
 static const char *bc_xlat[BC_EID_MAX];
+static const char *ab_xlat[AB_AID_MAX];
 
 /* ---- Lookup ---- */
 
@@ -98,6 +120,15 @@ const char *bc_efmt(bc_eid_t eid)
     if (bc_xlat[id]) return bc_xlat[id];
     if (bc_dflt[id]) return bc_dflt[id];
     return "unknown error";
+}
+
+const char *ab_afmt(uint16_t code)
+{
+    ab_dset();
+    if (code >= AB_AID_MAX) return "unknown GPU fault";
+    if (ab_xlat[code]) return ab_xlat[code];
+    if (ab_dflt[code]) return ab_dflt[code];
+    return "unknown GPU fault";
 }
 
 /* ---- Translation file loader ----
@@ -119,6 +150,8 @@ int bc_eload(const char *path)
     unsigned wpos = 0;
 
     memset(bc_xlat, 0, sizeof(bc_xlat));
+    memset(ab_xlat, 0, sizeof(ab_xlat));
+    ab_dset();
 
     while (fgets(line, (int)sizeof(line), fp) && nlines < XLAT_MAX_LN) {
         nlines++;
@@ -130,6 +163,31 @@ int bc_eload(const char *path)
 
         /* Skip blank lines and comments */
         if (ln == 0 || line[0] == '#') continue;
+
+        if (line[0] == 'A') {
+            /* Parse ANNN=text (hex ID, e.g. A0C4=...) */
+            int aid = 0, i = 1, ndig = 0;
+            for (; i < 4 && ndig < 3; i++) {
+                char c = line[i];
+                int v = -1;
+                if (c >= '0' && c <= '9') v = c - '0';
+                else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+                else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+                else break;
+                aid = aid * 16 + v;
+                ndig++;
+            }
+            if (ndig == 0 || line[i] != '=' || aid >= AB_AID_MAX) continue;
+            i++;
+
+            size_t mlen = ln - (size_t)i;
+            if (wpos + mlen + 1 > XLAT_BUF_SZ) break;
+            memcpy(xlat_buf + wpos, line + i, mlen);
+            xlat_buf[wpos + mlen] = '\0';
+            ab_xlat[aid] = xlat_buf + wpos;
+            wpos += (unsigned)(mlen + 1);
+            continue;
+        }
 
         /* Parse ENNN=text */
         if (line[0] != 'E') continue;

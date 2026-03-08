@@ -771,6 +771,11 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             return BIR_VAL_NONE;
         }
         if (s->is_alloca) {
+            /* Arrays decay to pointer — return alloca addr directly.
+             * Loading from an array alloca reads uninit scratch. */
+            if (s->type < L->M->num_types &&
+                L->M->types[s->type].kind == BIR_TYPE_ARRAY)
+                return BIR_MAKE_VAL(s->ref);
             uint32_t inst = emit(L, BIR_LOAD, s->type, 1, 0);
             set_op(L, inst, 0, BIR_MAKE_VAL(s->ref));
             return BIR_MAKE_VAL(inst);
@@ -807,18 +812,25 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
         uint32_t et     = ptr_inner(L, bt);
         if (!et) et = bir_type_int(L->M, 32);
 
-        uint32_t gep = emit(L, BIR_GEP, bt, 2, 0);
+        /* Array decay: ptr(T[N]) → ptr(T) so GEP strides by element */
+        uint32_t gep_t = bt;
+        if (et < L->M->num_types &&
+            L->M->types[et].kind == BIR_TYPE_ARRAY) {
+            uint32_t arr_el = L->M->types[et].inner;
+            uint8_t as = is_ptr_type(L, bt) ? L->M->types[bt].addrspace : 0;
+            gep_t = bir_type_ptr(L->M, arr_el, as);
+            et = arr_el;
+        }
+
+        uint32_t gep = emit(L, BIR_GEP, gep_t, 2, 0);
         set_op(L, gep, 0, base_v);
         set_op(L, gep, 1, idx_v);
 
-        /* a[i] on array-of-array: yield pointer, don't load */
+        /* Multi-dim array or struct: yield pointer, don't load */
         if (et < L->M->num_types &&
-            L->M->types[et].kind == BIR_TYPE_ARRAY) {
-            uint32_t ipt = bir_type_ptr(L->M, et,
-                is_ptr_type(L, bt) ? L->M->types[bt].addrspace : 0);
-            L->M->insts[gep].type = ipt;
+            (L->M->types[et].kind == BIR_TYPE_ARRAY ||
+             L->M->types[et].kind == BIR_TYPE_STRUCT))
             return BIR_MAKE_VAL(gep);
-        }
 
         uint32_t ld = emit(L, BIR_LOAD, et, 1, 0);
         set_op(L, ld, 0, BIR_MAKE_VAL(gep));
@@ -864,6 +876,56 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             }
 
             uint32_t val = lower_expr(L, rhs_n);
+
+            /* Struct copy: p = arr[i] where RHS is a pointer to a
+             * struct in foreign memory (global/shared). The subscript
+             * lowering yielded a GEP, not a loaded value — sensible
+             * for member access, catastrophic for whole-struct copy.
+             * Without this the alloca gets a raw pointer dumped into
+             * its first 8 bytes and the remaining fields read back
+             * as whatever the silicon was dreaming about. */
+            uint32_t vt = ref_type(L, val);
+            uint32_t dt = ptr_inner(L, ref_type(L, ptr));
+            if (is_ptr_type(L, vt) && dt &&
+                dt < L->M->num_types &&
+                L->M->types[dt].kind == BIR_TYPE_STRUCT) {
+                struct_def_t *sd = NULL;
+                for (int si = 0; si < L->nstructs; si++) {
+                    if (L->structs[si].bir_type == dt) {
+                        sd = &L->structs[si]; break;
+                    }
+                }
+                if (sd) {
+                    uint8_t src_as = L->M->types[vt].addrspace;
+                    uint8_t dst_as = L->M->types[ref_type(L, ptr)].addrspace;
+                    uint32_t t32 = bir_type_int(L->M, 32);
+                    for (int fi = 0; fi < sd->num_fields && fi < 16; fi++) {
+                        uint32_t ci = BIR_MAKE_CONST(
+                            bir_const_int(L->M, t32, fi));
+                        uint32_t spt = bir_type_ptr(L->M,
+                            sd->field_types[fi], src_as);
+                        uint32_t sg = emit(L, BIR_GEP, spt, 2, 0);
+                        set_op(L, sg, 0, val);
+                        set_op(L, sg, 1, ci);
+                        uint32_t ld = emit(L, BIR_LOAD,
+                            sd->field_types[fi], 1, 0);
+                        set_op(L, ld, 0, BIR_MAKE_VAL(sg));
+                        uint32_t dpt = bir_type_ptr(L->M,
+                            sd->field_types[fi], dst_as);
+                        uint32_t dg = emit(L, BIR_GEP, dpt, 2, 0);
+                        set_op(L, dg, 0, ptr);
+                        set_op(L, dg, 1, ci);
+                        uint32_t s = emit(L, BIR_STORE,
+                            bir_type_void(L->M), 2, 0);
+                        set_op(L, s, 0, BIR_MAKE_VAL(ld));
+                        set_op(L, s, 1, BIR_MAKE_VAL(dg));
+                    }
+                    uint32_t ld = emit(L, BIR_LOAD, dt, 1, 0);
+                    set_op(L, ld, 0, ptr);
+                    return BIR_MAKE_VAL(ld);
+                }
+            }
+
             uint32_t t_void = bir_type_void(L->M);
             uint32_t st = emit(L, BIR_STORE, t_void, 2, 0);
             set_op(L, st, 0, val);
@@ -1914,7 +1976,16 @@ static uint32_t lower_lvalue(lower_t *L, uint32_t node)
         uint32_t idx_v  = lower_expr(L, idx_n);
         uint32_t bt     = ref_type(L, base_v);
 
-        uint32_t gep = emit(L, BIR_GEP, bt, 2, 0);
+        /* Array decay: ptr(T[N]) → ptr(T) for correct GEP stride */
+        uint32_t gep_t = bt;
+        uint32_t et = ptr_inner(L, bt);
+        if (et && et < L->M->num_types &&
+            L->M->types[et].kind == BIR_TYPE_ARRAY) {
+            uint8_t as = is_ptr_type(L, bt) ? L->M->types[bt].addrspace : 0;
+            gep_t = bir_type_ptr(L->M, L->M->types[et].inner, as);
+        }
+
+        uint32_t gep = emit(L, BIR_GEP, gep_t, 2, 0);
         set_op(L, gep, 0, base_v);
         set_op(L, gep, 1, idx_v);
         return BIR_MAKE_VAL(gep);

@@ -271,8 +271,14 @@ static void regalloc_function(amd_module_t *A, uint32_t mf_idx)  /* called from 
         sgpr_start = AMD_KERN_MIN_RESERVED;
     for (uint16_t r = AMD_MAX_SGPRS; r-- > sgpr_start; )
         RA.sgpr_free[RA.num_sgpr_free++] = (uint8_t)r;
-    for (uint16_t r = AMD_MAX_VGPRS; r-- > 0; )
+
+    /* CDNA flat scratch reserves v250:v251 as addr staging pair */
+    int cdna_scr = (A->target <= AMD_TARGET_GFX942 && F->scratch_bytes > 0);
+    for (uint16_t r = AMD_MAX_VGPRS; r-- > 0; ) {
+        if (cdna_scr && (r == AMD_VGPR_SCR_LO || r == AMD_VGPR_SCR_HI))
+            continue;
         RA.vgpr_free[RA.num_vgpr_free++] = (uint8_t)r;
+    }
 
     compute_live_intervals(A, F);
 
@@ -341,6 +347,10 @@ static void regalloc_function(amd_module_t *A, uint32_t mf_idx)  /* called from 
         F->num_sgprs = F->first_alloc_sgpr;
     F->num_vgprs = RA.max_vgpr;
 
+    /* CDNA flat scratch: v250:v251 are physical, not regalloc'd */
+    if (cdna_scr && F->num_vgprs < AMD_VGPR_SCR_HI + 1)
+        F->num_vgprs = AMD_VGPR_SCR_HI + 1;
+
     /* Minimum 1 SGPR/VGPR for the descriptor */
     if (F->num_sgprs == 0) F->num_sgprs = 1;
     if (F->num_vgprs == 0) F->num_vgprs = 1;
@@ -382,10 +392,14 @@ static void regalloc_function(amd_module_t *A, uint32_t mf_idx)  /* called from 
                 }
             }
 
-            /* Convert PSEUDO_COPY to actual MOV */
+            /* Convert PSEUDO_COPY to actual MOV.
+             * SGPR←VGPR needs v_readfirstlane (uniform value
+             * that ended up in a VGPR — thanks, CDNA hazard). */
             if (mi->op == AMD_PSEUDO_COPY) {
                 if (mi->operands[0].kind == MOP_VGPR)
                     mi->op = AMD_V_MOV_B32;
+                else if (mi->operands[1].kind == MOP_VGPR)
+                    mi->op = AMD_V_READFIRSTLANE_B32;
                 else
                     mi->op = AMD_S_MOV_B32;
             }
@@ -460,9 +474,10 @@ static void print_operand(amd_module_t *A, const moperand_t *op)
         case AMD_SPEC_EXEC:
             asm_append(A, A->target <= AMD_TARGET_GFX942 ? "exec" : "exec_lo");
             break;
-        case AMD_SPEC_SCC:  asm_append(A, "scc"); break;
-        case AMD_SPEC_M0:   asm_append(A, "m0"); break;
-        default:            asm_append(A, "???"); break;
+        case AMD_SPEC_SCC:       asm_append(A, "scc"); break;
+        case AMD_SPEC_M0:        asm_append(A, "m0"); break;
+        case AMD_SPEC_PRIV_BASE: asm_append(A, "src_private_base"); break;
+        default:                 asm_append(A, "???"); break;
         }
         break;
     default:
@@ -541,7 +556,7 @@ static void print_minst(amd_module_t *A, const minst_t *mi)
         }
         break;
     }
-    case AMD_FMT_FLAT_GBL: case AMD_FMT_FLAT_SCR: {
+    case AMD_FMT_FLAT_GBL: case AMD_FMT_FLAT_SCR: case AMD_FMT_FLAT: {
         /* Load:  global_load_dword  vDst, vOffset, sBase|off */
         /* Store: global_store_dword vOffset, vSrc, sBase|off */
         if (mi->num_defs > 0) {
@@ -950,9 +965,11 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
             kd.compute_pgm_rsrc3 = accum_off & 0x3F;
         }
 
-        /* kernel_code_properties — only KERNARG_PTR.
-         * No dispatch_ptr; blockDim/gridDim come from hidden kernarg. */
+        /* kernel_code_properties */
         kd.kernel_code_properties = (1u << 3);   /* ENABLE_SGPR_KERNARG_PTR */
+        /* CDNA flat scratch via src_private_base — does NOT need
+         * ENABLE_PRIVATE_SEGMENT. Runtime/CP sets up FLAT_SCRATCH
+         * from SCRATCH_EN + private_segment_fixed_size. */
 
         if (rodata_len + 64 <= sizeof(rodata)) {
             memcpy(rodata + rodata_len, &kd, 64);
@@ -972,6 +989,58 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     for (uint32_t fi = 0; fi < A->num_mfuncs; fi++) {
         if (A->mfuncs[fi].is_kernel) continue;
         encode_function(A, fi);
+    }
+
+    /* ---- Build .debug_bc section ----
+     * Maps code offsets to source lines. Currently we emit what we know,
+     * which is per-instruction byte offsets. Line numbers are zero until
+     * the frontend grows source location tracking. But the section exists,
+     * the format is defined, and the ABEND dump machinery can read it.
+     * Patience, grasshopper. */
+    static uint8_t dbcbuf[65536];
+    uint32_t dbc_len = 0;
+
+    {
+        /* Count total instructions across all functions */
+        uint32_t n_ent = 0;
+        for (uint32_t fi = 0; fi < A->num_mfuncs && n_ent < 8000; fi++) {
+            const mfunc_t *F = &A->mfuncs[fi];
+            for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+                uint32_t mb_idx = F->first_block + bi;
+                if (mb_idx >= AMD_MAX_MBLOCKS) break;
+                n_ent += A->mblocks[mb_idx].num_insts;
+            }
+        }
+        if (n_ent > 8000) n_ent = 8000;
+
+        /* Header: "BCDB" + count */
+        if (8 + n_ent * 8 <= sizeof(dbcbuf)) {
+            dbcbuf[0] = 'B'; dbcbuf[1] = 'C';
+            dbcbuf[2] = 'D'; dbcbuf[3] = 'B';
+            memcpy(dbcbuf + 4, &n_ent, 4);
+            dbc_len = 8;
+
+            /* Entries: offset + line (line=0 for now) */
+            uint32_t ei = 0;
+            for (uint32_t fi = 0; fi < A->num_mfuncs && ei < n_ent; fi++) {
+                const mfunc_t *F2 = &A->mfuncs[fi];
+                for (uint32_t bi = 0; bi < F2->num_blocks && ei < n_ent; bi++) {
+                    uint32_t mb_idx = F2->first_block + bi;
+                    if (mb_idx >= AMD_MAX_MBLOCKS) break;
+                    const mblock_t *MB = &A->mblocks[mb_idx];
+                    for (uint32_t ii = 0; ii < MB->num_insts && ei < n_ent; ii++) {
+                        uint32_t mi_idx = MB->first_inst + ii;
+                        if (mi_idx >= AMD_MAX_MINSTS) break;
+                        uint32_t off = A->inst_off[mi_idx];
+                        uint32_t ln  = 0; /* no source lines yet */
+                        memcpy(dbcbuf + dbc_len,     &off, 4);
+                        memcpy(dbcbuf + dbc_len + 4, &ln,  4);
+                        dbc_len += 8;
+                        ei++;
+                    }
+                }
+            }
+        }
     }
 
     /* Build note section (msgpack metadata) */
@@ -1145,7 +1214,8 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
      * worked fine for the emulator but real hardware has standards.
      *
      * Sections: 0=NULL 1=.note 2=.dynsym 3=.hash 4=.dynstr
-     *           5=.text 6=.dynamic 7=.symtab 8=.strtab 9=.shstrtab
+     *           5=.rodata 6=.text 7=.dynamic 8=.symtab 9=.strtab
+     *           10=.shstrtab 11=.debug_bc
      *
      * Program headers: PT_PHDR, PT_LOAD(R), PT_LOAD(RX), PT_LOAD(RW),
      *                  PT_NOTE, PT_DYNAMIC
@@ -1164,6 +1234,7 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     shstrtab[shstrtab_len++] = '\0';
     uint32_t sn_note, sn_dynsym, sn_hash, sn_dynstr, sn_rodata;
     uint32_t sn_text, sn_dynamic, sn_symtab, sn_strtab, sn_shstrtab;
+    uint32_t sn_dbgbc;
     SHSTR(sn_note,     ".note");
     SHSTR(sn_dynsym,   ".dynsym");
     SHSTR(sn_hash,     ".hash");
@@ -1174,6 +1245,7 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     SHSTR(sn_symtab,   ".symtab");
     SHSTR(sn_strtab,   ".strtab");
     SHSTR(sn_shstrtab, ".shstrtab");
+    SHSTR(sn_dbgbc,    ".debug_bc");
     #undef SHSTR
 
     /* ---- .dynstr + .strtab: kernel name strings ---- */
@@ -1246,7 +1318,8 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     uint64_t sym_off   = (dyn_off + dyn_size + 7) & ~7ULL;
     uint64_t sym_size  = ndynsym * 24; /* .symtab mirrors .dynsym */
     uint64_t str_off   = sym_off + sym_size;
-    uint64_t shs_off   = str_off + strtab_len;
+    uint64_t dbc_off   = (str_off + strtab_len + 3) & ~3ULL;
+    uint64_t shs_off   = dbc_off + dbc_len;
     uint64_t shdr_off  = (shs_off + shstrtab_len + 7) & ~7ULL;
 
     /* Fix up kernel_code_entry_byte_offset now that VAs are known.
@@ -1348,7 +1421,7 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     ehdr.e_phentsize = 56;
     ehdr.e_phnum = N_PHDR;
     ehdr.e_shentsize = 64;
-    ehdr.e_shnum = 11;      /* +.rodata */
+    ehdr.e_shnum = 12;      /* +.rodata +.debug_bc */
     ehdr.e_shstrndx = 10;   /* .shstrtab */
     fwrite(&ehdr, 1, 64, fp);
 
@@ -1452,14 +1525,19 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     /* .strtab */
     fwrite(strtab, 1, strtab_len, fp);
 
+    /* .debug_bc */
+    fwrite_pad(fp, 4);
+    if (dbc_len > 0)
+        fwrite(dbcbuf, 1, dbc_len, fp);
+
     /* .shstrtab */
     fwrite(shstrtab, 1, shstrtab_len, fp);
     fwrite_pad(fp, 8);
 
     /* ---- Section header table ----
      * 0=NULL 1=.note 2=.dynsym 3=.hash 4=.dynstr 5=.rodata
-     * 6=.text 7=.dynamic 8=.symtab 9=.strtab 10=.shstrtab */
-    elf64_shdr_t shdrs[11];
+     * 6=.text 7=.dynamic 8=.symtab 9=.strtab 10=.shstrtab 11=.debug_bc */
+    elf64_shdr_t shdrs[12];
     memset(shdrs, 0, sizeof(shdrs));
 
     /* 0: NULL (already zeroed) */
@@ -1558,7 +1636,14 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     shdrs[10].sh_size  = shstrtab_len;
     shdrs[10].sh_addralign = 1;
 
-    fwrite(shdrs, 64, 11, fp);
+    /* 11: .debug_bc (non-loaded debug section) */
+    shdrs[11].sh_name  = sn_dbgbc;
+    shdrs[11].sh_type  = SHT_PROGBITS;
+    shdrs[11].sh_offset = dbc_off;
+    shdrs[11].sh_size  = dbc_len;
+    shdrs[11].sh_addralign = 4;
+
+    fwrite(shdrs, 64, 12, fp);
 
     fclose(fp);
 

@@ -37,7 +37,7 @@ const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
 
     /* SOPC */
     [AMD_S_CMP_EQ_U32]      = { AMD_FMT_SOPC, 0x06, "s_cmp_eq_u32"      },
-    [AMD_S_CMP_NE_U32]      = { AMD_FMT_SOPC, 0x06, "s_cmp_eq_u32"      }, /* GFX11: no NE, use EQ+invert */
+    [AMD_S_CMP_NE_U32]      = { AMD_FMT_SOPC, 0x07, "s_cmp_lg_u32"      },
     [AMD_S_CMP_LT_U32]      = { AMD_FMT_SOPC, 0x0A, "s_cmp_lt_u32"      },
     [AMD_S_CMP_LE_U32]      = { AMD_FMT_SOPC, 0x0B, "s_cmp_le_u32"      },
     [AMD_S_CMP_GT_U32]      = { AMD_FMT_SOPC, 0x08, "s_cmp_gt_u32"      },
@@ -47,7 +47,7 @@ const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     [AMD_S_CMP_GT_I32]      = { AMD_FMT_SOPC, 0x02, "s_cmp_gt_i32"      },
     [AMD_S_CMP_GE_I32]      = { AMD_FMT_SOPC, 0x03, "s_cmp_ge_i32"      },
     [AMD_S_CMP_EQ_I32]      = { AMD_FMT_SOPC, 0x00, "s_cmp_eq_i32"      },
-    [AMD_S_CMP_NE_I32]      = { AMD_FMT_SOPC, 0x00, "s_cmp_eq_i32"      }, /* GFX11: no NE, use EQ+invert */
+    [AMD_S_CMP_NE_I32]      = { AMD_FMT_SOPC, 0x01, "s_cmp_lg_i32"      },
 
     /* SOPP */
     [AMD_S_BRANCH]           = { AMD_FMT_SOPP, 0x20, "s_branch"           },
@@ -178,6 +178,10 @@ const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT] = {
     [AMD_SCRATCH_LOAD_DWORD]     = { AMD_FMT_FLAT_SCR, 0x14, "scratch_load_dword"     },
     [AMD_SCRATCH_STORE_DWORD]    = { AMD_FMT_FLAT_SCR, 0x1A, "scratch_store_dword"    },
 
+    /* FLAT — not used on RDNA, CDNA only */
+    [AMD_FLAT_LOAD_DWORD]        = { AMD_FMT_FLAT, 0x00, NULL },
+    [AMD_FLAT_STORE_DWORD]       = { AMD_FMT_FLAT, 0x00, NULL },
+
     /* Pseudo */
     [AMD_PSEUDO_PHI]             = { AMD_FMT_PSEUDO, 0, "PSEUDO_PHI"  },
     [AMD_PSEUDO_COPY]            = { AMD_FMT_PSEUDO, 0, "PSEUDO_COPY" },
@@ -211,9 +215,9 @@ const amd_enc_entry_t amd_enc_table_gfx10[AMD_OP_COUNT] = {
     [AMD_S_SWAPPC_B64]      = { AMD_FMT_SOP1, 0x1E, "s_swappc_b64"      },
     [AMD_S_GETPC_B64]       = { AMD_FMT_SOP1, 0x1C, "s_getpc_b64"       },
 
-    /* SOPC — opcodes mostly stable, NE maps to EQ+invert (same as GFX11) */
+    /* SOPC — GFX9: NE is "lg" (less-or-greater) */
     [AMD_S_CMP_EQ_U32]      = { AMD_FMT_SOPC, 0x06, "s_cmp_eq_u32"      },
-    [AMD_S_CMP_NE_U32]      = { AMD_FMT_SOPC, 0x06, "s_cmp_eq_u32"      },
+    [AMD_S_CMP_NE_U32]      = { AMD_FMT_SOPC, 0x07, "s_cmp_lg_u32"      },
     [AMD_S_CMP_LT_U32]      = { AMD_FMT_SOPC, 0x0A, "s_cmp_lt_u32"      },
     [AMD_S_CMP_LE_U32]      = { AMD_FMT_SOPC, 0x0B, "s_cmp_le_u32"      },
     [AMD_S_CMP_GT_U32]      = { AMD_FMT_SOPC, 0x08, "s_cmp_gt_u32"      },
@@ -223,7 +227,7 @@ const amd_enc_entry_t amd_enc_table_gfx10[AMD_OP_COUNT] = {
     [AMD_S_CMP_GT_I32]      = { AMD_FMT_SOPC, 0x02, "s_cmp_gt_i32"      },
     [AMD_S_CMP_GE_I32]      = { AMD_FMT_SOPC, 0x03, "s_cmp_ge_i32"      },
     [AMD_S_CMP_EQ_I32]      = { AMD_FMT_SOPC, 0x00, "s_cmp_eq_i32"      },
-    [AMD_S_CMP_NE_I32]      = { AMD_FMT_SOPC, 0x00, "s_cmp_eq_i32"      },
+    [AMD_S_CMP_NE_I32]      = { AMD_FMT_SOPC, 0x01, "s_cmp_lg_i32"      },
 
     /* SOPP — completely renumbered */
     [AMD_S_BRANCH]           = { AMD_FMT_SOPP, 0x02, "s_branch"           },
@@ -353,6 +357,10 @@ const amd_enc_entry_t amd_enc_table_gfx10[AMD_OP_COUNT] = {
     [AMD_SCRATCH_LOAD_DWORD]     = { AMD_FMT_FLAT_SCR, 0x0C, "scratch_load_dword"     },
     [AMD_SCRATCH_STORE_DWORD]    = { AMD_FMT_FLAT_SCR, 0x1C, "scratch_store_dword"    },
 
+    /* FLAT — not used on RDNA, CDNA only */
+    [AMD_FLAT_LOAD_DWORD]        = { AMD_FMT_FLAT, 0x00, NULL },
+    [AMD_FLAT_STORE_DWORD]       = { AMD_FMT_FLAT, 0x00, NULL },
+
     /* Pseudo */
     [AMD_PSEUDO_PHI]             = { AMD_FMT_PSEUDO, 0, "PSEUDO_PHI"  },
     [AMD_PSEUDO_COPY]            = { AMD_FMT_PSEUDO, 0, "PSEUDO_COPY" },
@@ -400,9 +408,9 @@ const amd_enc_entry_t amd_enc_table_gfx9[AMD_OP_COUNT] = {
     [AMD_S_SWAPPC_B64]      = { AMD_FMT_SOP1, 0x1E, "s_swappc_b64"      },
     [AMD_S_GETPC_B64]       = { AMD_FMT_SOP1, 0x1C, "s_getpc_b64"       },
 
-    /* SOPC — same opcodes as GFX10, NE maps to EQ+invert for consistency */
+    /* SOPC — GFX10: NE is "lg" (less-or-greater) */
     [AMD_S_CMP_EQ_U32]      = { AMD_FMT_SOPC, 0x06, "s_cmp_eq_u32"      },
-    [AMD_S_CMP_NE_U32]      = { AMD_FMT_SOPC, 0x06, "s_cmp_eq_u32"      },
+    [AMD_S_CMP_NE_U32]      = { AMD_FMT_SOPC, 0x07, "s_cmp_lg_u32"      },
     [AMD_S_CMP_LT_U32]      = { AMD_FMT_SOPC, 0x0A, "s_cmp_lt_u32"      },
     [AMD_S_CMP_LE_U32]      = { AMD_FMT_SOPC, 0x0B, "s_cmp_le_u32"      },
     [AMD_S_CMP_GT_U32]      = { AMD_FMT_SOPC, 0x08, "s_cmp_gt_u32"      },
@@ -412,7 +420,7 @@ const amd_enc_entry_t amd_enc_table_gfx9[AMD_OP_COUNT] = {
     [AMD_S_CMP_GT_I32]      = { AMD_FMT_SOPC, 0x02, "s_cmp_gt_i32"      },
     [AMD_S_CMP_GE_I32]      = { AMD_FMT_SOPC, 0x03, "s_cmp_ge_i32"      },
     [AMD_S_CMP_EQ_I32]      = { AMD_FMT_SOPC, 0x00, "s_cmp_eq_i32"      },
-    [AMD_S_CMP_NE_I32]      = { AMD_FMT_SOPC, 0x00, "s_cmp_eq_i32"      },
+    [AMD_S_CMP_NE_I32]      = { AMD_FMT_SOPC, 0x01, "s_cmp_lg_i32"      },
 
     /* SOPP — same as GFX10. Stable from GFX9 through the heat death */
     [AMD_S_BRANCH]           = { AMD_FMT_SOPP, 0x02, "s_branch"           },
@@ -542,6 +550,10 @@ const amd_enc_entry_t amd_enc_table_gfx9[AMD_OP_COUNT] = {
     /* FLAT_SCR — same opcodes as FLAT_GBL, differentiated by SEG field */
     [AMD_SCRATCH_LOAD_DWORD]     = { AMD_FMT_FLAT_SCR, 0x14, "scratch_load_dword"     },
     [AMD_SCRATCH_STORE_DWORD]    = { AMD_FMT_FLAT_SCR, 0x1C, "scratch_store_dword"    },
+
+    /* FLAT — true flat (SEG=0). CDNA uses private aperture for scratch. */
+    [AMD_FLAT_LOAD_DWORD]        = { AMD_FMT_FLAT, 0x14, "flat_load_dword"        },
+    [AMD_FLAT_STORE_DWORD]       = { AMD_FMT_FLAT, 0x1C, "flat_store_dword"       },
 
     /* VOP3P-MAI — MFMA matrix ops. Opcodes from llvm-mc, format from ISA PDF.
        These only exist on CDNA, which is why they're here and not upstairs

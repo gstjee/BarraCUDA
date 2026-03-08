@@ -41,11 +41,16 @@ typedef enum {
 #define AMD_VGPR_THREAD_Y     1   /* v1: thread ID Y */
 #define AMD_VGPR_THREAD_Z     2   /* v2: thread ID Z */
 
+/* CDNA flat scratch staging (reserved physical VGPRs) */
+#define AMD_VGPR_SCR_LO     250   /* v250: scratch addr lo */
+#define AMD_VGPR_SCR_HI     251   /* v251: private_base hi */
+
 /* Special register IDs (for MOP_SPECIAL) */
 #define AMD_SPEC_VCC        0
 #define AMD_SPEC_EXEC       1
 #define AMD_SPEC_SCC        2
 #define AMD_SPEC_M0         3
+#define AMD_SPEC_PRIV_BASE  4   /* src_private_base (SSRC=0xED) */
 
 /* ELF constants */
 #define EM_AMDGPU                224
@@ -72,6 +77,7 @@ typedef enum {
     AMD_FMT_DS,         /* data share (LDS) */
     AMD_FMT_FLAT_GBL,   /* flat/global memory */
     AMD_FMT_FLAT_SCR,   /* flat/scratch memory */
+    AMD_FMT_FLAT,       /* true flat (SEG=0, private aperture) */
     AMD_FMT_VOP3P_MAI,  /* MFMA matrix instructions (64-bit, CDNA only) */
     AMD_FMT_PSEUDO,     /* pseudo-instruction (eliminated before emit) */
     AMD_FMT_COUNT
@@ -258,6 +264,10 @@ typedef enum {
     AMD_SCRATCH_LOAD_DWORD,
     AMD_SCRATCH_STORE_DWORD,
 
+    /* -- FLAT: true flat (SEG=0, CDNA private aperture scratch) -- */
+    AMD_FLAT_LOAD_DWORD,
+    AMD_FLAT_STORE_DWORD,
+
     /* -- VOP3P-MAI: Matrix Fused Multiply-Add (CDNA only) -- */
     AMD_V_MFMA_F32_4X4X4_F16,
     AMD_V_MFMA_F32_16X16X16_F16,
@@ -414,6 +424,9 @@ typedef struct {
     uint32_t    val_vreg[BIR_MAX_INSTS];   /* BIR inst index -> vreg */
     uint8_t     val_file[BIR_MAX_INSTS];   /* 0=scalar, 1=vector */
     uint16_t    val_sbase[BIR_MAX_INSTS];  /* SGPR pair base for pointers, 0xFFFF=none */
+
+    /* Instruction byte offsets (populated by encode_function) */
+    uint32_t    inst_off[AMD_MAX_MINSTS];
 
     /* Output buffers */
     uint8_t     code[AMD_CODE_SIZE];

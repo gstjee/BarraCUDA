@@ -29,6 +29,7 @@
 #define BC_ERR_LEX         -2
 #define BC_ERR_PARSE       -3
 #define BC_ERR_OVERFLOW    -4
+#define BC_ERR_VERIFY      -5
 
 typedef struct {
     uint32_t line;
