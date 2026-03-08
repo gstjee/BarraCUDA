@@ -216,6 +216,8 @@ The HLASM-style short identifiers (`ra_gc`, `mk_hash`, `enc_vop3`) are culturall
 
 ## Changelog
 
+**2026-03-09** — Post-isel verification pass (`bc_vfy`). The encoder used to trust isel to produce valid machine instructions. It shouldn't have. `bc_vfy` runs twice (post-isel, post-RA) and catches 5 classes of encoding violation before the binary leaves the compiler. Its first run immediately found 7 isel bugs across GFX10 and GFX942 — every one a silent miscompile that would fault on hardware with "Reason: Unknown." Fixed them all. Also: `bc_abend` runtime crash diagnostics, because if IBM could do post-mortem dumps in 1964, we can do it for GPUs in 2026.
+
 **2026-03-08** — Error localisation infrastructure. Every diagnostic now has a language-neutral ID (`E001`–`E111`). External translation files via `--lang <file>`. English reference at `lang/en.txt`, te reo Maori at `lang/mi.txt`. Unified error structs. Lowering errors now displayed.
 
 **2026-03-05** — CDNA 3 additions: GFX942 backend hardening, MFMA, Wave64 divergence, tinygrad compat. 8/8 tests passing on MI300X ([PR#56](https://github.com/Zaneham/BarraCUDA/pull/56)).
