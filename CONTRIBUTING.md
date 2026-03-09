@@ -74,12 +74,6 @@ All of these are perfectly acceptable uses of LLM's.
 
 When I was a kid learning Lua on Roblox, I would actually copy and paste scripts from forums when I genuinely got stuck. It is a fantastic way to 1) learn and 2) fix a problem if you struggle with it. Intellisense, Stack Overflow and all of these things are tools. The Mainframe community passed around assembler macros and borrowed off each other's work on literal magnetic tapes. This isn't new. LLM's are just another tool in a long line of tool development that has happened over the years.
 
-## On the Mighty Emdash
-You'll notice emdashes everywhere — in comments, in commit messages, in this document. I've been drawing hyphens a bit too long since primary school. I have my old books from when I was seven, and there they are — emdashes. Or hyphens. Or maybe I just didn't know what I was writing. 7-year-old me didn't leave a comment.
-
-The point is: use them. They're better than parentheses for asides, better than semicolons for joining related thoughts, and they look good in monospaced fonts. If your PR has emdashes, you'll fit right in.
-
-The hate for emdashes is superficial and weird. I understand its because of LLM's. But I'm not going to let some Robot dictate how I share my own thoughts in my own language. 
 
 **What's acceptable**
 
@@ -92,6 +86,13 @@ The hate for emdashes is superficial and weird. I understand its because of LLM'
 
 - Generating code you don't understand - When I was writing Callout, my Call and Dispatch engine (it's what Emergency services use when dispatching a firetruck because you burnt toast and now the alarm is going off), I hit a wall. I know systems but had no idea on how to properly add a button or a UI element. I found myself relying on my Ollama model too much and eventually couldn't understand what I was making. BarraCUDA requires bit level precision as it emits machine code. If you want to submit a PR but don't understand a section of the codebase or don't understand everything, that is fine, that's being human. You are more than welcome to submit a PR, even an incomplete one, and we can discuss tradeoffs and implementations. We are all learning. Learning is what makes us, us.
 - Architecture - As above please don't make architectural decisions using a chatbot. Even then if you're making a big change in the code anyway feel free to contact me, I'm always happy to chat and open to new ideas.
+
+## On the Mighty Emdash
+You'll notice emdashes everywhere — in comments, in commit messages, in this document. I've been drawing hyphens a bit too long since primary school. I have my old books from when I was seven, and there they are — emdashes. Or hyphens. Or maybe I just didn't know what I was writing. 7-year-old me didn't leave a comment.
+
+The point is: use them. They're better than parentheses for asides, better than semicolons for joining related thoughts, and they look good in monospaced fonts. If your PR has emdashes, you'll fit right in.
+
+The hate for emdashes is superficial and weird. I understand its because of LLM's. But I'm not going to let some Robot dictate how I share my own thoughts in my own language. 
 
 ## Where to Help
 
