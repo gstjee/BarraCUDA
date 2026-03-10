@@ -166,6 +166,9 @@ typedef enum {
     BIR_SHFL, BIR_SHFL_UP, BIR_SHFL_DOWN, BIR_SHFL_XOR,
     BIR_BALLOT, BIR_VOTE_ANY, BIR_VOTE_ALL,
 
+    /* Matrix */
+    BIR_MFMA,                   /* subop = variant ID, ops: [0]=A, [1]=B, [2]=C(accum) */
+
     /* Misc */
     BIR_CALL,                   /* ops[0] = callee func index, rest = args */
     BIR_SELECT,                 /* ops[0] = cond, ops[1] = true, ops[2] = false */

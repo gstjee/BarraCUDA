@@ -12,8 +12,10 @@
  * Host functions are scanned for kernel launches to trigger template instantiation.
  * Returns 0 on success, negative on error.
  * sema may be NULL (fallback: everything treated as signed).
+ * out_errs/out_nerrs: if non-NULL, receives lowering errors for display.
  */
 int bir_lower(const parser_t *P, uint32_t ast_root, bir_module_t *M,
-              const sema_ctx_t *sema);
+              const sema_ctx_t *sema,
+              bc_error_t *out_errs, int *out_nerrs);
 
 #endif /* BARRACUDA_BIR_LOWER_H */

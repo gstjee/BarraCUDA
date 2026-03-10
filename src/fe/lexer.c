@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include <ctype.h>
+#include <stdarg.h>
 
 /* 80 keywords walk into a sorted bar */
 
@@ -315,7 +316,8 @@ static void emit(lexer_t *L, int type, uint32_t start, uint32_t len,
             e->loc.col = col;
             e->loc.offset = start;
             e->code = BC_ERR_OVERFLOW;
-            snprintf(e->msg, sizeof(e->msg), "token buffer overflow");
+            e->eid  = (uint16_t)BC_E001;
+            snprintf(e->msg, sizeof(e->msg), "%s", bc_efmt(BC_E001));
         }
         return;
     }
@@ -327,7 +329,7 @@ static void emit(lexer_t *L, int type, uint32_t start, uint32_t len,
     t->col = col;
 }
 
-static void lex_error(lexer_t *L, const char *msg)
+static void lex_error(lexer_t *L, bc_eid_t eid, ...)
 {
     if (L->num_errors < BC_MAX_ERRORS) {
         bc_error_t *e = &L->errors[L->num_errors++];
@@ -335,7 +337,11 @@ static void lex_error(lexer_t *L, const char *msg)
         e->loc.col = (uint16_t)(L->pos - L->line_start + 1);
         e->loc.offset = L->pos;
         e->code = BC_ERR_LEX;
-        snprintf(e->msg, sizeof(e->msg), "%s", msg);
+        e->eid  = (uint16_t)eid;
+        va_list ap;
+        va_start(ap, eid);
+        vsnprintf(e->msg, sizeof(e->msg), bc_efmt(eid), ap);
+        va_end(ap);
     }
 }
 
@@ -378,7 +384,7 @@ static void skip_block_comment(lexer_t *L)
         }
         advance(L);
     }
-    lex_error(L, "unterminated block comment");
+    lex_error(L, BC_E002);
 }
 
 static void scan_string(lexer_t *L, char quote)
@@ -393,7 +399,7 @@ static void scan_string(lexer_t *L, char quote)
         if (cur(L) == '\\')
             advance(L);
         if (cur(L) == '\n') {
-            lex_error(L, "newline in string literal");
+            lex_error(L, BC_E003);
             break;
         }
         advance(L);
@@ -401,7 +407,7 @@ static void scan_string(lexer_t *L, char quote)
     if (!at_end(L))
         advance(L);
     else
-        lex_error(L, "unterminated string literal");
+        lex_error(L, BC_E004);
 
     emit(L, type, start, L->pos - start, start_line, start_col);
 }
@@ -734,7 +740,7 @@ int lexer_tokenize(lexer_t *L)
             }
             break;
         default:
-            lex_error(L, "unexpected character");
+            lex_error(L, BC_E005);
             emit(L, TOK_ERROR, start, 1, start_line, start_col);
             break;
         }

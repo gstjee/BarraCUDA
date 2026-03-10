@@ -7,6 +7,8 @@
 #include "bir_cfold.h"
 #include "bir_dce.h"
 #include "amdgpu.h"
+#include "sched.h"
+#include "verify.h"
 #include "tensix.h"
 #include <stdlib.h>
 
@@ -65,6 +67,7 @@ static void usage(const char *prog)
         "  --no-mem2reg  Skip mem2reg optimization pass\n"
         "  --no-cfold    Skip constant folding\n"
         "  --no-dce      Skip dead code elimination\n"
+        "  --no-sched    Skip instruction scheduling\n"
         "  --sema        Run semantic analysis and dump types\n"
         "  --pp          Preprocess only and print result\n"
         "  --no-pp       Skip preprocessor\n"
@@ -73,12 +76,14 @@ static void usage(const char *prog)
         "  --amdgpu      Compile to AMDGCN assembly (default: gfx1100)\n"
         "  --amdgpu-bin  Compile to AMDGPU ELF code object (.hsaco)\n"
         "  --gfx90a      Target CDNA 2 (gfx90a, MI250)\n"
+        "  --gfx942      Target CDNA 3 (gfx942, MI300X)\n"
         "  --gfx1030     Target RDNA 2 (gfx1030)\n"
         "  --gfx1200     Target RDNA 4 (gfx1200)\n"
         "  --no-graphcolor  Force linear scan register allocation\n"
         "  --max-vgprs N    Cap VGPR count for regalloc (forces spills)\n"
         "  --tensix      Compile to TT-Metalium C++ (Tensix SFPU)\n"
         "  -o <file>     Output file (for --amdgpu-bin, --tensix)\n"
+        "  --lang <file> Load translated error messages\n"
         "  --help        Show this message\n"
         "\n", prog);
 }
@@ -87,6 +92,7 @@ int main(int argc, char *argv[])
 {
     const char *file = NULL;
     const char *output_file = NULL;
+    const char *lang_file = NULL;
     int mode_pp = 0;
     int mode_lex = 0;
     int mode_parse = 0;
@@ -98,6 +104,7 @@ int main(int argc, char *argv[])
     int no_mem2reg = 0;
     int no_cfold = 0;
     int no_dce = 0;
+    int no_sched = 0;
     int no_pp = 0;
     amd_target_t amd_target = AMD_TARGET_GFX1100;
     uint32_t     amd_elfm  = 0x41;       /* EF_AMDGPU_MACH for exact chip */
@@ -129,6 +136,9 @@ int main(int argc, char *argv[])
         /* CDNA 2 (GFX9) */
         else if (strcmp(argv[i], "--gfx90a") == 0)
             { amd_target = AMD_TARGET_GFX90A; amd_elfm = 0x3F; amd_chip = "gfx90a"; }
+        /* CDNA 3 (GFX9.4.2) */
+        else if (strcmp(argv[i], "--gfx942") == 0)
+            { amd_target = AMD_TARGET_GFX942; amd_elfm = 0x54C; amd_chip = "gfx942"; } /* xnack=off sramecc=off */
         /* RDNA 2 (GFX10.3) */
         else if (strcmp(argv[i], "--gfx1030") == 0)
             { amd_target = AMD_TARGET_GFX1030; amd_elfm = 0x36; amd_chip = "gfx1030"; }
@@ -169,6 +179,8 @@ int main(int argc, char *argv[])
             { amd_target = AMD_TARGET_GFX1200; amd_elfm = 0x4e; amd_chip = "gfx1201"; }
         else if (strcmp(argv[i], "--tensix") == 0)
             mode_tensix = 1;
+        else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc)
+            lang_file = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
             output_file = argv[++i];
         else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
@@ -189,6 +201,8 @@ int main(int argc, char *argv[])
             no_cfold = 1;
         else if (strcmp(argv[i], "--no-dce") == 0)
             no_dce = 1;
+        else if (strcmp(argv[i], "--no-sched") == 0)
+            no_sched = 1;
         else if (strcmp(argv[i], "--no-graphcolor") == 0)
             amd_ra_lin = 1;
         else if (strcmp(argv[i], "--max-vgprs") == 0 && i + 1 < argc)
@@ -213,6 +227,9 @@ int main(int argc, char *argv[])
     if (!mode_pp && !mode_lex && !mode_parse && !mode_sema && !mode_ir &&
         !mode_amdgpu && !mode_amdgpu_bin && !mode_tensix)
         mode_parse = 1;
+
+    /* Load translation file before any diagnostics fire */
+    if (lang_file) bc_eload(lang_file);
 
     uint32_t src_len = 0;
     if (read_file(file, source_buf, BC_MAX_SOURCE, &src_len) != BC_OK)
@@ -250,8 +267,9 @@ int main(int argc, char *argv[])
 
         if (pp->num_errors > 0) {
             for (int i = 0; i < pp->num_errors; i++) {
-                fprintf(stderr, "%s:%u: preproc error: %s\n",
-                        file, pp->errors[i].loc.line, pp->errors[i].msg);
+                fprintf(stderr, "%s:%u: E%03u: %s\n",
+                        file, pp->errors[i].loc.line,
+                        pp->errors[i].eid, pp->errors[i].msg);
             }
         }
 
@@ -272,9 +290,9 @@ int main(int argc, char *argv[])
 
     if (L.num_errors > 0) {
         for (int i = 0; i < L.num_errors; i++) {
-            fprintf(stderr, "%s:%u:%u: error: %s\n",
+            fprintf(stderr, "%s:%u:%u: E%03u: %s\n",
                     file, L.errors[i].loc.line, L.errors[i].loc.col,
-                    L.errors[i].msg);
+                    L.errors[i].eid, L.errors[i].msg);
         }
     }
 
@@ -292,9 +310,9 @@ int main(int argc, char *argv[])
 
         if (P.num_errors > 0) {
             for (int i = 0; i < P.num_errors; i++) {
-                fprintf(stderr, "%s:%u:%u: parse error: %s\n",
+                fprintf(stderr, "%s:%u:%u: E%03u: %s\n",
                         file, P.errors[i].loc.line, P.errors[i].loc.col,
-                        P.errors[i].msg);
+                        P.errors[i].eid, P.errors[i].msg);
             }
         }
 
@@ -319,9 +337,10 @@ int main(int argc, char *argv[])
 
             if (sema_ctx->num_errors > 0) {
                 for (int i = 0; i < sema_ctx->num_errors; i++) {
-                    fprintf(stderr, "%s:%u:%u: sema: %s\n",
-                            file, sema_ctx->errors[i].line,
-                            sema_ctx->errors[i].col,
+                    fprintf(stderr, "%s:%u:%u: E%03u: %s\n",
+                            file, sema_ctx->errors[i].loc.line,
+                            sema_ctx->errors[i].loc.col,
+                            sema_ctx->errors[i].eid,
                             sema_ctx->errors[i].msg);
                 }
             }
@@ -336,12 +355,23 @@ int main(int argc, char *argv[])
 
         if ((mode_ir || mode_amdgpu || mode_amdgpu_bin || mode_tensix) &&
             P.num_errors == 0) {
+            bc_error_t lower_errs[BC_MAX_ERRORS];
+            int num_lower_errs = 0;
             bir_module = (bir_module_t *)malloc(sizeof(bir_module_t));
             if (!bir_module) {
                 fprintf(stderr, "error: failed to allocate BIR module\n");
                 return 1;
             }
-            int lrc = bir_lower(&P, root, bir_module, sema_ctx);
+            int lrc = bir_lower(&P, root, bir_module, sema_ctx,
+                                lower_errs, &num_lower_errs);
+            if (num_lower_errs > 0) {
+                for (int i = 0; i < num_lower_errs; i++) {
+                    fprintf(stderr, "%s:%u:%u: E%03u: %s\n",
+                            file, lower_errs[i].loc.line,
+                            lower_errs[i].loc.col,
+                            lower_errs[i].eid, lower_errs[i].msg);
+                }
+            }
             if (lrc == BC_OK) {
                 if (!no_mem2reg)
                     bir_mem2reg(bir_module);
@@ -370,14 +400,33 @@ int main(int argc, char *argv[])
                              "%s", amd_chip);
                     int arc = amdgpu_compile(bir_module, amd);
                     if (arc == BC_OK) {
+                        vfy_res_t v1 = bc_vfy(amd, VFY_ISEL);
+                        if (v1.errs) {
+                            fprintf(stderr, "verify: %u error(s) after isel\n",
+                                    v1.errs);
+                            arc = BC_ERR_VERIFY;
+                        }
+                    }
+                    if (arc == BC_OK) {
+                        if (!no_sched)
+                            amdgpu_sched(amd);
                         amdgpu_regalloc(amd);
+                        vfy_res_t v2 = bc_vfy(amd, VFY_RA);
+                        if (v2.errs) {
+                            fprintf(stderr, "verify: %u error(s) after regalloc\n",
+                                    v2.errs);
+                            arc = BC_ERR_VERIFY;
+                        }
+                    }
+                    if (arc == BC_OK) {
                         if (mode_amdgpu_bin)
                             amdgpu_emit_elf(amd,
                                 output_file ? output_file : "a.hsaco");
                         else
                             amdgpu_emit_asm(amd, stdout);
                     } else {
-                        fprintf(stderr, "error: AMDGPU compilation failed\n");
+                        if (arc != BC_ERR_VERIFY)
+                            fprintf(stderr, "error: AMDGPU compilation failed\n");
                         rc = arc;
                     }
                     free(amd);

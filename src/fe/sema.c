@@ -44,21 +44,25 @@ static int text_eq(const sema_ctx_t *S, uint32_t node, const char *s)
 
 /* ---- Error Reporting ---- */
 
-static void sema_error(sema_ctx_t *S, uint32_t node, const char *fmt, ...)
+static void sema_error(sema_ctx_t *S, uint32_t node,
+                       bc_eid_t eid, ...)
 {
     if (S->num_errors >= SEMA_MAX_ERRORS) return;
-    sema_error_t *e = &S->errors[S->num_errors++];
+    bc_error_t *e = &S->errors[S->num_errors++];
     if (node) {
         const ast_node_t *n = ND(S, node);
-        e->line = n->line;
-        e->col  = n->col;
+        e->loc.line = n->line;
+        e->loc.col  = (uint16_t)n->col;
     } else {
-        e->line = 0;
-        e->col  = 0;
+        e->loc.line = 0;
+        e->loc.col  = 0;
     }
+    e->loc.offset = 0;
+    e->code = BC_ERR_SEMA;
+    e->eid  = (uint16_t)eid;
     va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(e->msg, sizeof(e->msg), fmt, ap);
+    va_start(ap, eid);
+    vsnprintf(e->msg, sizeof(e->msg), bc_efmt(eid), ap);
     va_end(ap);
 }
 
@@ -393,7 +397,8 @@ static uint32_t resolve_typespec(sema_ctx_t *S, uint32_t node, int ptr_depth)
         if (strcmp(tname, "uint8_t") == 0)      { base = st_uchar(S); break; }
         if (strcmp(tname, "int8_t") == 0)       { base = st_schar(S); break; }
         if (strcmp(tname, "__half") == 0
-            || strcmp(tname, "half") == 0)       { base = intern_type(S, STYPE_HALF, 0, 0, 0, 0); break; }
+            || strcmp(tname, "half") == 0
+            || strcmp(tname, "_Float16") == 0)   { base = intern_type(S, STYPE_HALF, 0, 0, 0, 0); break; }
         if (strcmp(tname, "__nv_bfloat16") == 0
             || strcmp(tname, "nv_bfloat16") == 0
             || strcmp(tname, "__bfloat16") == 0) { base = intern_type(S, STYPE_BF16, 0, 0, 0, 0); break; }
@@ -710,7 +715,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
         uint32_t struct_t = obj_t;
         if (n->d.member.is_arrow) {
             if (!is_ptr(S, obj_t)) {
-                sema_error(S, node, "arrow on non-pointer");
+                sema_error(S, node, BC_E070);
                 return annotate(S, node, st_error(S));
             }
             struct_t = ptr_pointee(S, obj_t);
@@ -727,7 +732,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
                         return annotate(S, node, sd->field_types[fi]);
                     }
                 }
-                sema_error(S, fld_n, "no field '%s' in struct '%s'",
+                sema_error(S, fld_n, BC_E071,
                            fname, sd->name);
             }
         }
@@ -744,7 +749,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
             else if (strcmp(fname, "w") == 0) lane = 3;
             if (lane >= 0 && lane < (int)width)
                 return annotate(S, node, S->types[struct_t].inner);
-            sema_error(S, fld_n, "invalid vector field '%s'", fname);
+            sema_error(S, fld_n, BC_E072, fname);
         }
         return annotate(S, node, st_int(S));
     }
@@ -986,7 +991,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
                     uint32_t elem_t = intern_type(S, vec_ctors[vi].elem, 0, 0, 0, 0);
                     uint32_t vt = intern_type(S, STYPE_VECTOR, 0, vec_ctors[vi].lanes, elem_t, 0);
                     if (nargs != (int)vec_ctors[vi].lanes)
-                        sema_error(S, node, "'%s' expects %d args, got %d",
+                        sema_error(S, node, BC_E073,
                                    cname, (int)vec_ctors[vi].lanes, nargs);
                     return annotate(S, node, vt);
                 }
@@ -996,12 +1001,12 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
         /* ---- Half conversion builtins ---- */
         if (strcmp(cname, "__float2half") == 0) {
             if (nargs != 1)
-                sema_error(S, node, "'__float2half' expects 1 arg, got %d", nargs);
+                sema_error(S, node, BC_E074, "__float2half", nargs);
             return annotate(S, node, intern_type(S, STYPE_HALF, 0, 0, 0, 0));
         }
         if (strcmp(cname, "__half2float") == 0) {
             if (nargs != 1)
-                sema_error(S, node, "'__half2float' expects 1 arg, got %d", nargs);
+                sema_error(S, node, BC_E074, "__half2float", nargs);
             return annotate(S, node, st_float(S));
         }
 
@@ -1009,24 +1014,33 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
         if (strcmp(cname, "__float2bfloat16") == 0
             || strcmp(cname, "__float2bfloat16_rn") == 0) {
             if (nargs != 1)
-                sema_error(S, node, "'%s' expects 1 arg, got %d", cname, nargs);
+                sema_error(S, node, BC_E074, cname, nargs);
             return annotate(S, node, intern_type(S, STYPE_BF16, 0, 0, 0, 0));
         }
         if (strcmp(cname, "__bfloat162float") == 0) {
             if (nargs != 1)
-                sema_error(S, node, "'__bfloat162float' expects 1 arg, got %d", nargs);
+                sema_error(S, node, BC_E074, "__bfloat162float", nargs);
             return annotate(S, node, st_float(S));
         }
         /* ---- Bit-cast builtins ---- */
         if (strcmp(cname, "__int_as_float") == 0) {
             if (nargs != 1)
-                sema_error(S, node, "'__int_as_float' expects 1 arg, got %d", nargs);
+                sema_error(S, node, BC_E074, "__int_as_float", nargs);
             return annotate(S, node, st_float(S));
         }
         if (strcmp(cname, "__float_as_int") == 0) {
             if (nargs != 1)
-                sema_error(S, node, "'__float_as_int' expects 1 arg, got %d", nargs);
+                sema_error(S, node, BC_E074, "__float_as_int", nargs);
             return annotate(S, node, st_int(S));
+        }
+
+        /* ---- MFMA intrinsics (CDNA matrix ops) ---- */
+        if (strncmp(cname, "__builtin_amdgcn_mfma_", 22) == 0) {
+            if (nargs != 3)
+                sema_error(S, node, BC_E075, cname, nargs);
+            /* Return type = accumulator type (arg[2]) */
+            uint32_t rt = (nargs >= 3) ? arg_types[2] : st_float(S);
+            return annotate(S, node, rt);
         }
 
         for (int i = 0; cuda_builtins[i].name; i++) {
@@ -1034,7 +1048,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
             const cuda_builtin_t *b = &cuda_builtins[i];
 
             if (b->nargs >= 0 && nargs != b->nargs) {
-                sema_error(S, node, "'%s' expects %d args, got %d",
+                sema_error(S, node, BC_E073,
                            cname, b->nargs, nargs);
             }
 
@@ -1065,7 +1079,7 @@ static uint32_t check_expr(sema_ctx_t *S, uint32_t node)
             if (ft < S->num_types && S->types[ft].kind == STYPE_FUNC) {
                 int expected = (int)S->types[ft].width;
                 if (expected > 0 && nargs != expected) {
-                    sema_error(S, node, "'%s' expects %d args, got %d",
+                    sema_error(S, node, BC_E073,
                                cname, expected, nargs);
                 }
                 return annotate(S, node, S->types[ft].inner);
@@ -1225,7 +1239,7 @@ static void check_stmt(sema_ctx_t *S, uint32_t node)
         if (cond_n) {
             uint32_t ct = check_expr(S, cond_n);
             if (!is_scalar(S, ct) && !is_error(S, ct))
-                sema_error(S, cond_n, "condition must be scalar type");
+                sema_error(S, cond_n, BC_E076);
         }
         check_stmt(S, then_n);
         if (else_n) check_stmt(S, else_n);
@@ -1249,7 +1263,7 @@ static void check_stmt(sema_ctx_t *S, uint32_t node)
         if (cond_n && ND(S, cond_n)->type != AST_NONE) {
             uint32_t ct = check_expr(S, cond_n);
             if (!is_scalar(S, ct) && !is_error(S, ct))
-                sema_error(S, cond_n, "for-condition must be scalar type");
+                sema_error(S, cond_n, BC_E077);
         }
         if (incr_n && ND(S, incr_n)->type != AST_NONE)
             check_expr(S, incr_n);
@@ -1266,7 +1280,7 @@ static void check_stmt(sema_ctx_t *S, uint32_t node)
         if (cond_n) {
             uint32_t ct = check_expr(S, cond_n);
             if (!is_scalar(S, ct) && !is_error(S, ct))
-                sema_error(S, cond_n, "while-condition must be scalar type");
+                sema_error(S, cond_n, BC_E078);
         }
         if (body_n) check_stmt(S, body_n);
         break;
@@ -1280,7 +1294,7 @@ static void check_stmt(sema_ctx_t *S, uint32_t node)
         if (cond_n) {
             uint32_t ct = check_expr(S, cond_n);
             if (!is_scalar(S, ct) && !is_error(S, ct))
-                sema_error(S, cond_n, "do-while condition must be scalar type");
+                sema_error(S, cond_n, BC_E079);
         }
         break;
     }
@@ -1292,7 +1306,7 @@ static void check_stmt(sema_ctx_t *S, uint32_t node)
         if (cond_n) {
             uint32_t ct = check_expr(S, cond_n);
             if (!is_integer(S, ct) && !is_error(S, ct))
-                sema_error(S, cond_n, "switch expression must be integer type");
+                sema_error(S, cond_n, BC_E080);
         }
         if (body_n) {
             uint32_t c = ND(S, body_n)->first_child;
@@ -1440,11 +1454,11 @@ static void collect_func_decl(sema_ctx_t *S, uint32_t node)
     int ret_ptr = ND(S, node)->d.oper.flags;
     uint32_t ret_t = resolve_typespec(S, type_n, ret_ptr);
 
-    uint32_t param_types[16];
+    uint32_t param_types[32];
     int nparams = 0;
     uint32_t c = ND(S, node)->first_child;
     while (c) {
-        if (ND(S, c)->type == AST_PARAM && nparams < 16) {
+        if (ND(S, c)->type == AST_PARAM && nparams < 32) {
             uint32_t pt_n = ND(S, c)->first_child;
             int pdepth = ND(S, c)->d.oper.flags;
             param_types[nparams++] = resolve_typespec(S, pt_n, pdepth);
@@ -1504,7 +1518,7 @@ static void check_func_def(sema_ctx_t *S, uint32_t node)
     uint16_t cuda = ND(S, node)->cuda_flags;
 
     if ((cuda & CUDA_GLOBAL) && !is_void_type(S, ret_t))
-        sema_error(S, node, "__global__ function must return void");
+        sema_error(S, node, BC_E081);
 
     S->cur_ret_type = ret_t;
 

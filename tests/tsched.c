@@ -1,0 +1,89 @@
+/* tsched.c -- instruction scheduling tests
+ * Verifies that the scheduler groups loads and defers waits. */
+
+#include "tharns.h"
+
+static char obuf[TH_BUFSZ];
+
+/* ---- sched: loads grouped (no wait between two global_load_dword) ---- */
+
+static void sch_loadpair(void)
+{
+    int rc = th_run(BC_BIN " --amdgpu tests/test_sched.cu", obuf, TH_BUFSZ);
+    CHEQ(rc, 0);
+
+    /* Find two global_load_dword instructions — there should be no
+     * s_waitcnt between them after scheduling. */
+    const char *first = strstr(obuf, "global_load_");
+    CHECK(first != NULL);
+    const char *second = strstr(first + 1, "global_load_");
+    CHECK(second != NULL);
+
+    int gap = (int)(second - first);
+    char between[TH_BUFSZ];
+    if (gap > 0 && gap < TH_BUFSZ - 1) {
+        memcpy(between, first, (size_t)gap);
+        between[gap] = '\0';
+        /* no wait between the two loads */
+        CHECK(strstr(between, "s_waitcnt") == NULL);
+        CHECK(strstr(between, "s_wait_loadcnt") == NULL);
+    }
+
+    PASS();
+}
+TH_REG("sched", sch_loadpair)
+
+/* ---- sched: --no-sched still produces correct output ---- */
+
+static void sch_nosched(void)
+{
+    int rc = th_run(BC_BIN " --amdgpu --no-sched tests/test_sched.cu",
+                    obuf, TH_BUFSZ);
+    CHEQ(rc, 0);
+
+    /* Should still have global_load and s_waitcnt in output */
+    CHECK(strstr(obuf, "global_load_") != NULL);
+    PASS();
+}
+TH_REG("sched", sch_nosched)
+
+/* ---- sched: compiles to ELF with scheduling ---- */
+
+static void sch_elf(void)
+{
+    const char *out = "test_sched_out.hsaco";
+    char cmd[TH_BUFSZ];
+
+    snprintf(cmd, TH_BUFSZ, BC_BIN " --amdgpu-bin tests/test_sched.cu -o %s", out);
+    int rc = th_run(cmd, obuf, TH_BUFSZ);
+    CHEQ(rc, 0);
+    CHECK(th_exist(out));
+    remove(out);
+    PASS();
+}
+TH_REG("sched", sch_elf)
+
+/* ---- sched: all targets compile with scheduling ---- */
+
+static void sch_targets(void)
+{
+    static const char *targets[] = { "--gfx1030", "", "--gfx1200" };
+    static const char *tnames[]  = { "gfx1030", "gfx1100", "gfx1200" };
+    const char *out = "test_sched_tgt.hsaco";
+    char cmd[TH_BUFSZ];
+
+    for (int t = 0; t < 3; t++) {
+        snprintf(cmd, TH_BUFSZ,
+                 BC_BIN " --amdgpu-bin %s tests/test_sched.cu -o %s",
+                 targets[t], out);
+        int rc = th_run(cmd, obuf, TH_BUFSZ);
+        if (rc != 0) {
+            printf("  target %s failed: %s\n", tnames[t], obuf);
+            CHECK(0);
+        }
+        CHECK(th_exist(out));
+        remove(out);
+    }
+    PASS();
+}
+TH_REG("sched", sch_targets)

@@ -18,7 +18,7 @@
 
 /* ---- Error reporting ---- */
 
-static void pp_error(preproc_t *pp, const char *fmt, ...)
+static void pp_error(preproc_t *pp, bc_eid_t eid, ...)
 {
     if (pp->num_errors >= BC_MAX_ERRORS) return;
     bc_error_t *e = &pp->errors[pp->num_errors++];
@@ -26,9 +26,10 @@ static void pp_error(preproc_t *pp, const char *fmt, ...)
     e->loc.col = 1;
     e->loc.offset = pp->pos;
     e->code = BC_ERR_PREPROC;
+    e->eid  = (uint16_t)eid;
     va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(e->msg, sizeof(e->msg), fmt, ap);
+    va_start(ap, eid);
+    vsnprintf(e->msg, sizeof(e->msg), bc_efmt(eid), ap);
     va_end(ap);
 }
 
@@ -100,7 +101,7 @@ static void pp_emit_str(preproc_t *pp, const char *s, uint32_t len)
 static uint32_t pool_add(preproc_t *pp, const char *s, uint32_t len)
 {
     if (pp->pool_len + len > PP_POOL_SIZE) {
-        pp_error(pp, "macro string pool exhausted");
+        pp_error(pp, BC_E040);
         return 0;
     }
     uint32_t off = pp->pool_len;
@@ -142,7 +143,7 @@ static int pp_define_macro(preproc_t *pp, const char *name, uint32_t name_len,
     }
 
     if (pp->num_macros >= PP_MAX_MACROS) {
-        pp_error(pp, "too many macros (max %d)", PP_MAX_MACROS);
+        pp_error(pp, BC_E041, PP_MAX_MACROS);
         return BC_ERR_PREPROC;
     }
 
@@ -185,7 +186,7 @@ static int pp_is_active(const preproc_t *pp)
 static void pp_push_cond(preproc_t *pp, int active)
 {
     if (pp->cond_depth >= PP_MAX_COND_DEPTH) {
-        pp_error(pp, "#if nesting too deep (max %d)", PP_MAX_COND_DEPTH);
+        pp_error(pp, BC_E042, PP_MAX_COND_DEPTH);
         return;
     }
     int parent = pp_is_active(pp);
@@ -198,7 +199,7 @@ static void pp_push_cond(preproc_t *pp, int active)
 static void pp_flip_else(preproc_t *pp)
 {
     if (pp->cond_depth == 0) {
-        pp_error(pp, "#else without matching #if");
+        pp_error(pp, BC_E043);
         return;
     }
     pp_cond_t *c = &pp->cond_stack[pp->cond_depth - 1];
@@ -209,7 +210,7 @@ static void pp_flip_else(preproc_t *pp)
 static void pp_flip_elif(preproc_t *pp, int expr_val)
 {
     if (pp->cond_depth == 0) {
-        pp_error(pp, "#elif without matching #if");
+        pp_error(pp, BC_E044);
         return;
     }
     pp_cond_t *c = &pp->cond_stack[pp->cond_depth - 1];
@@ -220,7 +221,7 @@ static void pp_flip_elif(preproc_t *pp, int expr_val)
 static void pp_pop_cond(preproc_t *pp)
 {
     if (pp->cond_depth == 0) {
-        pp_error(pp, "#endif without matching #if");
+        pp_error(pp, BC_E045);
         return;
     }
     pp->cond_depth--;
@@ -908,7 +909,7 @@ static void pp_dir_define(preproc_t *pp)
 
     /* Read macro name */
     if (pp_at_end(pp) || !pp_is_ident_start(pp_cur(pp))) {
-        pp_error(pp, "#define: expected macro name");
+        pp_error(pp, BC_E046);
         pp_skip_to_eol(pp);
         return;
     }
@@ -1019,7 +1020,7 @@ static void pp_dir_error(preproc_t *pp)
     char msg[256];
     uint32_t mlen = pp_collect_line(pp, msg, sizeof(msg));
     (void)mlen;
-    pp_error(pp, "#error %s", msg);
+    pp_error(pp, BC_E047, msg);
 }
 
 static void pp_dir_pragma(preproc_t *pp)
@@ -1110,7 +1111,7 @@ static void pp_dir_include(preproc_t *pp)
         }
         if (pp_cur(pp) == '>') pp_advance(pp);
     } else {
-        pp_error(pp, "#include: expected \"file\" or <file>");
+        pp_error(pp, BC_E048);
         pp_skip_to_eol(pp);
         return;
     }
@@ -1144,7 +1145,7 @@ static void pp_dir_include(preproc_t *pp)
 
     /* Guard against include depth overflow */
     if (pp->file_depth >= PP_MAX_FILE_DEPTH) {
-        pp_error(pp, "#include: nesting too deep (max %d)", PP_MAX_FILE_DEPTH);
+        pp_error(pp, BC_E049, PP_MAX_FILE_DEPTH);
         return;
     }
 
@@ -1152,7 +1153,7 @@ static void pp_dir_include(preproc_t *pp)
     char *inc_buf = NULL;
     uint32_t inc_len = 0;
     if (pp_read_file(fullpath, &inc_buf, &inc_len) != 0) {
-        pp_error(pp, "#include: cannot read '%s'", fullpath);
+        pp_error(pp, BC_E050, fullpath);
         return;
     }
 
@@ -1264,7 +1265,7 @@ static void pp_process_directive(preproc_t *pp)
     else if (strcmp(dir, "line") == 0)    pp_skip_to_eol(pp);
     else if (dlen == 0) { /* null directive: just '#' on a line */ }
     else {
-        pp_error(pp, "unknown directive: #%s", dir);
+        pp_error(pp, BC_E051, dir);
         pp_skip_to_eol(pp);
     }
 }
@@ -1321,7 +1322,7 @@ int pp_process(preproc_t *pp)
 
     /* Check for unterminated conditionals */
     if (pp->cond_depth > 0) {
-        pp_error(pp, "unterminated #if/#ifdef (missing %d #endif)", pp->cond_depth);
+        pp_error(pp, BC_E052, pp->cond_depth);
     }
 
     /* Null-terminate output */

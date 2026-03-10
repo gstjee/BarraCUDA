@@ -4,13 +4,7 @@ An open-source CUDA C++ compiler written from scratch in C99 that takes `.cu` fi
 
 This is what happens when you look at NVIDIA's walled garden and think "how hard can it be?" The answer is: quite hard, actually, but I did it anyway.
 
-**UPDATE: RDNA 2, 3 and 4 now supported.** `--gfx1030` / `--gfx1100` / `--gfx1200`
-
-**UPDATE: HSA runtime launcher added.** Compile kernels and dispatch them on AMD hardware. See [Runtime Launcher](#runtime-launcher).
-
-**UPDATE (AGAIN!):** Tenstorrent is now supported. Looking for testers, please fill out an issue if there is any problems. 
-
-**UPDATE:** CDNA 2 is now supported! Yes I'm getting to the point a changelog might be in order but thats a tomorrow problem. If anyone has hardware to validate please feel free to test this.
+See [Changelog](#changelog) for recent updates.
 
 ## What It Does
 
@@ -86,6 +80,9 @@ make
 
 # Run semantic analysis
 ./barracuda --sema kernel.cu
+
+# Error messages in te reo Maori (or any language with a translation file)
+./barracuda --lang lang/mi.txt --amdgpu-bin kernel.cu -o kernel.hsaco
 ```
 
 ## Runtime Launcher
@@ -137,6 +134,7 @@ Requires Linux with ROCm installed. See `examples/launch_saxpy.c` for a complete
 ### Compiler Features
 - Full C preprocessor: `#include`, `#define`/`#undef`, function-like macros, `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else`/`#endif`, `#pragma`, `#error`, `-I`/`-D` flags
 - Error recovery (reports multiple errors without hanging)
+- Multilingual error messages (`--lang <file>`) with language-neutral E-codes
 - Source location tracking in IR dumps
 - Struct pass-by-value
 
@@ -195,11 +193,9 @@ Fix the known gaps: integer literal suffixes, `const`, parameter reassignment. T
 
 ### Medium Term: Optimisation
 
-The generated code works but isn't winning any benchmarks. Priorities:
+The generated code works but isn't winning any benchmarks. Done so far: instruction scheduling, constant folding, dead code elimination. Priorities:
 
-- Instruction scheduling (hide memory latency)
 - Better register allocation (currently linear scan, consider graph colouring)
-- Constant folding (dead code elimination: done)
 - Loop-invariant code motion
 - Occupancy tuning based on register pressure
 
@@ -212,13 +208,39 @@ The IR (BIR) is target-independent. The backend is cleanly separated. Adding a n
 - **RISC-V Vector Extension** - For when GPUs are too mainstream and you want to run CUDA on a softcore.
 
 
+## Contributing
+
+**Issues and PRs in any language are welcome** — just include an English translation alongside. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide on style, naming, and where to help.
+
+The HLASM-style short identifiers (`ra_gc`, `mk_hash`, `enc_vop3`) are culturally neutral by accident, there's nothing English about a 5-character label. If you've found a bug or have an idea, write it up in whatever language you think in.
+
+## Changelog
+
+**2026-03-09** — Post-isel verification pass (`bc_vfy`). The encoder used to trust isel to produce valid machine instructions. It shouldn't have. `bc_vfy` runs twice (post-isel, post-RA) and catches 5 classes of encoding violation before the binary leaves the compiler. Its first run immediately found 7 isel bugs across GFX10 and GFX942 — every one a silent miscompile that would fault on hardware with "Reason: Unknown." Fixed them all. Also: `bc_abend` runtime crash diagnostics, because if IBM could do post-mortem dumps in 1964, we can do it for GPUs in 2026.
+
+**2026-03-08** — Error localisation infrastructure. Every diagnostic now has a language-neutral ID (`E001`–`E111`). External translation files via `--lang <file>`. English reference at `lang/en.txt`, te reo Maori at `lang/mi.txt`. Unified error structs. Lowering errors now displayed.
+
+**2026-03-05** — CDNA 3 additions: GFX942 backend hardening, MFMA, Wave64 divergence, tinygrad compat. 8/8 tests passing on MI300X ([PR#56](https://github.com/Zaneham/BarraCUDA/pull/56)).
+
+**2026-03-05** — Instruction scheduling ([PR#52](https://github.com/Zaneham/BarraCUDA/pull/52)).
+
+**2026-03-03** — CDNA 2 support (`--gfx90a`, MI250). Tinygrad compatibility.
+
+**2026-02-28** — Tenstorrent Tensix backend (`--tensix`). Compiles CUDA to TT-Metalium C++ for Blackhole. Constant folding ([PR#51](https://github.com/Zaneham/BarraCUDA/pull/51)). Dead code elimination ([PR#48](https://github.com/Zaneham/BarraCUDA/pull/48)).
+
+**2026-02-25** — HSA runtime launcher ([PR#40](https://github.com/Zaneham/BarraCUDA/pull/40)). RDNA 2 support (`--gfx1030`, [PR#38](https://github.com/Zaneham/BarraCUDA/pull/38)). Test suite ([PR#41](https://github.com/Zaneham/BarraCUDA/pull/41)).
+
+**2026-02-20** — RDNA 4 support (`--gfx1200`, [PR#32](https://github.com/Zaneham/BarraCUDA/pull/32)).
+
+**2026-02-16** — Initial release. CUDA compiler targeting AMD RDNA 3 (gfx1100).
+
 ## Contact
 
 Found a bug? Want to discuss the finer points of AMDGPU instruction encoding? Need someone to commiserate with about the state of GPU computing?
 
 **zanehambly@gmail.com**
 
-Open an issue if theres anything you want to discuss. Or don't. I'm not your mum.
+Open an issue if there's anything you want to discuss. Or don't. I'm not your mum.
 
 Based in New Zealand, where it's already tomorrow and the GPUs are just as confused as everywhere else.
 

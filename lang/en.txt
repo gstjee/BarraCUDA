@@ -1,0 +1,77 @@
+# lang/en.txt - English (reference)
+# BarraCUDA error messages. Format: ENNN=message text
+# Placeholders (%s, %d, %c, %02x) must be preserved in translations.
+
+# ---- Internal ----
+E000=internal compiler error
+
+# ---- Lexer (E001-E019) ----
+E001=token buffer overflow
+E002=unterminated block comment
+E003=newline in string literal
+E004=unterminated string literal
+E005=unexpected character
+
+# ---- Parser (E020-E039) ----
+E020=expected '%s', got '%s'
+E021=AST node limit exceeded
+E022=expected expression
+E023=unexpected token in namespace
+E024=expected declaration
+E025=unexpected token in function body
+E026=unexpected token in block
+E027=unexpected token at top level
+
+# ---- Preprocessor (E040-E069) ----
+E040=macro string pool exhausted
+E041=too many macros (max %d)
+E042=#if nesting too deep (max %d)
+E043=#else without matching #if
+E044=#elif without matching #if
+E045=#endif without matching #if
+E046=#define: expected macro name
+E047=#error %s
+E048=#include: expected "file" or <file>
+E049=#include: nesting too deep (max %d)
+E050=#include: cannot read '%s'
+E051=unknown directive: #%s
+E052=unterminated #if/#ifdef (missing %d #endif)
+
+# ---- Sema (E070-E099) ----
+E070=arrow on non-pointer
+E071=no field '%s' in struct '%s'
+E072=invalid vector field '%s'
+E073='%s' expects %d args, got %d
+E074='%s' expects 1 arg, got %d
+E075='%s' expects 3 args, got %d
+E076=condition must be scalar type
+E077=for-condition must be scalar type
+E078=while-condition must be scalar type
+E079=do-while condition must be scalar type
+E080=switch expression must be integer type
+E081=__global__ function must return void
+
+# ---- Lowering (E100-E129) ----
+E100=too many labels (max 256)
+E101=undefined variable
+E102=unsupported binary op
+E103=unsupported unary prefix
+E104=unsupported postfix op
+E105=unknown function in call
+E106=unsupported expression node
+E107=undefined lvalue
+E108=parameter not addressable
+E109=not an lvalue (prefix)
+E110=unknown field in lvalue
+E111=not an lvalue
+
+# ---- ABEND Messages (hex IDs) ----
+A0C1=illegal GPU instruction
+A0C4=memory access violation (page not mapped)
+A0C5=addressing exception (unmapped address)
+A0C7=data exception (alignment or arithmetic fault)
+A0CB=GPU hardware error (machine check)
+A001=kernel dispatch failure
+A002=kernel timeout exceeded
+A003=GPU memory exhaustion
+A0FF=unknown GPU fault

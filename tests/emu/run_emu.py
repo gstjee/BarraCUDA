@@ -138,7 +138,9 @@ def ipl3(ARCHV="rdna3"):
 # ---- ELF Parser ----
 
 def prs_elf(FDATA):
-    """Extract .text from ELF64 LE."""
+    """Extract .rodata (KD) + .text (code) from ELF64 LE.
+    Returns KD bytes + code bytes concatenated so prs_kd still
+    reads offset 0 as the kernel descriptor."""
     if FDATA[:4] != b'\x7fELF':
         raise ValueError("not ELF")
     SHOFF = struct.unpack_from('<Q', FDATA, 40)[0]
@@ -148,15 +150,25 @@ def prs_elf(FDATA):
     SSOFF = struct.unpack_from('<Q', FDATA, SHOFF + STIDX * SHENT + 24)[0]
     SSSIZ = struct.unpack_from('<Q', FDATA, SHOFF + STIDX * SHENT + 32)[0]
     SSTAB = FDATA[SSOFF : SSOFF + SSSIZ]
+    SECTS = {}
     for i in range(SHNUM):
         SHBAS = SHOFF + i * SHENT
         NMOFF = struct.unpack_from('<I', FDATA, SHBAS)[0]
         SNAME = SSTAB[NMOFF : SSTAB.index(b'\0', NMOFF)].decode()
-        if SNAME == '.text':
-            TXOFF = struct.unpack_from('<Q', FDATA, SHBAS + 24)[0]
-            TXSIZ = struct.unpack_from('<Q', FDATA, SHBAS + 32)[0]
-            return FDATA[TXOFF : TXOFF + TXSIZ]
-    raise ValueError("no .text")
+        SOFF  = struct.unpack_from('<Q', FDATA, SHBAS + 24)[0]
+        SSIZ  = struct.unpack_from('<Q', FDATA, SHBAS + 32)[0]
+        SECTS[SNAME] = FDATA[SOFF : SOFF + SSIZ]
+    # New layout: KD in .rodata, code in .text
+    if '.rodata' in SECTS and '.text' in SECTS:
+        KDATA = SECTS['.rodata']
+        TDATA = SECTS['.text']
+        # Pad KD to 256 bytes (entry_byte_offset) then append code
+        PAD   = b'\x00' * (256 - len(KDATA))
+        return KDATA + PAD + TDATA
+    # Legacy layout: KD + code both in .text
+    if '.text' in SECTS:
+        return SECTS['.text']
+    raise ValueError("no .text or .rodata")
 
 def prs_arch(FDATA):
     """Extract arch from ELF e_flags. Returns 'rdna3' or 'rdna4'."""
@@ -170,11 +182,12 @@ def prs_kd(TXDAT):
     KASIZ = struct.unpack_from('<I', TXDAT, 8)[0]
     RSRC1 = struct.unpack_from('<I', TXDAT, 48)[0]
     RSRC2 = struct.unpack_from('<I', TXDAT, 52)[0]
-    return RSRC1, RSRC2, KASIZ, LDSSZ, SCRSZ
+    KPROP = struct.unpack_from('<H', TXDAT, 56)[0]
+    return RSRC1, RSRC2, KASIZ, LDSSZ, SCRSZ, KPROP
 
 # ---- vectorAdd Execution ----
 
-def run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV="rdna3"):
+def run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV="rdna3", KPROP=0x03):
     """Execute vectorAdd and verify every element."""
     KCODE = TXDAT[256:]
     KCSIZ = len(KCODE)
@@ -186,19 +199,19 @@ def run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV="rdna3"):
     NGRPS = NELMS // BKSIZ
     FSIZE = NELMS * 4
 
-    MEMSZ = FSIZE * 3 + 32 + 64
+    MEMSZ = FSIZE * 3 + 64 + 64
     MBASE = lo_mem(MEMSZ)
 
     AADDR = MBASE
     BADDR = MBASE + FSIZE
     CADR2 = MBASE + FSIZE * 2
     KAOFF = MBASE + FSIZE * 3
-    DPOFF = KAOFF + 32
+    DPOFF = KAOFF + 64
 
     BUFA  = (ctypes.c_float * NELMS).from_address(AADDR)
     BUFB  = (ctypes.c_float * NELMS).from_address(BADDR)
     BUFC  = (ctypes.c_float * NELMS).from_address(CADR2)
-    KARGS = (ctypes.c_uint8 * 32).from_address(KAOFF)
+    KARGS = (ctypes.c_uint8 * 64).from_address(KAOFF)
     DSPKT = (ctypes.c_uint8 * 64).from_address(DPOFF)
 
     for i in range(NELMS):
@@ -213,6 +226,15 @@ def run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV="rdna3"):
     struct.pack_into('<Q', KARGS, 16, CADR2)
     struct.pack_into('<I', KARGS, 24, NELMS)
 
+    # Hidden kernargs at offset 32: block_count (3×u32) + group_size (3×u16)
+    # Matches isel.c hk_base layout for BIR_BLOCK_DIM / BIR_GRID_DIM
+    struct.pack_into('<I', KARGS, 32, NGRPS)   # block_count_x
+    struct.pack_into('<I', KARGS, 36, 1)        # block_count_y
+    struct.pack_into('<I', KARGS, 40, 1)        # block_count_z
+    struct.pack_into('<H', KARGS, 44, BKSIZ)    # group_size_x
+    struct.pack_into('<H', KARGS, 46, 1)        # group_size_y
+    struct.pack_into('<H', KARGS, 48, 1)        # group_size_z
+
     struct.pack_into('<H', DSPKT, 4,  BKSIZ)
     struct.pack_into('<H', DSPKT, 6,  1)
     struct.pack_into('<H', DSPKT, 8,  1)
@@ -220,10 +242,16 @@ def run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV="rdna3"):
 
     print(f"  karg=0x{KAOFF:016x} disp=0x{DPOFF:016x} code=0x{CADDR:016x}")
 
-    USRDT = [
-        DPOFF & 0xFFFFFFFF, (DPOFF >> 32) & 0xFFFFFFFF,
-        KAOFF & 0xFFFFFFFF, (KAOFF >> 32) & 0xFFFFFFFF,
-    ]
+    # Build user SGPRs from kernel_code_properties bits:
+    #   bit 0 = ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER (4 SGPRs)
+    #   bit 1 = ENABLE_SGPR_DISPATCH_PTR (2 SGPRs)
+    #   bit 2 = ENABLE_SGPR_QUEUE_PTR (2 SGPRs)
+    #   bit 3 = ENABLE_SGPR_KERNARG_SEGMENT_PTR (2 SGPRs)
+    USRDT = []
+    if KPROP & (1 << 1):  # dispatch_ptr
+        USRDT += [DPOFF & 0xFFFFFFFF, (DPOFF >> 32) & 0xFFFFFFFF]
+    if KPROP & (1 << 3):  # kernarg_ptr
+        USRDT += [KAOFF & 0xFFFFFFFF, (KAOFF >> 32) & 0xFFFFFFFF]
 
     RETCD = run_asm(CADDR, KCSIZ, NGRPS, 1, 1, BKSIZ, 1, 1,
                     KAOFF, RSRC2, SCRSZ, ARCHV, USRDT)
@@ -267,13 +295,13 @@ def main():
 
     print(f"\n=== vectorAdd ({ARCHV}) ===")
     TXDAT = prs_elf(FDATA)
-    RSRC1, RSRC2, KASIZ, LDSSZ, SCRSZ = prs_kd(TXDAT)
+    RSRC1, RSRC2, KASIZ, LDSSZ, SCRSZ, KPROP = prs_kd(TXDAT)
     KCSIZ = len(TXDAT) - 256
 
     print(f"  rsrc1=0x{RSRC1:08x} rsrc2=0x{RSRC2:08x} "
           f"kernarg={KASIZ} lds={LDSSZ} scratch={SCRSZ} code={KCSIZ}B")
 
-    RETCD, NFAIL, NELMS = run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV)
+    RETCD, NFAIL, NELMS = run_vadd(TXDAT, RSRC2, SCRSZ, ARCHV, KPROP)
 
     if RETCD != 0:
         print(f"FAIL: emulator rc={RETCD}")

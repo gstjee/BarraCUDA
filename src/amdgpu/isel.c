@@ -24,12 +24,18 @@ static struct {
 
     /* Scratch offset tracking */
     uint32_t        scratch_offset;
+    uint8_t         has_scratch;    /* BIR pre-scan: function uses alloca */
+    uint16_t        sgpr_priv;      /* CDNA: SGPR pair for src_private_base */
 
     /* LDS (shared memory) offset tracking */
     uint32_t        lds_offset;
 
     /* Pointer param SGPR pair allocation */
     uint16_t        next_param_sgpr;
+
+    /* CDNA exec-save pairs, reused by nesting depth */
+    uint16_t        esave_base;
+    uint16_t        max_ddep;
 
     /* Current BIR block being processed */
     uint32_t        current_bir_block;
@@ -52,6 +58,14 @@ static struct {
     /* Saved thread IDs: v0/v1/v2 must be copied before param loads clobber them */
     uint32_t        saved_tid[3];   /* virtual VGPR holding saved threadIdx.x/y/z */
 
+    /* Dynamic SGPR layout — set per-kernel based on needs_dispatch */
+    uint16_t        sgpr_kernarg;   /* SGPR pair base for kernarg ptr */
+    uint16_t        sgpr_dispatch;  /* SGPR pair base for dispatch ptr (if enabled) */
+    uint16_t        sgpr_wg_base;   /* first SGPR for workgroup IDs */
+    uint16_t        kern_reserved;  /* first allocatable SGPR after system regs */
+    uint8_t         needs_dispatch; /* this kernel uses dispatch_ptr */
+    uint8_t         max_dim;        /* highest dim needed (0=x, 1=xy, 2=xyz) */
+
     /* Hidden kernarg offset for __device__/__constant__ global pointers */
     uint32_t        hkrarg;
 
@@ -61,7 +75,7 @@ static struct {
 
 /* ---- Target Helpers ---- */
 
-static int is_cdna(void) { return S.amd->target <= AMD_TARGET_GFX90A; }
+static int is_cdna(void) { return S.amd->target <= AMD_TARGET_GFX942; }
 
 /* ---- Divergence Analysis ---- */
 
@@ -157,6 +171,7 @@ static void divergence_analysis(const bir_func_t *F)
             case BIR_SHFL: case BIR_SHFL_UP:
             case BIR_SHFL_DOWN: case BIR_SHFL_XOR:
             case BIR_ALLOCA: /* per-thread scratch — inherently divergent */
+            case BIR_MFMA:  /* matrix result is a collective warp operation */
                 mark_divergent(idx);
                 break;
             case BIR_PARAM:
@@ -648,17 +663,58 @@ static void isel_arith(uint32_t idx, const bir_inst_t *I, int div)
         default: break;
         }
     } else {
-        /* Scalar (uniform) path */
+        /* Scalar (uniform) path.
+         * Guard: if either operand landed in a VGPR (source was computed
+         * divergently), the scalar ALU can't read it.  Promote the whole
+         * op to VALU rather than let the encoder silently read s0. */
+        int vprom = (src0.kind == MOP_VGPR || src0.kind == MOP_VREG_V ||
+                     src1.kind == MOP_VGPR || src1.kind == MOP_VREG_V);
+        /* CDNA s_add/s_sub hazard: yields 0 when both operands come
+         * fresh from SMEM loads.  Promote to VALU even when both are
+         * scalar vregs — the pipe hasn't settled yet. */
+        if (!vprom && is_cdna() &&
+            (I->op == BIR_ADD || I->op == BIR_SUB) &&
+            src0.kind == MOP_VREG_S && src1.kind == MOP_VREG_S)
+            vprom = 1;
+
+        if (vprom) {
+            S.amd->val_file[idx] = 1;
+            S.amd->reg_file[vr] = 1;
+            dst = mop_vreg_v((uint16_t)vr);
+            src0 = ensure_vgpr(src0);
+            src1 = ensure_vgpr(src1);
+        }
         switch (I->op) {
-        case BIR_ADD:  emit2(AMD_S_ADD_U32, dst, src0, src1); break;
-        case BIR_SUB:  emit2(AMD_S_SUB_U32, dst, src0, src1); break;
-        case BIR_MUL:  emit2(AMD_S_MUL_I32, dst, src0, src1); break;
-        case BIR_AND:  emit2(AMD_S_AND_B32, dst, src0, src1); break;
-        case BIR_OR:   emit2(AMD_S_OR_B32,  dst, src0, src1); break;
-        case BIR_XOR:  emit2(AMD_S_XOR_B32, dst, src0, src1); break;
-        case BIR_SHL:  emit2(AMD_S_LSHL_B32, dst, src0, src1); break;
-        case BIR_LSHR: emit2(AMD_S_LSHR_B32, dst, src0, src1); break;
-        case BIR_ASHR: emit2(AMD_S_ASHR_I32, dst, src0, src1); break;
+        case BIR_ADD:
+            emit2(vprom ? AMD_V_ADD_U32  : AMD_S_ADD_I32,  dst, src0, src1);
+            break;
+        case BIR_SUB:
+            emit2(vprom ? AMD_V_SUB_U32  : AMD_S_SUB_U32,  dst, src0, src1);
+            break;
+        case BIR_MUL:
+            emit2(vprom ? AMD_V_MUL_LO_U32 : AMD_S_MUL_I32, dst, src0, src1);
+            break;
+        case BIR_AND:
+            emit2(vprom ? AMD_V_AND_B32  : AMD_S_AND_B32,  dst, src0, src1);
+            break;
+        case BIR_OR:
+            emit2(vprom ? AMD_V_OR_B32   : AMD_S_OR_B32,   dst, src0, src1);
+            break;
+        case BIR_XOR:
+            emit2(vprom ? AMD_V_XOR_B32  : AMD_S_XOR_B32,  dst, src0, src1);
+            break;
+        case BIR_SHL:
+            if (vprom) emit2(AMD_V_LSHLREV_B32, dst, src1, src0);
+            else       emit2(AMD_S_LSHL_B32,    dst, src0, src1);
+            break;
+        case BIR_LSHR:
+            if (vprom) emit2(AMD_V_LSHRREV_B32, dst, src1, src0);
+            else       emit2(AMD_S_LSHR_B32,    dst, src0, src1);
+            break;
+        case BIR_ASHR:
+            if (vprom) emit2(AMD_V_ASHRREV_I32, dst, src1, src0);
+            else       emit2(AMD_S_ASHR_I32,    dst, src0, src1);
+            break;
         /* Float ops: no scalar float ALU on AMDGPU, always vector */
         case BIR_FADD: case BIR_FSUB: case BIR_FMUL:
         case BIR_FMAX: case BIR_FMIN:
@@ -794,6 +850,20 @@ static void isel_icmp(uint32_t idx, const bir_inst_t *I, int div)
         emit3(AMD_V_CNDMASK_B32, mop_vreg_v((uint16_t)vr),
               mop_imm(0), mop_vreg_v((uint16_t)one_vr),
               mop_special(AMD_SPEC_VCC));
+    } else if (src0.kind == MOP_VGPR || src0.kind == MOP_VREG_V ||
+               src1.kind == MOP_VGPR || src1.kind == MOP_VREG_V) {
+        /* Operand landed in VGPR — can't use SOPC, promote to VOPC */
+        moperand_t vs0 = ensure_vgpr(src0);
+        moperand_t vs1 = ensure_vgpr(src1);
+        uint16_t vcmp = icmp_to_vcmp(I->subop);
+        emit0_2(vcmp, vs0, vs1);
+        uint32_t one_vr = new_vreg(1);
+        emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)one_vr), mop_imm(1));
+        S.amd->val_file[idx] = 1;
+        S.amd->reg_file[vr] = 1;
+        emit3(AMD_V_CNDMASK_B32, mop_vreg_v((uint16_t)vr),
+              mop_imm(0), mop_vreg_v((uint16_t)one_vr),
+              mop_special(AMD_SPEC_VCC));
     } else {
         /* SOPC: s_cmp_* sets SCC. Materialize via s_cselect_b32 */
         uint16_t scmp = icmp_to_scmp(I->subop);
@@ -822,6 +892,16 @@ static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
     moperand_t src = resolve_val(I->operands[0], div);
     uint32_t vr = map_bir_val(idx, div);
 
+    /* Guard: source landed in VGPR but we're on the scalar path.
+     * Promote to vector — scalar ALU can't read VGPRs, and
+     * pretending otherwise leads to the encoder quietly substituting
+     * s0 and a memory fault that ruins your afternoon. */
+    if (!div && (src.kind == MOP_VGPR || src.kind == MOP_VREG_V)) {
+        div = 1;
+        S.amd->val_file[idx] = 1;
+        S.amd->reg_file[vr] = 1;
+    }
+
     switch (I->op) {
     case BIR_TRUNC: {
         /* Truncate to narrower int: mask off high bits */
@@ -829,8 +909,9 @@ static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
         if (w < 32) {
             uint32_t mask = (1u << w) - 1;
             if (div) {
+                /* SRC0 takes the immediate, VSRC1 must be VGPR */
                 emit2(AMD_V_AND_B32, mop_vreg_v((uint16_t)vr),
-                      ensure_vgpr(src), mop_imm((int32_t)mask));
+                      mop_imm((int32_t)mask), ensure_vgpr(src));
             } else {
                 emit2(AMD_S_AND_B32, mop_vreg_s((uint16_t)vr), src, mop_imm((int32_t)mask));
             }
@@ -854,7 +935,7 @@ static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
         if (src_w < 32) {
             uint32_t mask = (1u << src_w) - 1;
             if (div)
-                emit2(AMD_V_AND_B32, mop_vreg_v((uint16_t)vr), ensure_vgpr(src), mop_imm((int32_t)mask));
+                emit2(AMD_V_AND_B32, mop_vreg_v((uint16_t)vr), mop_imm((int32_t)mask), ensure_vgpr(src));
             else
                 emit2(AMD_S_AND_B32, mop_vreg_s((uint16_t)vr), src, mop_imm((int32_t)mask));
         } else {
@@ -957,10 +1038,41 @@ static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
         break;
     }
     case BIR_PTRTOINT: case BIR_INTTOPTR: case BIR_BITCAST: {
-        if (div)
-            emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), ensure_vgpr(src));
-        else
+        /* Bitcast is a reinterpretation — the bits don't change,
+         * so neither should the SGPR base pointer that tells the
+         * hardware where this address actually lives.  Without
+         * this, (struct Quad *)out loses its sbase and subsequent
+         * global_load uses vaddr-only mode, which interprets a
+         * 32-bit offset as a 64-bit address and lands you in
+         * whatever unmapped region the GPU feels like faulting on.
+         * The kind of bug that makes you question pointer semantics,
+         * your career choices, and the heat death of the universe,
+         * in that order. */
+        uint32_t opref = I->operands[0];
+        uint16_t sbase = 0xFFFF;
+        if (!BIR_VAL_IS_CONST(opref) && opref != BIR_VAL_NONE) {
+            uint32_t si = BIR_VAL_INDEX(opref);
+            if (si < BIR_MAX_INSTS) {
+                sbase = S.amd->val_sbase[si];
+                S.amd->val_sbase[idx] = sbase;
+            }
+        }
+        /* When sbase is set, the "value" is a VGPR offset paired
+         * with an SGPR base — must stay in VGPR land regardless
+         * of divergence.  SOP1 can't source VGPRs anyway; v0 in
+         * an 8-bit SSRC field silently encodes as s0, which gives
+         * you the kernarg pointer instead of zero and a memory
+         * fault that looks like the GPU has opinions about your
+         * type-punning. */
+        if (sbase != 0xFFFF || div ||
+            src.kind == MOP_VGPR || src.kind == MOP_VREG_V) {
+            S.amd->val_file[idx] = 1;
+            S.amd->reg_file[vr] = 1;
+            emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr),
+                  ensure_vgpr(src));
+        } else {
             emit1(AMD_S_MOV_B32, mop_vreg_s((uint16_t)vr), src);
+        }
         break;
     }
     case BIR_SQRT: case BIR_RSQ: case BIR_RCP:
@@ -986,10 +1098,12 @@ static void isel_conversion(uint32_t idx, const bir_inst_t *I, int div)
         break;
     }
     case BIR_FABS: {
+        /* VOP2 VSRC1 is VGPR-only — literal in VSRC1 silently becomes v0.
+           AND is commutative, so put the bitmask in SRC0. */
         S.amd->val_file[idx] = 1;
         S.amd->reg_file[vr] = 1;
         emit2(AMD_V_AND_B32, mop_vreg_v((uint16_t)vr),
-              ensure_vgpr(src), mop_imm(0x7FFFFFFF));
+              mop_imm(0x7FFFFFFF), ensure_vgpr(src));
         break;
     }
     default:
@@ -1043,7 +1157,18 @@ static void isel_load(uint32_t idx, const bir_inst_t *I, int div)
     }
     case BIR_AS_PRIVATE: {
         moperand_t vaddr = ensure_vgpr(resolve_val(I->operands[0], div));
-        emit2(AMD_SCRATCH_LOAD_DWORD, mop_vreg_v((uint16_t)vr), vaddr, mop_imm(0));
+        if (is_cdna()) {
+            /* Fence preceding flat_stores before reading back */
+            emit_wait_vm();
+            /* v250 = FLAT_SCRATCH_LO + alloca_offset (wave scratch base) */
+            emit2(AMD_V_ADD_U32, mop_vgpr(AMD_VGPR_SCR_LO),
+                  mop_sgpr(S.sgpr_priv), vaddr);
+            emit2(AMD_FLAT_LOAD_DWORD, mop_vreg_v((uint16_t)vr),
+                  mop_vgpr(AMD_VGPR_SCR_LO), mop_imm(0));
+        } else {
+            emit2(AMD_SCRATCH_LOAD_DWORD, mop_vreg_v((uint16_t)vr),
+                  vaddr, mop_imm(0));
+        }
         emit_wait_vm();
         break;
     }
@@ -1088,8 +1213,18 @@ static void isel_store(const bir_inst_t *I, int div)
     case BIR_AS_PRIVATE: {
         moperand_t vaddr = ensure_vgpr(resolve_val(I->operands[1], div));
         moperand_t ops[MINST_MAX_OPS];
-        ops[0] = vaddr; ops[1] = ensure_vgpr(val); ops[2] = mop_imm(0);
-        emit_minst(AMD_SCRATCH_STORE_DWORD, 0, 3, ops, 0);
+        if (is_cdna()) {
+            /* v250 = FLAT_SCRATCH_LO + alloca_offset (wave scratch base) */
+            emit2(AMD_V_ADD_U32, mop_vgpr(AMD_VGPR_SCR_LO),
+                  mop_sgpr(S.sgpr_priv), vaddr);
+            ops[0] = mop_vgpr(AMD_VGPR_SCR_LO);
+            ops[1] = ensure_vgpr(val);
+            ops[2] = mop_imm(0);
+            emit_minst(AMD_FLAT_STORE_DWORD, 0, 3, ops, 0);
+        } else {
+            ops[0] = vaddr; ops[1] = ensure_vgpr(val); ops[2] = mop_imm(0);
+            emit_minst(AMD_SCRATCH_STORE_DWORD, 0, 3, ops, 0);
+        }
         break;
     }
     default:
@@ -1162,6 +1297,27 @@ static void isel_gep(uint32_t idx, const bir_inst_t *I, int div)
             acc = mop_vreg_v((uint16_t)tmp);
         }
         emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), acc);
+    } else if (is_cdna()) {
+        /* CDNA GEP: the MI300X s_add_i32 zero-result errata strikes
+         * again.  Two SMEM-sourced operands → s_add returns 0, your
+         * pointer goes to la-la land, and the GPU segfaults with the
+         * serenity of a mainframe ABEND.  Promote to VALU. */
+        S.amd->val_file[idx] = 1;
+        S.amd->reg_file[vr] = 1;
+        acc = ensure_vgpr(base);
+        for (uint32_t k = 1; k < nops; k++) {
+            moperand_t index = ensure_vgpr(resolve_val(get_op(I, k), 0));
+            if (elem_sz != 1) {
+                uint32_t scaled = new_vreg(1);
+                emit2(AMD_V_MUL_LO_U32, mop_vreg_v((uint16_t)scaled),
+                      index, mop_imm((int32_t)elem_sz));
+                index = mop_vreg_v((uint16_t)scaled);
+            }
+            uint32_t tmp = new_vreg(1);
+            emit2(AMD_V_ADD_U32, mop_vreg_v((uint16_t)tmp), acc, index);
+            acc = mop_vreg_v((uint16_t)tmp);
+        }
+        emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), acc);
     } else {
         acc = base;
         for (uint32_t k = 1; k < nops; k++) {
@@ -1222,7 +1378,7 @@ static void isel_global_ref(uint32_t idx, const bir_inst_t *I)
     S.next_param_sgpr = sbase + 2;
 
     emit2(AMD_S_LOAD_DWORDX2, mop_sgpr(sbase),
-          mop_sgpr(AMD_SGPR_KERNARG_LO), mop_imm((int32_t)offst));
+          mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)offst));
     emit_wait_smem();
     S.amd->val_sbase[idx] = sbase;
 
@@ -1265,9 +1421,24 @@ static void isel_br_cond(const bir_inst_t *I, int cond_div)
         /* VOPC: immediate must be SRC0 (VSRC1 is VGPR-only). NE is commutative. */
         emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);
 
-        uint32_t saved = new_vreg(0);
-        emit1(is_cdna() ? AMD_S_AND_SAVEEXEC_B64 : AMD_S_AND_SAVEEXEC_B32,
-              mop_vreg_s((uint16_t)saved), mop_special(AMD_SPEC_VCC));
+        uint32_t saved;
+        if (is_cdna()) {
+            /* Wave64: reuse SGPR pairs by depth — dead after merge */
+            if (S.esave_base == 0xFFFF) {
+                S.esave_base = S.next_param_sgpr;
+                if (S.esave_base & 1) S.esave_base++;
+            }
+            saved = S.esave_base + S.div_depth * 2;
+            if (saved + 1 >= AMD_MAX_SGPRS) saved = AMD_MAX_SGPRS - 2;
+            if (S.div_depth + 1 > S.max_ddep)
+                S.max_ddep = (uint16_t)(S.div_depth + 1);
+            emit1(AMD_S_AND_SAVEEXEC_B64,
+                  mop_sgpr((uint16_t)saved), mop_special(AMD_SPEC_VCC));
+        } else {
+            saved = new_vreg(0);
+            emit1(AMD_S_AND_SAVEEXEC_B32,
+                  mop_vreg_s((uint16_t)saved), mop_special(AMD_SPEC_VCC));
+        }
         emit0_1(AMD_S_CBRANCH_EXECZ, mop_label(false_mb));
         /* Fall through to true block (next in layout) */
 
@@ -1292,6 +1463,13 @@ static void isel_br_cond(const bir_inst_t *I, int cond_div)
     } else {
         /* Uniform branch: compare and branch on SCC */
         moperand_t cond = resolve_val(I->operands[0], 0);
+        /* Guard: cond landed in VGPR — yank to SGPR via readfirstlane.
+         * Branch is uniform so all lanes agree; lane 0 is gospel. */
+        if (cond.kind == MOP_VGPR || cond.kind == MOP_VREG_V) {
+            uint32_t sv = new_vreg(0);
+            emit1(AMD_V_READFIRSTLANE_B32, mop_vreg_s((uint16_t)sv), cond);
+            cond = mop_vreg_s((uint16_t)sv);
+        }
         emit0_2(AMD_S_CMP_NE_U32, cond, mop_imm(0));
         emit0_1(AMD_S_CBRANCH_SCC1, mop_label(true_mb));
         emit0_1(AMD_S_BRANCH, mop_label(false_mb));
@@ -1362,12 +1540,21 @@ static void isel_phi(uint32_t idx, const bir_inst_t *I, int div)
     moperand_t ops[MINST_MAX_OPS];
     ops[0] = mop_vreg((uint16_t)vr, div);
 
-    /* PHI operands are (block, value) pairs. Encode up to 2 pairs inline. */
+    /* PHI operands are (block, value) pairs. Encode up to 2 pairs inline.
+     * Backedge values (from later blocks) may not be mapped yet —
+     * pre-allocate their vregs so the phi copy has something to point at.
+     * Like laying out runway lights before the plane's been built. */
     uint8_t npairs = 0;
     for (uint32_t k = 0; k + 1 < nops && npairs < 2; k += 2, npairs++) {
         uint32_t pred_blk = get_op(I, k);
         uint32_t pred_val = get_op(I, k + 1);
         if (pred_blk >= BIR_MAX_BLOCKS) continue;
+        /* Pre-allocate vreg for backedge values not yet processed */
+        if (!BIR_VAL_IS_CONST(pred_val) && pred_val != BIR_VAL_NONE) {
+            uint32_t pi = BIR_VAL_INDEX(pred_val);
+            if (pi < BIR_MAX_INSTS && S.amd->val_vreg[pi] == 0xFFFFFFFF)
+                map_bir_val(pi, div);
+        }
         ops[1 + npairs * 2] = mop_label(S.block_map[pred_blk]);
         ops[2 + npairs * 2] = resolve_val(pred_val, div);
     }
@@ -1393,7 +1580,7 @@ static void isel_param(uint32_t idx, const bir_inst_t *I)
             S.next_param_sgpr = base_sgpr + 2;
 
             emit2(AMD_S_LOAD_DWORDX2, mop_sgpr(base_sgpr),
-                  mop_sgpr(AMD_SGPR_KERNARG_LO), mop_imm((int32_t)offset));
+                  mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)offset));
             emit_wait_smem();
             S.amd->val_sbase[idx] = base_sgpr;
 
@@ -1405,7 +1592,7 @@ static void isel_param(uint32_t idx, const bir_inst_t *I)
         } else {
             uint32_t vr = map_bir_val(idx, 0);
             emit2(AMD_S_LOAD_DWORD, mop_vreg_s((uint16_t)vr),
-                  mop_sgpr(AMD_SGPR_KERNARG_LO), mop_imm((int32_t)offset));
+                  mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)offset));
             emit_wait_smem();
         }
     } else {
@@ -1413,7 +1600,7 @@ static void isel_param(uint32_t idx, const bir_inst_t *I)
         uint32_t vr = map_bir_val(idx, 1);
         S.amd->val_file[idx] = 1;
         S.amd->reg_file[vr] = 1;
-        if (param_idx < 16)
+        if (param_idx < 32)
             emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_vgpr((uint16_t)param_idx));
     }
 }
@@ -1434,33 +1621,36 @@ static void isel_thread_model(uint32_t idx, const bir_inst_t *I)
         break;
     }
     case BIR_BLOCK_ID: {
-        /* s4/s5/s6: pre-loaded workgroup IDs */
+        /* Pre-loaded workgroup IDs at sgpr_wg_base + dim */
         uint32_t vr = map_bir_val(idx, 0);
         emit1(AMD_S_MOV_B32, mop_vreg_s((uint16_t)vr),
-              mop_sgpr((uint16_t)(AMD_SGPR_WORKGROUP_X + dim)));
+              mop_sgpr((uint16_t)(S.sgpr_wg_base + dim)));
         break;
     }
     case BIR_BLOCK_DIM: {
-        /* Load from dispatch packet: s_load_dword from s[0:1] + offset */
-        /* Packet offsets: blockDim.x = 4, .y = 6, .z = 8 (16-bit fields) */
-        /* Actually workgroup_size fields in hsa_kernel_dispatch_packet_t:
-           offset 4 = workgroup_size_x (uint16), 6 = y, 8 = z */
+        /* Hidden kernarg: group_size_x/y/z are uint16 at hk_base+12/14/16.
+         * Load 32 bits containing the pair, mask to 16. */
         uint32_t vr = map_bir_val(idx, 0);
-        uint32_t offset = 4 + dim * 2;
+        uint32_t hk_base = S.num_params * 8;  /* hidden args start here */
+        uint32_t off = hk_base + 12 + (dim & ~1u) * 2;
         emit2(AMD_S_LOAD_DWORD, mop_vreg_s((uint16_t)vr),
-              mop_sgpr(AMD_SGPR_DISPATCH_LO), mop_imm((int32_t)offset));
+              mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)off));
         emit_wait_smem();
-        /* Mask to 16 bits */
-        emit2(AMD_S_AND_B32, mop_vreg_s((uint16_t)vr),
-              mop_vreg_s((uint16_t)vr), mop_imm(0xFFFF));
+        if (dim & 1) /* odd dim: shift right 16 */
+            emit2(AMD_S_LSHR_B32, mop_vreg_s((uint16_t)vr),
+                  mop_vreg_s((uint16_t)vr), mop_imm(16));
+        else
+            emit2(AMD_S_AND_B32, mop_vreg_s((uint16_t)vr),
+                  mop_vreg_s((uint16_t)vr), mop_imm(0xFFFF));
         break;
     }
     case BIR_GRID_DIM: {
-        /* grid_size / block_dim. Load grid_size from dispatch packet offset 12/16/20 */
+        /* Hidden kernarg: block_count_x/y/z are uint32 at hk_base+0/4/8.
+         * This IS gridDim (num workgroups), not grid_size. */
         uint32_t vr = map_bir_val(idx, 0);
-        uint32_t gs_off = 12 + dim * 4; /* grid_size_x=12, y=16, z=20 */
+        uint32_t hk_base = S.num_params * 8;
         emit2(AMD_S_LOAD_DWORD, mop_vreg_s((uint16_t)vr),
-              mop_sgpr(AMD_SGPR_DISPATCH_LO), mop_imm((int32_t)gs_off));
+              mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)(hk_base + dim * 4)));
         emit_wait_smem();
         break;
     }
@@ -1560,10 +1750,31 @@ static void isel_warp(uint32_t idx, const bir_inst_t *I)
 
     switch (I->op) {
     case BIR_SHFL: case BIR_SHFL_UP: case BIR_SHFL_DOWN: case BIR_SHFL_XOR: {
-        /* ds_bpermute_b32: cross-lane via LDS permute */
-        moperand_t val = ensure_vgpr(resolve_val(I->operands[0], 1));
-        moperand_t lane = ensure_vgpr(resolve_val(I->operands[1], 1));
-        /* Multiply lane by 4 for byte address */
+        /* ds_bpermute_b32: the cross-lane shuffle.  AMD doesn't have
+         * NVIDIA's nice warp-shuffle instructions, so we fake it via
+         * LDS permute — like passing notes in class, but through the
+         * shared memory subsystem.
+         *
+         * BIR ops: [0]=mask(ignored on AMD — all lanes or nothing),
+         *          [1]=val, [2]=delta, [3]=width(ignored).
+         * Lane computation per variant:
+         *   SHFL      → lane = delta  (direct index)
+         *   SHFL_DOWN → lane = tid + delta  (look ahead)
+         *   SHFL_UP   → lane = tid - delta  (look behind)
+         *   SHFL_XOR  → lane = tid ^ delta  (butterfly) */
+        moperand_t val   = ensure_vgpr(resolve_val(I->operands[1], 1));
+        moperand_t delta = ensure_vgpr(resolve_val(I->operands[2], 1));
+        moperand_t tid   = mop_vreg_v((uint16_t)S.saved_tid[0]);
+        uint32_t lane_v  = new_vreg(1);
+        moperand_t lane  = mop_vreg_v((uint16_t)lane_v);
+        switch (I->op) {
+        case BIR_SHFL:      emit1(AMD_V_MOV_B32, lane, delta); break;
+        case BIR_SHFL_DOWN: emit2(AMD_V_ADD_U32, lane, tid, delta); break;
+        case BIR_SHFL_UP:   emit2(AMD_V_SUB_U32, lane, tid, delta); break;
+        case BIR_SHFL_XOR:  emit2(AMD_V_XOR_B32, lane, tid, delta); break;
+        default: break;
+        }
+        /* Byte address = lane * 4 */
         uint32_t addr_v = new_vreg(1);
         emit2(AMD_V_LSHLREV_B32, mop_vreg_v((uint16_t)addr_v), mop_imm(2), lane);
         emit2(AMD_DS_BPERMUTE_B32, mop_vreg_v((uint16_t)vr),
@@ -1617,6 +1828,78 @@ static void isel_warp(uint32_t idx, const bir_inst_t *I)
     }
 }
 
+/* ---- MFMA variant IDs (packed into BIR_MFMA subop) ---- */
+#define MFMA_F16_4x4x4       0
+#define MFMA_F16_16x16x16    1
+#define MFMA_F16_32x32x8     2
+#define MFMA_BF16_4x4x4      3
+#define MFMA_BF16_16x16x16   4
+#define MFMA_BF16_32x32x8    5
+#define MFMA_F32_4x4x1       6
+#define MFMA_F32_16x16x4     7
+#define MFMA_F32_32x32x2     8
+#define MFMA_I8_4x4x4        9
+#define MFMA_I8_16x16x16    10
+#define MFMA_I8_32x32x8     11
+/* FP8/BF8 mixed-precision (gfx942) */
+#define MFMA_FP8_FP8_16x16  12
+#define MFMA_FP8_BF8_16x16  13
+#define MFMA_BF8_FP8_16x16  14
+#define MFMA_BF8_BF8_16x16  15
+#define MFMA_FP8_FP8_32x32  16
+#define MFMA_FP8_BF8_32x32  17
+#define MFMA_BF8_FP8_32x32  18
+#define MFMA_BF8_BF8_32x32  19
+/* F64 matrix (gfx942) */
+#define MFMA_F64_4x4x4      20
+#define MFMA_F64_16x16x4    21
+
+static void isel_mfma(uint32_t idx, const bir_inst_t *I)
+{
+    /* Map subop → AMD machine opcode. The hardware does the hard
+       part; we just shuffle operands like a very expensive postman. */
+    static const uint16_t mfma_ops[] = {
+        [MFMA_F16_4x4x4]     = AMD_V_MFMA_F32_4X4X4_F16,
+        [MFMA_F16_16x16x16]  = AMD_V_MFMA_F32_16X16X16_F16,
+        [MFMA_F16_32x32x8]   = AMD_V_MFMA_F32_32X32X8_F16,
+        [MFMA_BF16_4x4x4]    = AMD_V_MFMA_F32_4X4X4_BF16_1K,
+        [MFMA_BF16_16x16x16] = AMD_V_MFMA_F32_16X16X16_BF16_1K,
+        [MFMA_BF16_32x32x8]  = AMD_V_MFMA_F32_32X32X8_BF16_1K,
+        [MFMA_F32_4x4x1]     = AMD_V_MFMA_F32_4X4X1_F32,
+        [MFMA_F32_16x16x4]   = AMD_V_MFMA_F32_16X16X4_F32,
+        [MFMA_F32_32x32x2]   = AMD_V_MFMA_F32_32X32X2_F32,
+        [MFMA_I8_4x4x4]      = AMD_V_MFMA_I32_4X4X4_I8,
+        [MFMA_I8_16x16x16]   = AMD_V_MFMA_I32_16X16X16_I8,
+        [MFMA_I8_32x32x8]    = AMD_V_MFMA_I32_32X32X8_I8,
+        [MFMA_FP8_FP8_16x16] = AMD_V_MFMA_F32_16X16X32_FP8_FP8,
+        [MFMA_FP8_BF8_16x16] = AMD_V_MFMA_F32_16X16X32_FP8_BF8,
+        [MFMA_BF8_FP8_16x16] = AMD_V_MFMA_F32_16X16X32_BF8_FP8,
+        [MFMA_BF8_BF8_16x16] = AMD_V_MFMA_F32_16X16X32_BF8_BF8,
+        [MFMA_FP8_FP8_32x32] = AMD_V_MFMA_F32_32X32X16_FP8_FP8,
+        [MFMA_FP8_BF8_32x32] = AMD_V_MFMA_F32_32X32X16_FP8_BF8,
+        [MFMA_BF8_FP8_32x32] = AMD_V_MFMA_F32_32X32X16_BF8_FP8,
+        [MFMA_BF8_BF8_32x32] = AMD_V_MFMA_F32_32X32X16_BF8_BF8,
+        [MFMA_F64_4x4x4]     = AMD_V_MFMA_F64_4X4X4_F64,
+        [MFMA_F64_16x16x4]   = AMD_V_MFMA_F64_16X16X4_F64,
+    };
+
+    uint8_t var = I->subop;
+    if (var > MFMA_F64_16x16x4) return;
+    uint16_t mop = mfma_ops[var];
+
+    /* MFMA: ops[0]=A, ops[1]=B, ops[2]=C(accum). All VGPR on gfx942. */
+    moperand_t a = ensure_vgpr(resolve_val(I->operands[0], 1));
+    moperand_t b = ensure_vgpr(resolve_val(I->operands[1], 1));
+    moperand_t c = ensure_vgpr(resolve_val(I->operands[2], 1));
+    uint32_t vr = map_bir_val(idx, 1);
+
+    /* Wait for any pending VMEM before the matrix op — the hardware
+       won't schedule around these for you */
+    emit_wait_vm();
+
+    emit3(mop, mop_vreg_v((uint16_t)vr), a, b, c);
+}
+
 static void isel_select(uint32_t idx, const bir_inst_t *I, int div)
 {
     /* ops[0] = cond, ops[1] = true, ops[2] = false */
@@ -1631,6 +1914,16 @@ static void isel_select(uint32_t idx, const bir_inst_t *I, int div)
         emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);
         emit3(AMD_V_CNDMASK_B32, mop_vreg_v((uint16_t)vr),
               ensure_vgpr(vfalse), ensure_vgpr(vtrue), mop_special(AMD_SPEC_VCC));
+    } else if (cond.kind == MOP_VGPR || cond.kind == MOP_VREG_V ||
+               vtrue.kind == MOP_VGPR || vtrue.kind == MOP_VREG_V ||
+               vfalse.kind == MOP_VGPR || vfalse.kind == MOP_VREG_V) {
+        /* Operand landed in VGPR — promote to divergent select */
+        S.amd->val_file[idx] = 1;
+        S.amd->reg_file[vr] = 1;
+        moperand_t vcond = ensure_vgpr(cond);
+        emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);
+        emit3(AMD_V_CNDMASK_B32, mop_vreg_v((uint16_t)vr),
+              ensure_vgpr(vfalse), ensure_vgpr(vtrue), mop_special(AMD_SPEC_VCC));
     } else {
         /* s_cmp_ne cond, 0; s_cselect_b32 dst, true, false */
         emit0_2(AMD_S_CMP_NE_U32, cond, mop_imm(0));
@@ -1640,26 +1933,57 @@ static void isel_select(uint32_t idx, const bir_inst_t *I, int div)
 
 static void isel_call(uint32_t idx, const bir_inst_t *I, int div)
 {
-    /* ops[0] = callee func index, rest = args */
-    uint32_t nops = get_num_ops(I);
+    /* s_swappc_b64 needs a PC-relative offset, but we only have
+     * a raw BIR function index — like being handed a phone number
+     * with no country code.  Device function linking is a future
+     * adventure; for now, die with dignity. */
+    fprintf(stderr, "barracuda: device function calls not yet supported "
+            "(BIR_CALL func=%u)\n", get_op(I, 0));
+    (void)idx; (void)div;
+}
 
-    /* Pass args in v0, v1, ... */
-    for (uint32_t k = 1; k < nops && k <= 16; k++) {
-        moperand_t arg = resolve_val(get_op(I, k), 1);
-        emit1(AMD_V_MOV_B32, mop_vgpr((uint16_t)(k - 1)), ensure_vgpr(arg));
+/* ---- Pre-scan: determine kernel's SGPR layout needs ---- */
+
+static void scan_kernel_needs(const bir_func_t *F)
+{
+    const bir_module_t *M = S.bir;
+    S.needs_dispatch = 0;
+    S.has_scratch = 0;
+    S.max_dim = 0;
+
+    for (uint32_t bi = 0; bi < F->num_blocks && bi < BIR_MAX_BLOCKS; bi++) {
+        const bir_block_t *B = &M->blocks[F->first_block + bi];
+        for (uint32_t ii = 0; ii < B->num_insts; ii++) {
+            const bir_inst_t *I = &M->insts[B->first_inst + ii];
+            switch (I->op) {
+            case BIR_BLOCK_DIM:
+            case BIR_GRID_DIM:
+                S.needs_dispatch = 1;
+                if (I->subop > S.max_dim) S.max_dim = (uint8_t)I->subop;
+                break;
+            case BIR_THREAD_ID:
+            case BIR_BLOCK_ID:
+                if (I->subop > S.max_dim) S.max_dim = (uint8_t)I->subop;
+                break;
+            case BIR_ALLOCA:
+                S.has_scratch = 1;
+                break;
+            default:
+                break;
+            }
+        }
     }
+    if (S.max_dim > 2) S.max_dim = 2; /* clamp */
 
-    /* s_swappc_b64 s[30:31], target */
-    /* For now, emit as a pseudo-call with the function index */
-    uint32_t func_ref = get_op(I, 0);
-    emit0_1(AMD_S_SWAPPC_B64, mop_imm((int32_t)func_ref));
-
-    /* Result in v0 */
-    if (I->type < S.bir->num_types && S.bir->types[I->type].kind != BIR_TYPE_VOID) {
-        uint32_t vr = map_bir_val(idx, 1);
-        emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_vgpr(0));
-    }
-    (void)div;
+    /* SGPR layout — always: s[0:1]=kernarg, s2+=TGID.
+     * No dispatch_ptr; blockDim/gridDim read from hidden kernarg
+     * (same approach as hipcc — dispatch_ptr + multi-arg is cursed). */
+    S.sgpr_dispatch = 0xFFFF;
+    S.sgpr_kernarg  = 0;     /* s[0:1] = kernarg ptr */
+    S.sgpr_wg_base  = 2;     /* s2+ = workgroup IDs */
+    S.kern_reserved = 2 + 1 + S.max_dim; /* after last TGID */
+    /* Align reserved to even for SGPR pair loads */
+    if (S.kern_reserved & 1) S.kern_reserved++;
 }
 
 /* ---- Main Instruction Selection Loop ---- */
@@ -1682,9 +2006,30 @@ static void isel_function(uint32_t fi)
     S.suppress_src = 0xFFFFFFFF;
     S.suppress_dst = 0xFFFFFFFF;
     S.current_bir_block = 0;
+
+    /* Scan BIR to determine hidden kernarg needs */
+    if (S.is_kernel)
+        scan_kernel_needs(F);
+    else {
+        S.needs_dispatch = 0;
+        S.max_dim = 0;
+        S.sgpr_kernarg = 0;
+        S.sgpr_dispatch = 0xFFFF;
+        S.sgpr_wg_base = 2;
+        S.kern_reserved = 2;
+    }
+
+    /* Reserve hidden kernarg space for block_count/group_size if needed.
+     * Layout: [block_count_x/y/z (3×4B)] [group_size_x/y/z (3×2B)]
+     *       = 18 bytes, rounded to 24 for alignment. */
+    if (S.is_kernel && S.needs_dispatch)
+        S.hkrarg = (uint32_t)(F->num_params * 8) + 24u;
+
     /* Pointer params get physical SGPR pairs starting after reserved regs */
-    S.next_param_sgpr = AMD_KERN_RESERVED_SGPR;
+    S.next_param_sgpr = S.kern_reserved;
     if (S.next_param_sgpr & 1) S.next_param_sgpr++; /* align to even */
+    S.esave_base = 0xFFFF;
+    S.max_ddep = 0;
 
     /* Skip host-only functions */
     if (!(F->cuda_flags & (CUDA_GLOBAL | CUDA_DEVICE))) return;
@@ -1705,6 +2050,8 @@ static void isel_function(uint32_t fi)
     MF->kernarg_bytes = F->num_params * 8;
     MF->launch_bounds_max = F->launch_bounds_max;
     MF->launch_bounds_min = F->launch_bounds_min;
+    MF->needs_dispatch = S.needs_dispatch;
+    MF->max_dim = S.max_dim;
 
     /* Pre-create machine blocks and build block map */
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
@@ -1735,9 +2082,10 @@ static void isel_function(uint32_t fi)
             if (S.div_stack[di].has_else && S.div_stack[di].false_bir == bir_bi) {
                 /* Else block: xor EXEC to get false lanes */
                 uint16_t sv = (uint16_t)S.div_stack[di].saved_vreg;
+                moperand_t sv_op = is_cdna() ? mop_sgpr(sv) : mop_vreg_s(sv);
                 emit2(is_cdna() ? AMD_S_XOR_B64 : AMD_S_XOR_B32,
                       mop_special(AMD_SPEC_EXEC),
-                      mop_special(AMD_SPEC_EXEC), mop_vreg_s(sv));
+                      mop_special(AMD_SPEC_EXEC), sv_op);
                 /* If all false lanes are off, skip else body */
                 uint32_t merge_mb = S.block_map[S.div_stack[di].merge_bir];
                 emit0_1(AMD_S_CBRANCH_EXECZ, mop_label(merge_mb));
@@ -1747,21 +2095,38 @@ static void isel_function(uint32_t fi)
             if (S.div_stack[di - 1].merge_bir == bir_bi) {
                 /* Merge block: restore all lanes */
                 uint16_t sv = (uint16_t)S.div_stack[di - 1].saved_vreg;
+                moperand_t sv_op = is_cdna() ? mop_sgpr(sv) : mop_vreg_s(sv);
                 emit2(is_cdna() ? AMD_S_OR_B64 : AMD_S_OR_B32,
                       mop_special(AMD_SPEC_EXEC),
-                      mop_special(AMD_SPEC_EXEC), mop_vreg_s(sv));
+                      mop_special(AMD_SPEC_EXEC), sv_op);
                 /* Pop the region */
                 S.div_depth--;
             }
         }
 
         /* Save hardware thread IDs before params can clobber v0/v1/v2.
-           First block of kernel only — like saving the black box before takeoff. */
+           First block of kernel only — like saving the black box before takeoff.
+           Only save dims the kernel actually uses (max_dim). */
         if (bi == 0 && S.is_kernel) {
-            for (uint32_t d = 0; d < 3; d++) {
+            for (uint32_t d = 0; d <= (uint32_t)S.max_dim && d < 3; d++) {
                 S.saved_tid[d] = new_vreg(1);
                 emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)S.saved_tid[d]),
                       mop_vgpr((uint16_t)d));
+            }
+            /* CDNA flat scratch: read src_private_base hi word into v251.
+               scratch_store doesn't work on GFX942 — HIP uses flat_store
+               with the private aperture tag instead. Cheers, AMD. */
+            if (is_cdna() && S.has_scratch) {
+                uint16_t sp = S.next_param_sgpr;
+                if (sp & 1) sp++;
+                S.sgpr_priv = sp;
+                S.next_param_sgpr = sp + 2;
+                /* s_mov_b64 s[sp:sp+1], src_private_base */
+                emit1(AMD_S_MOV_B64, mop_sgpr(sp),
+                      mop_special(AMD_SPEC_PRIV_BASE));
+                /* v_mov_b32 v251, s[sp+1]  (aperture tag) */
+                emit1(AMD_V_MOV_B32, mop_vgpr(AMD_VGPR_SCR_HI),
+                      mop_sgpr((uint16_t)(sp + 1)));
             }
         }
 
@@ -1886,6 +2251,11 @@ static void isel_function(uint32_t fi)
                 isel_warp(idx, I);
                 break;
 
+            /* Matrix */
+            case BIR_MFMA:
+                isel_mfma(idx, I);
+                break;
+
             /* Misc */
             case BIR_SELECT:
                 isel_select(idx, I, div);
@@ -1912,6 +2282,11 @@ static void isel_function(uint32_t fi)
     MF->kernarg_bytes = S.hkrarg;
     MF->lds_bytes = (uint16_t)S.lds_offset;
     MF->first_alloc_sgpr = S.next_param_sgpr;
+    if (is_cdna() && S.esave_base != 0xFFFF) {
+        uint16_t etop = (uint16_t)(S.esave_base + S.max_ddep * 2);
+        if (etop > MF->first_alloc_sgpr)
+            MF->first_alloc_sgpr = etop;
+    }
 }
 
 /* ---- Public API ---- */

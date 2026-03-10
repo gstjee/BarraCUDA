@@ -83,12 +83,7 @@ typedef struct {
     uint16_t    cuda_flags;  /* __device__, __global__, __shared__ etc. */
 } sema_sym_t;
 
-/* ---- Error ---- */
-
-typedef struct {
-    uint32_t    line, col;
-    char        msg[256];
-} sema_error_t;
+/* ---- Error (unified bc_error_t from barracuda.h) ---- */
 
 /* ---- Function param pool ---- */
 
@@ -125,7 +120,7 @@ typedef struct {
     uint32_t        cur_ret_type;
 
     /* Errors */
-    sema_error_t    errors[SEMA_MAX_ERRORS];
+    bc_error_t      errors[SEMA_MAX_ERRORS];
     int             num_errors;
 } sema_ctx_t;
 

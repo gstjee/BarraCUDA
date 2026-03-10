@@ -1,6 +1,7 @@
 #include "parser.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 /* Every node gets a name. Even the ones that probably shouldn't exist. */
 
@@ -102,7 +103,7 @@ static void advance(parser_t *P)
     if (P->pos < P->num_tokens) P->pos++;
 }
 
-static void parse_error(parser_t *P, const char *msg)
+static void parse_error(parser_t *P, bc_eid_t eid, ...)
 {
     if (P->num_errors < BC_MAX_ERRORS) {
         bc_error_t *e = &P->errors[P->num_errors++];
@@ -111,7 +112,11 @@ static void parse_error(parser_t *P, const char *msg)
         e->loc.col = t->col;
         e->loc.offset = t->offset;
         e->code = BC_ERR_PARSE;
-        snprintf(e->msg, sizeof(e->msg), "%s", msg);
+        e->eid  = (uint16_t)eid;
+        va_list ap;
+        va_start(ap, eid);
+        vsnprintf(e->msg, sizeof(e->msg), bc_efmt(eid), ap);
+        va_end(ap);
     }
 }
 
@@ -124,17 +129,15 @@ static int match(parser_t *P, int type)
 static int expect(parser_t *P, int type)
 {
     if (cur_type(P) == type) { advance(P); return 1; }
-    char msg[128];
-    snprintf(msg, sizeof(msg), "expected '%s', got '%s'",
-             token_type_name(type), token_type_name(cur_type(P)));
-    parse_error(P, msg);
+    parse_error(P, BC_E020,
+                token_type_name(type), token_type_name(cur_type(P)));
     return 0;
 }
 
 static uint32_t alloc_node(parser_t *P, int type)
 {
     if (P->num_nodes >= P->max_nodes) {
-        parse_error(P, "AST node limit exceeded");
+        parse_error(P, BC_E021);
         return 0;
     }
     uint32_t idx = P->num_nodes++;
@@ -542,7 +545,7 @@ static uint32_t parse_primary(parser_t *P)
         return n;
     }
 
-    parse_error(P, "expected expression");
+    parse_error(P, BC_E022);
     advance(P);
     return 0;
 }
@@ -937,7 +940,7 @@ static uint32_t parse_declaration(parser_t *P)
                 uint32_t inner = parse_decl_or_stmt(P);
                 if (inner) add_child(P, ns, inner);
                 else if (P->pos == old_pos) {
-                    parse_error(P, "unexpected token in namespace");
+                    parse_error(P, BC_E023);
                     sync_past_semi(P);
                 }
             }
@@ -972,7 +975,7 @@ static uint32_t parse_declaration(parser_t *P)
 
     uint32_t type_node = parse_type_spec(P, &quals, &cuda);
     if (!type_node) {
-        parse_error(P, "expected declaration");
+        parse_error(P, BC_E024);
         advance(P);
         return 0;
     }
@@ -1155,7 +1158,7 @@ static uint32_t parse_declaration(parser_t *P)
                     uint32_t s = parse_decl_or_stmt(P);
                     if (s) add_child(P, body, s);
                     else if (P->pos == old_pos) {
-                        parse_error(P, "unexpected token in function body");
+                        parse_error(P, BC_E025);
                         sync_past_semi(P);
                     }
                 }
@@ -1241,7 +1244,7 @@ static uint32_t parse_block(parser_t *P)
         if (s) add_child(P, block, s);
         else if (P->pos == old_pos) {
             /* Stuck in a block. Skip to the next thing that looks intentional. */
-            parse_error(P, "unexpected token in block");
+            parse_error(P, BC_E026);
             sync_past_semi(P);
         }
     }
@@ -1435,7 +1438,7 @@ uint32_t parser_parse(parser_t *P)
         else if (P->pos == old_pos) {
             /* No progress — the parser is going in circles.
                Politely suggest we move on. */
-            parse_error(P, "unexpected token at top level");
+            parse_error(P, BC_E027);
             sync_to_next_decl(P);
         }
     }

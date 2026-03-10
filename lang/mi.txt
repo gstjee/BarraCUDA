@@ -1,0 +1,76 @@
+# lang/mi.txt - Te Reo Maori
+# Ko te reo Maori tenei — na te kaihanga rorohiko o Aotearoa
+
+# ---- Internal ----
+E000=he hapa o roto i te kaihanga
+
+# ---- Lexer ----
+E001=kua ki te rohe tohu
+E002=he korero poraka kaore i oti
+E003=he rarangi hou kei roto i te aho kupu
+E004=he aho kupu kaore i oti
+E005=he tohu ohorere
+
+# ---- Parser ----
+E020=e hiahiatia ana '%s', engari i kitea '%s'
+E021=kua taea te nui o nga pona AST
+E022=e hiahiatia ana he whakahua
+E023=he tohu ohorere kei roto i te waahi ingoa
+E024=e hiahiatia ana he whakapuakanga
+E025=he tohu ohorere kei roto i te tinana mahinga
+E026=he tohu ohorere kei roto i te poraka
+E027=he tohu ohorere kei runga rawa
+
+# ---- Preprocessor ----
+E040=kua ki te puna kupu macro
+E041=he nui rawa nga macro (nui rawa %d)
+E042=#if he hohonu rawa (nui rawa %d)
+E043=#else kaore he #if hei whakaurunga
+E044=#elif kaore he #if hei whakaurunga
+E045=#endif kaore he #if hei whakaurunga
+E046=#define: e hiahiatia ana he ingoa macro
+E047=#error %s
+E048=#include: e hiahiatia ana "konae" he <konae> ranei
+E049=#include: he hohonu rawa (nui rawa %d)
+E050=#include: kaore e taea te panui '%s'
+E051=he tohutohu kore mohio: #%s
+E052=#if/#ifdef kaore i oti (e ngaro ana %d #endif)
+
+# ---- Sema ----
+E070=he pere kei runga i te mea ehara i te tohu atu
+E071=kaore he mara '%s' kei roto i te hanganga '%s'
+E072=he mara vector kore tika '%s'
+E073=e hiahia ana '%s' ki %d taupa, engari i kitea %d
+E074=e hiahia ana '%s' ki 1 taupa, engari i kitea %d
+E075=e hiahia ana '%s' ki 3 taupa, engari i kitea %d
+E076=me he momo taurangi te ahuatanga
+E077=me he momo taurangi te ahuatanga for
+E078=me he momo taurangi te ahuatanga while
+E079=me he momo taurangi te ahuatanga do-while
+E080=me he momo tau te whakahua switch
+E081=me whakahoki kore te mahinga __global__
+
+# ---- Lowering ----
+E100=he nui rawa nga tapanga (nui rawa 256)
+E101=he taurangi kaore i whakapuakitia
+E102=he mahi rua kaore e tautokona
+E103=he mua kaore e tautokona
+E104=he muri kaore e tautokona
+E105=he mahinga kore mohio i te karanga
+E106=he pona whakahua kaore e tautokona
+E107=he uara-taha kaore i tautuhia
+E108=kaore e taea te toro atu ki te taupa
+E109=ehara i te uara-taha (mua)
+E110=he mara kore mohio kei roto i te uara-taha
+E111=ehara i te uara-taha
+
+# ---- ABEND (hex IDs) ----
+A0C1=he tohutohu GPU kore ture
+A0C4=he takahi whakamaru mahara (wharangi kore mahere)
+A0C5=he rerekeetanga waahitau (waahitau kore mahere)
+A0C7=he rerekeetanga raraunga (tiiaroaro, taatai raanei)
+A0CB=he hapa puuhanga GPU (tirotiro mihini)
+A001=i rahua te tuku kaupapa
+A002=kua pau te waa o te kaupapa
+A003=kua pau te mahara GPU
+A0FF=he hapa GPU kaore i moohiotia

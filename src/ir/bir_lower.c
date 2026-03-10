@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 /*
  * AST-to-BIR lowering.
@@ -142,7 +143,7 @@ static int text_eq(const lower_t *L, uint32_t node, const char *s)
         && memcmp(L->src + n->d.text.offset, s, (size_t)len) == 0;
 }
 
-static void lower_error(lower_t *L, uint32_t node, const char *msg)
+static void lower_error(lower_t *L, uint32_t node, bc_eid_t eid, ...)
 {
     if (L->nerrors < BC_MAX_ERRORS) {
         bc_error_t *e = &L->errors[L->nerrors++];
@@ -151,8 +152,13 @@ static void lower_error(lower_t *L, uint32_t node, const char *msg)
             e->loc.line = n->line;
             e->loc.col  = n->col;
         }
+        e->loc.offset = 0;
         e->code = BC_ERR_LOWER;
-        snprintf(e->msg, sizeof(e->msg), "%s", msg);
+        e->eid  = (uint16_t)eid;
+        va_list ap;
+        va_start(ap, eid);
+        vsnprintf(e->msg, sizeof(e->msg), bc_efmt(eid), ap);
+        va_end(ap);
     }
 }
 
@@ -345,7 +351,7 @@ static uint32_t find_or_create_label(lower_t *L, const char *name)
         if (strcmp(L->labels[i].name, name) == 0)
             return L->labels[i].block;
     if (L->nlabels >= 256) {
-        lower_error(L, 0, "too many labels (max 256)");
+        lower_error(L, 0, BC_E100);
         return L->cur_block;
     }
     int idx = L->nlabels++;
@@ -399,7 +405,8 @@ static uint32_t resolve_type(lower_t *L, uint32_t node, int ptr_depth,
             base = bound;
         else if (strcmp(name, "size_t") == 0)
             base = bir_type_int(L->M, 64);
-        else if (strcmp(name, "__half") == 0 || strcmp(name, "half") == 0)
+        else if (strcmp(name, "__half") == 0 || strcmp(name, "half") == 0
+                 || strcmp(name, "_Float16") == 0)
             base = bir_type_float(L->M, 16);
         else if (strcmp(name, "__nv_bfloat16") == 0
                  || strcmp(name, "nv_bfloat16") == 0
@@ -760,10 +767,15 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             }
         }
         if (!s) {
-            lower_error(L, node, "undefined variable");
+            lower_error(L, node, BC_E101);
             return BIR_VAL_NONE;
         }
         if (s->is_alloca) {
+            /* Arrays decay to pointer — return alloca addr directly.
+             * Loading from an array alloca reads uninit scratch. */
+            if (s->type < L->M->num_types &&
+                L->M->types[s->type].kind == BIR_TYPE_ARRAY)
+                return BIR_MAKE_VAL(s->ref);
             uint32_t inst = emit(L, BIR_LOAD, s->type, 1, 0);
             set_op(L, inst, 0, BIR_MAKE_VAL(s->ref));
             return BIR_MAKE_VAL(inst);
@@ -800,18 +812,25 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
         uint32_t et     = ptr_inner(L, bt);
         if (!et) et = bir_type_int(L->M, 32);
 
-        uint32_t gep = emit(L, BIR_GEP, bt, 2, 0);
+        /* Array decay: ptr(T[N]) → ptr(T) so GEP strides by element */
+        uint32_t gep_t = bt;
+        if (et < L->M->num_types &&
+            L->M->types[et].kind == BIR_TYPE_ARRAY) {
+            uint32_t arr_el = L->M->types[et].inner;
+            uint8_t as = is_ptr_type(L, bt) ? L->M->types[bt].addrspace : 0;
+            gep_t = bir_type_ptr(L->M, arr_el, as);
+            et = arr_el;
+        }
+
+        uint32_t gep = emit(L, BIR_GEP, gep_t, 2, 0);
         set_op(L, gep, 0, base_v);
         set_op(L, gep, 1, idx_v);
 
-        /* a[i] on array-of-array: yield pointer, don't load */
+        /* Multi-dim array or struct: yield pointer, don't load */
         if (et < L->M->num_types &&
-            L->M->types[et].kind == BIR_TYPE_ARRAY) {
-            uint32_t ipt = bir_type_ptr(L->M, et,
-                is_ptr_type(L, bt) ? L->M->types[bt].addrspace : 0);
-            L->M->insts[gep].type = ipt;
+            (L->M->types[et].kind == BIR_TYPE_ARRAY ||
+             L->M->types[et].kind == BIR_TYPE_STRUCT))
             return BIR_MAKE_VAL(gep);
-        }
 
         uint32_t ld = emit(L, BIR_LOAD, et, 1, 0);
         set_op(L, ld, 0, BIR_MAKE_VAL(gep));
@@ -857,6 +876,56 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             }
 
             uint32_t val = lower_expr(L, rhs_n);
+
+            /* Struct copy: p = arr[i] where RHS is a pointer to a
+             * struct in foreign memory (global/shared). The subscript
+             * lowering yielded a GEP, not a loaded value — sensible
+             * for member access, catastrophic for whole-struct copy.
+             * Without this the alloca gets a raw pointer dumped into
+             * its first 8 bytes and the remaining fields read back
+             * as whatever the silicon was dreaming about. */
+            uint32_t vt = ref_type(L, val);
+            uint32_t dt = ptr_inner(L, ref_type(L, ptr));
+            if (is_ptr_type(L, vt) && dt &&
+                dt < L->M->num_types &&
+                L->M->types[dt].kind == BIR_TYPE_STRUCT) {
+                struct_def_t *sd = NULL;
+                for (int si = 0; si < L->nstructs; si++) {
+                    if (L->structs[si].bir_type == dt) {
+                        sd = &L->structs[si]; break;
+                    }
+                }
+                if (sd) {
+                    uint8_t src_as = L->M->types[vt].addrspace;
+                    uint8_t dst_as = L->M->types[ref_type(L, ptr)].addrspace;
+                    uint32_t t32 = bir_type_int(L->M, 32);
+                    for (int fi = 0; fi < sd->num_fields && fi < 16; fi++) {
+                        uint32_t ci = BIR_MAKE_CONST(
+                            bir_const_int(L->M, t32, fi));
+                        uint32_t spt = bir_type_ptr(L->M,
+                            sd->field_types[fi], src_as);
+                        uint32_t sg = emit(L, BIR_GEP, spt, 2, 0);
+                        set_op(L, sg, 0, val);
+                        set_op(L, sg, 1, ci);
+                        uint32_t ld = emit(L, BIR_LOAD,
+                            sd->field_types[fi], 1, 0);
+                        set_op(L, ld, 0, BIR_MAKE_VAL(sg));
+                        uint32_t dpt = bir_type_ptr(L->M,
+                            sd->field_types[fi], dst_as);
+                        uint32_t dg = emit(L, BIR_GEP, dpt, 2, 0);
+                        set_op(L, dg, 0, ptr);
+                        set_op(L, dg, 1, ci);
+                        uint32_t s = emit(L, BIR_STORE,
+                            bir_type_void(L->M), 2, 0);
+                        set_op(L, s, 0, BIR_MAKE_VAL(ld));
+                        set_op(L, s, 1, BIR_MAKE_VAL(dg));
+                    }
+                    uint32_t ld = emit(L, BIR_LOAD, dt, 1, 0);
+                    set_op(L, ld, 0, ptr);
+                    return BIR_MAKE_VAL(ld);
+                }
+            }
+
             uint32_t t_void = bir_type_void(L->M);
             uint32_t st = emit(L, BIR_STORE, t_void, 2, 0);
             set_op(L, st, 0, val);
@@ -1001,7 +1070,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             int fp       = is_float_type(L, lt);
             int opc      = bin_op_code(op, fp, node_is_unsigned(L, node));
             if (opc < 0) {
-                lower_error(L, node, "unsupported binary op");
+                lower_error(L, node, BC_E102);
                 return lhs;
             }
             uint32_t inst = emit(L, (uint16_t)opc, lt, 2, 0);
@@ -1095,7 +1164,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             return BIR_MAKE_VAL(res); /* pre-inc returns new value */
         }
 
-        lower_error(L, node, "unsupported unary prefix");
+        lower_error(L, node, BC_E103);
         return BIR_VAL_NONE;
     }
 
@@ -1128,7 +1197,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             set_op(L, st, 1, ptr);
             return BIR_MAKE_VAL(old); /* post-inc returns old value */
         }
-        lower_error(L, node, "unsupported postfix op");
+        lower_error(L, node, BC_E104);
         return BIR_VAL_NONE;
     }
 
@@ -1604,6 +1673,130 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             }
         }
 
+        /* ---- MFMA intrinsics (CDNA matrix multiply) ---- */
+        if (strncmp(cname, "__builtin_amdgcn_mfma_", 22) == 0) {
+            static const struct { const char *sfx; uint8_t var; } mfma_tab[] = {
+                {"f32_4x4x4_f16",       0},
+                {"f32_16x16x16_f16",     1},
+                {"f32_32x32x8_f16",      2},
+                {"f32_4x4x4_bf16_1k",    3},
+                {"f32_16x16x16_bf16_1k", 4},
+                {"f32_32x32x8_bf16_1k",  5},
+                {"f32_4x4x1_f32",        6},
+                {"f32_16x16x4_f32",      7},
+                {"f32_32x32x2_f32",      8},
+                {"i32_4x4x4_i8",         9},
+                {"i32_16x16x16_i8",     10},
+                {"i32_32x32x8_i8",      11},
+                /* FP8/BF8 mixed-precision (gfx942) */
+                {"f32_16x16x32_fp8_fp8", 12},
+                {"f32_16x16x32_fp8_bf8", 13},
+                {"f32_16x16x32_bf8_fp8", 14},
+                {"f32_16x16x32_bf8_bf8", 15},
+                {"f32_32x32x16_fp8_fp8", 16},
+                {"f32_32x32x16_fp8_bf8", 17},
+                {"f32_32x32x16_bf8_fp8", 18},
+                {"f32_32x32x16_bf8_bf8", 19},
+                /* F64 matrix */
+                {"f64_4x4x4f64",        20},
+                {"f64_16x16x4f64",      21},
+            };
+            const char *sfx = cname + 22;
+            for (int mi = 0; mi < 22; mi++) {
+                if (strcmp(sfx, mfma_tab[mi].sfx) != 0) continue;
+                /* 3 args: A, B, C(accum) */
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t a0 = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t a1 = lower_expr(L, an);
+                an = ND(L, an)->next_sibling;
+                uint32_t a2 = lower_expr(L, an);
+                uint32_t rt = ref_type(L, a2); /* return type = accum type */
+                uint32_t r = emit(L, BIR_MFMA, rt, 3, mfma_tab[mi].var);
+                set_op(L, r, 0, a0);
+                set_op(L, r, 1, a1);
+                set_op(L, r, 2, a2);
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
+        /* ---- __ockl_* thread model (tinygrad's preferred API) ---- */
+        if (strncmp(cname, "__ockl_get_", 11) == 0) {
+            static const struct { const char *sfx; uint16_t op; } ockl[] = {
+                {"local_id",   BIR_THREAD_ID},
+                {"group_id",   BIR_BLOCK_ID},
+                {"local_size", BIR_BLOCK_DIM},
+                {"num_groups", BIR_GRID_DIM},
+            };
+            const char *rest = cname + 11;
+            for (int oi = 0; oi < 4; oi++) {
+                if (strcmp(rest, ockl[oi].sfx) != 0) continue;
+                /* arg is literal dim (0/1/2) */
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                int dim = 0;
+                if (an && ND(L, an)->type == AST_INT_LIT)
+                    dim = (int)parse_int_text(
+                        L->src + ND(L, an)->d.text.offset,
+                        (int)ND(L, an)->d.text.len);
+                uint32_t i32 = bir_type_int(L->M, 32);
+                uint32_t r = emit(L, ockl[oi].op, i32, 0, (uint8_t)dim);
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
+        /* ---- __ocml_* math builtins (AMD's libm naming) ---- */
+        if (strncmp(cname, "__ocml_", 7) == 0) {
+            const char *rest = cname + 7;
+            /* Unary direct: no prescale needed */
+            static const struct { const char *n; size_t len; uint16_t op; } ou[] = {
+                {"exp2",  4, BIR_EXP2},  {"log2",  4, BIR_LOG2},
+                {"sqrt",  4, BIR_SQRT},  {"fabs",  4, BIR_FABS},
+                {"floor", 5, BIR_FLOOR}, {"ceil",  4, BIR_CEIL},
+                {"trunc", 5, BIR_FTRUNC},{"rint",  4, BIR_RNDNE},
+            };
+            for (int oi = 0; oi < 8; oi++) {
+                if (strncmp(rest, ou[oi].n, ou[oi].len) == 0
+                    && rest[ou[oi].len] == '_') {
+                    uint32_t an = ND(L, callee_n)->next_sibling;
+                    uint32_t v = lower_expr(L, an);
+                    uint32_t rt = ref_type(L, v);
+                    uint32_t r = emit(L, ou[oi].op, rt, 1, 0);
+                    set_op(L, r, 0, v);
+                    return BIR_MAKE_VAL(r);
+                }
+            }
+            /* Binary direct */
+            static const struct { const char *n; size_t len; uint16_t op; } ob[] = {
+                {"fmax", 4, BIR_FMAX}, {"fmin", 4, BIR_FMIN},
+            };
+            for (int oi = 0; oi < 2; oi++) {
+                if (strncmp(rest, ob[oi].n, ob[oi].len) == 0
+                    && rest[ob[oi].len] == '_') {
+                    uint32_t an = ND(L, callee_n)->next_sibling;
+                    uint32_t a0 = lower_expr(L, an);
+                    an = ND(L, an)->next_sibling;
+                    uint32_t a1 = lower_expr(L, an);
+                    uint32_t rt = ref_type(L, a0);
+                    uint32_t r = emit(L, ob[oi].op, rt, 2, 0);
+                    set_op(L, r, 0, a0); set_op(L, r, 1, a1);
+                    return BIR_MAKE_VAL(r);
+                }
+            }
+            /* sin/cos: HW wants input in turns, so prescale by 1/(2pi) */
+            if (strncmp(rest, "sin_", 4) == 0 || strncmp(rest, "cos_", 4) == 0) {
+                uint16_t sop = (rest[0] == 's') ? BIR_SIN : BIR_COS;
+                uint32_t an = ND(L, callee_n)->next_sibling;
+                uint32_t v = lower_expr(L, an);
+                uint32_t rt = ref_type(L, v);
+                uint32_t k = BIR_MAKE_CONST(bir_const_float(L->M, rt, 0.15915494309189535));
+                uint32_t m = emit(L, BIR_FMUL, rt, 2, 0);
+                set_op(L, m, 0, v); set_op(L, m, 1, k);
+                uint32_t r = emit(L, sop, rt, 1, 0);
+                set_op(L, r, 0, BIR_MAKE_VAL(m));
+                return BIR_MAKE_VAL(r);
+            }
+        }
+
         /* ---- Regular function call ---- */
 
         /* Find function in module */
@@ -1618,7 +1811,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             }
         }
         if (!found) {
-            lower_error(L, node, "unknown function in call");
+            lower_error(L, node, BC_E105);
             return BIR_VAL_NONE;
         }
 
@@ -1748,7 +1941,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             bir_type_int(L->M, 64), 0));
 
     default:
-        lower_error(L, node, "unsupported expression node");
+        lower_error(L, node, BC_E106);
         return BIR_VAL_NONE;
     }
 }
@@ -1766,12 +1959,12 @@ static uint32_t lower_lvalue(lower_t *L, uint32_t node)
         get_text(L, node, name, sizeof(name));
         sym_t *s = find_sym(L, name);
         if (!s) {
-            lower_error(L, node, "undefined lvalue");
+            lower_error(L, node, BC_E107);
             return BIR_VAL_NONE;
         }
         if (s->is_alloca)
             return BIR_MAKE_VAL(s->ref);
-        lower_error(L, node, "parameter not addressable");
+        lower_error(L, node, BC_E108);
         return BIR_VAL_NONE;
     }
 
@@ -1783,7 +1976,16 @@ static uint32_t lower_lvalue(lower_t *L, uint32_t node)
         uint32_t idx_v  = lower_expr(L, idx_n);
         uint32_t bt     = ref_type(L, base_v);
 
-        uint32_t gep = emit(L, BIR_GEP, bt, 2, 0);
+        /* Array decay: ptr(T[N]) → ptr(T) for correct GEP stride */
+        uint32_t gep_t = bt;
+        uint32_t et = ptr_inner(L, bt);
+        if (et && et < L->M->num_types &&
+            L->M->types[et].kind == BIR_TYPE_ARRAY) {
+            uint8_t as = is_ptr_type(L, bt) ? L->M->types[bt].addrspace : 0;
+            gep_t = bir_type_ptr(L->M, L->M->types[et].inner, as);
+        }
+
+        uint32_t gep = emit(L, BIR_GEP, gep_t, 2, 0);
         set_op(L, gep, 0, base_v);
         set_op(L, gep, 1, idx_v);
         return BIR_MAKE_VAL(gep);
@@ -1792,7 +1994,7 @@ static uint32_t lower_lvalue(lower_t *L, uint32_t node)
     case AST_UNARY_PREFIX:
         if (n->d.oper.op == TOK_STAR)
             return lower_expr(L, n->first_child);
-        lower_error(L, node, "not an lvalue (prefix)");
+        lower_error(L, node, BC_E109);
         return BIR_VAL_NONE;
 
     case AST_MEMBER: {
@@ -1826,7 +2028,7 @@ static uint32_t lower_lvalue(lower_t *L, uint32_t node)
                 return BIR_MAKE_VAL(gep);
             }
         }
-        lower_error(L, node, "unknown field in lvalue");
+        lower_error(L, node, BC_E110);
         return BIR_VAL_NONE;
     }
 
@@ -1834,7 +2036,7 @@ static uint32_t lower_lvalue(lower_t *L, uint32_t node)
         return lower_lvalue(L, n->first_child);
 
     default:
-        lower_error(L, node, "not an lvalue");
+        lower_error(L, node, BC_E111);
         return BIR_VAL_NONE;
     }
 }
@@ -2414,11 +2616,11 @@ static void lower_func_body(lower_t *L, uint32_t func_def,
     uint32_t ret_t = resolve_type(L, type_n, ret_ptr, 0);
 
     /* Collect parameters */
-    uint32_t param_nodes[16];
-    int nparams = collect_params(L, func_def, param_nodes, 16);
+    uint32_t param_nodes[32];
+    int nparams = collect_params(L, func_def, param_nodes, 32);
 
     /* Resolve param types and build function type */
-    uint32_t param_types[16];
+    uint32_t param_types[32];
     for (int i = 0; i < nparams; i++) {
         const ast_node_t *pn = ND(L, param_nodes[i]);
         uint32_t pt_type_n = pn->first_child;
@@ -2881,7 +3083,8 @@ recurse:
 /* ---- Top-Level Entry Point ---- */
 
 int bir_lower(const parser_t *P, uint32_t ast_root, bir_module_t *M,
-              const sema_ctx_t *sema)
+              const sema_ctx_t *sema,
+              bc_error_t *out_errs, int *out_nerrs)
 {
     static lower_t L_storage; /* large struct — static to avoid stack overflow */
     lower_t *L = &L_storage;
@@ -2946,15 +3149,15 @@ int bir_lower(const parser_t *P, uint32_t ast_root, bir_module_t *M,
         c = P->nodes[c].next_sibling;
     }
 
-    /* Report errors */
-    if (L->nerrors > 0) {
-        for (int i = 0; i < L->nerrors; i++) {
-            fprintf(stderr, "lower: %u:%u: %s\n",
-                    L->errors[i].loc.line, L->errors[i].loc.col,
-                    L->errors[i].msg);
-        }
-        return BC_ERR_LOWER;
+    /* Copy errors out for main.c to display */
+    if (out_errs && out_nerrs) {
+        int n = L->nerrors < BC_MAX_ERRORS ? L->nerrors : BC_MAX_ERRORS;
+        memcpy(out_errs, L->errors, (size_t)n * sizeof(bc_error_t));
+        *out_nerrs = n;
     }
+
+    if (L->nerrors > 0)
+        return BC_ERR_LOWER;
 
     return BC_OK;
 }

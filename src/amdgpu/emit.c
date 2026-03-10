@@ -7,7 +7,7 @@
 /*
  * AMDGPU emitter: phi elimination, register allocation, assembly printer,
  * and ELF code object writer.
- * Targets CDNA 2 (gfx90a, Wave64), RDNA 2/3/4 (gfx1030/1100/1200, Wave32).
+ * Targets CDNA 2/3 (gfx90a/gfx942, Wave64), RDNA 2/3/4 (gfx1030/1100/1200, Wave32).
  * Dependencies: libc, optimism, tea.
  */
 
@@ -283,6 +283,8 @@ static void rw_ops(amd_module_t *A, const mfunc_t *F)
             if (mi->op == AMD_PSEUDO_COPY) {
                 if (mi->operands[0].kind == MOP_VGPR)
                     mi->op = AMD_V_MOV_B32;
+                else if (mi->operands[1].kind == MOP_VGPR)
+                    mi->op = AMD_V_READFIRSTLANE_B32;
                 else
                     mi->op = AMD_S_MOV_B32;
             }
@@ -355,7 +357,7 @@ static void fin_regs(const amd_module_t *A, mfunc_t *F)
        The maths of sharing: 256 VGPRs divided among the waves you
        promised the hardware you'd run. Break the promise at your peril. */
     if (F->launch_bounds_max > 0 && F->launch_bounds_max < 1024) {
-        int w64 = (A->target <= AMD_TARGET_GFX90A);
+        int w64 = (A->target <= AMD_TARGET_GFX942);
         uint32_t wsz = w64 ? 64u : 32u;
         uint32_t desired_waves = (F->launch_bounds_max + wsz - 1) / wsz;
         if (desired_waves > 0) {
@@ -383,12 +385,18 @@ static void ra_lin(amd_module_t *A, uint32_t mf_idx)
 
     /* Push high regs first so low regs are popped first (stack order) */
     uint16_t sgpr_start = F->is_kernel ? F->first_alloc_sgpr : 0;
-    if (sgpr_start < AMD_KERN_RESERVED_SGPR && F->is_kernel)
-        sgpr_start = AMD_KERN_RESERVED_SGPR;
+    if (sgpr_start < AMD_KERN_MIN_RESERVED && F->is_kernel)
+        sgpr_start = AMD_KERN_MIN_RESERVED;
     for (uint16_t r = AMD_MAX_SGPRS; r-- > sgpr_start; )
         RA.sgpr_free[RA.num_sgpr_free++] = (uint8_t)r;
-    for (uint16_t r = AMD_MAX_VGPRS; r-- > 0; )
+
+    /* CDNA flat scratch reserves v250:v251 as addr staging pair */
+    int cdna_scr = (A->target <= AMD_TARGET_GFX942 && F->scratch_bytes > 0);
+    for (uint16_t r = AMD_MAX_VGPRS; r-- > 0; ) {
+        if (cdna_scr && (r == AMD_VGPR_SCR_LO || r == AMD_VGPR_SCR_HI))
+            continue;
         RA.vgpr_free[RA.num_vgpr_free++] = (uint8_t)r;
+    }
 
     compute_live_intervals(A, F);
 
@@ -448,9 +456,19 @@ static void ra_lin(amd_module_t *A, uint32_t mf_idx)
             RA.active[RA.num_active++] = v;
     }
 
-    /* Record usage for kernel descriptor */
+    /* Record usage for kernel descriptor.
+     * Regalloc only tracks its own assigned SGPRs, but kernels also
+     * use system SGPRs (kernarg, TGID) and param pair SGPRs.
+     * first_alloc_sgpr is the floor — everything below it is spoken for. */
     F->num_sgprs = RA.max_sgpr;
+    if (F->is_kernel && F->num_sgprs < F->first_alloc_sgpr)
+        F->num_sgprs = F->first_alloc_sgpr;
     F->num_vgprs = RA.max_vgpr;
+
+    /* CDNA flat scratch: v250:v251 are physical, not regalloc'd */
+    if (cdna_scr && F->num_vgprs < AMD_VGPR_SCR_HI + 1)
+        F->num_vgprs = AMD_VGPR_SCR_HI + 1;
+
     fin_regs(A, F);
     rw_ops(A, F);
     dce_copy(A, F);
@@ -834,8 +852,8 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
 
         /* --- Compute K (available physical regs per file) --- */
         uint16_t sgpr_start = F->is_kernel ? F->first_alloc_sgpr : 0;
-        if (sgpr_start < AMD_KERN_RESERVED_SGPR && F->is_kernel)
-            sgpr_start = AMD_KERN_RESERVED_SGPR;
+        if (sgpr_start < AMD_KERN_MIN_RESERVED && F->is_kernel)
+            sgpr_start = AMD_KERN_MIN_RESERVED;
         uint32_t K_sgpr = (AMD_MAX_SGPRS > sgpr_start) ? AMD_MAX_SGPRS - sgpr_start : 0;
         uint32_t K_vgpr = (amd_max_vgpr > 0 && amd_max_vgpr < AMD_MAX_VGPRS)
                            ? (uint32_t)amd_max_vgpr : AMD_MAX_VGPRS;
@@ -1362,14 +1380,15 @@ static void print_operand(amd_module_t *A, const moperand_t *op)
     case MOP_SPECIAL:
         switch (op->imm) {
         case AMD_SPEC_VCC:
-            asm_append(A, A->target <= AMD_TARGET_GFX90A ? "vcc" : "vcc_lo");
+            asm_append(A, A->target <= AMD_TARGET_GFX942 ? "vcc" : "vcc_lo");
             break;
         case AMD_SPEC_EXEC:
-            asm_append(A, A->target <= AMD_TARGET_GFX90A ? "exec" : "exec_lo");
+            asm_append(A, A->target <= AMD_TARGET_GFX942 ? "exec" : "exec_lo");
             break;
-        case AMD_SPEC_SCC:  asm_append(A, "scc"); break;
-        case AMD_SPEC_M0:   asm_append(A, "m0"); break;
-        default:            asm_append(A, "???"); break;
+        case AMD_SPEC_SCC:       asm_append(A, "scc"); break;
+        case AMD_SPEC_M0:        asm_append(A, "m0"); break;
+        case AMD_SPEC_PRIV_BASE: asm_append(A, "src_private_base"); break;
+        default:                 asm_append(A, "???"); break;
         }
         break;
     default:
@@ -1448,7 +1467,7 @@ static void print_minst(amd_module_t *A, const minst_t *mi)
         }
         break;
     }
-    case AMD_FMT_FLAT_GBL: case AMD_FMT_FLAT_SCR: {
+    case AMD_FMT_FLAT_GBL: case AMD_FMT_FLAT_SCR: case AMD_FMT_FLAT: {
         /* Load:  global_load_dword  vDst, vOffset, sBase|off */
         /* Store: global_store_dword vOffset, vSrc, sBase|off */
         if (mi->num_defs > 0) {
@@ -1475,6 +1494,15 @@ static void print_minst(amd_module_t *A, const minst_t *mi)
             }
         }
         if (mi->flags & AMD_FLAG_GLC) asm_append(A, " glc");
+        break;
+    }
+    case AMD_FMT_VOP3P_MAI: {
+        /* v_mfma_*  vDst, vSrc0, vSrc1, vAccum */
+        for (uint8_t k = 0; k < total; k++) {
+            if (k > 0) asm_append(A, ",");
+            asm_append(A, " ");
+            print_operand(A, &mi->operands[k]);
+        }
         break;
     }
     case AMD_FMT_DS: {
@@ -1659,14 +1687,7 @@ static void mp_uint(uint8_t *buf, uint32_t *pos, uint32_t val)
 
 /* ---- ELF Code Object Writer ---- */
 
-/* Local emit_dword for kernel descriptor padding (encode.c owns the
-   encoding-side copy, but we need one here for the ELF layout too) */
-static void emit_dword_elf(amd_module_t *A, uint32_t dw)
-{
-    if (A->code_len + 4 > AMD_CODE_SIZE) return;
-    memcpy(A->code + A->code_len, &dw, 4);
-    A->code_len += 4;
-}
+
 
 /* ELF64 types */
 typedef struct {
@@ -1714,17 +1735,52 @@ typedef struct {
     uint32_t n_type;
 } elf64_nhdr_t;   /* 12 bytes */
 
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} elf64_phdr_t;   /* 56 bytes */
+
+typedef struct {
+    int64_t  d_tag;
+    uint64_t d_val;
+} elf64_dyn_t;    /* 16 bytes */
+
 #define SHT_NULL     0
 #define SHT_PROGBITS 1
 #define SHT_SYMTAB   2
 #define SHT_STRTAB   3
+#define SHT_HASH     5
+#define SHT_DYNAMIC  6
 #define SHT_NOTE     7
+#define SHT_DYNSYM   11
+#define SHF_WRITE    1
 #define SHF_ALLOC    2
 #define SHF_EXECINSTR 4
 #define STB_GLOBAL   1
 #define STT_FUNC     2
 #define STT_OBJECT   1
 #define NT_AMDGPU_METADATA 32
+
+#define PT_LOAD      1
+#define PT_DYNAMIC   2
+#define PT_NOTE      4
+#define PT_PHDR      6
+#define PF_X         1
+#define PF_W         2
+#define PF_R         4
+
+#define DT_NULL      0
+#define DT_HASH      4
+#define DT_STRTAB    5
+#define DT_SYMTAB    6
+#define DT_STRSZ     10
+#define DT_SYMENT    11
 
 /* Pad file to alignment boundary (bounded to avoid infinite loops) */
 static void fwrite_pad(FILE *fp, uint32_t align)
@@ -1743,71 +1799,100 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     /* First, encode all functions to binary */
     A->code_len = 0;
 
-    /* Track kernel descriptor positions */
-    static uint32_t kd_offsets[AMD_MAX_MFUNCS];
-    static uint32_t code_offsets[AMD_MAX_MFUNCS];
+    /* Build .rodata (kernel descriptors) and .text (code) separately.
+     * The HSA runtime wants KDs in .rodata — data and deeds, separated
+     * like a well-organised criminal enterprise. */
+    static uint8_t rodata[16384];   /* up to ~256 KDs with alignment */
+    uint32_t rodata_len = 0;
+    static uint32_t rodata_kd_off[64]; /* KD offset within .rodata */
+    static uint32_t code_offsets[64];  /* code offset within .text */
     uint32_t num_kernels = 0;
 
     for (uint32_t fi = 0; fi < A->num_mfuncs; fi++) {
         if (!A->mfuncs[fi].is_kernel) continue;
-
-        /* Align to 256 bytes for kernel descriptor */
-        for (uint32_t pad = 0; A->code_len % 256 != 0 && pad < 64; pad++)
-            emit_dword_elf(A, 0);
-        kd_offsets[num_kernels] = A->code_len;
-
-        /* Write kernel descriptor (64 bytes) */
-        amd_kernel_descriptor_t kd;
-        memset(&kd, 0, sizeof(kd));
+        if (num_kernels >= 64) break;
 
         mfunc_t *F = &A->mfuncs[fi];
+        int cdna = (A->target <= AMD_TARGET_GFX942);
+
+        /* ---- KD → .rodata (64-byte aligned, CP microcode demands it) ---- */
+        while (rodata_len % 64 != 0 && rodata_len < sizeof(rodata))
+            rodata[rodata_len++] = 0;
+        rodata_kd_off[num_kernels] = rodata_len;
+
+        amd_kernel_descriptor_t kd;
+        memset(&kd, 0, sizeof(kd));
         kd.group_segment_fixed_size = F->lds_bytes;
         kd.private_segment_fixed_size = F->scratch_bytes;
         kd.kernarg_size = F->kernarg_bytes;
-        kd.kernel_code_entry_byte_offset = 256; /* descriptor is 64 bytes, padded to 256 */
+        kd.kernel_code_entry_byte_offset = 0; /* patched after layout */
 
-        /* compute_pgm_rsrc1 — GFX9: VGPR granularity 4, no WGP_MODE/MEM_ORDERED */
-        int cdna = (A->target <= AMD_TARGET_GFX90A);
-        uint32_t vgran = cdna ? 4u : 8u;
+        /* compute_pgm_rsrc1 — VGPR gran=8 (GFX90A+), SGPR gran=16 (GFX9).
+         * GFX10+ ignores the SGPR field entirely.
+         * GFX9/CDNA: VCC, FLAT_SCRATCH, XNACK_MASK are carved from the
+         * RSRC1 SGPR allocation.  MI300X needs SGPR_BLOCKS >= 2 (i.e.
+         * >= 48 physical) or kernels with 12+ user SGPRs get Error 700.
+         * The +6 from the ISA manual is necessary but not sufficient —
+         * 48 is the empirically proven floor.  Don't fly with less. */
         uint32_t vgpr_blocks = (F->num_vgprs > 0)
-            ? (uint32_t)((F->num_vgprs + vgran - 1) / vgran - 1) : 0;
-        uint32_t sgpr_blocks = (F->num_sgprs > 0) ? (uint32_t)((F->num_sgprs + 7) / 8 - 1) : 0;
+            ? (uint32_t)((F->num_vgprs + 7) / 8 - 1) : 0;
+        uint32_t sgpr_gran = cdna ? 16u : 8u;
+        uint32_t total_sgprs = F->num_sgprs;
+        if (cdna && total_sgprs < 33) total_sgprs = 33;
+        uint32_t sgpr_blocks = (total_sgprs > 0)
+            ? (uint32_t)((total_sgprs + sgpr_gran - 1) / sgpr_gran - 1) : 0;
         kd.compute_pgm_rsrc1 = (vgpr_blocks & 0x3F) |
                                ((sgpr_blocks & 0xF) << 6) |
-                               (1u << 20);   /* IEEE_MODE */
+                               (3u << 16) |   /* FLOAT_DENORM_MODE_32 = preserve all */
+                               (3u << 18) |   /* FLOAT_DENORM_MODE_16_64 = preserve all */
+                               (1u << 21) |   /* ENABLE_DX10_CLAMP */
+                               (1u << 23);    /* ENABLE_IEEE_MODE */
         if (!cdna) {
             kd.compute_pgm_rsrc1 |= (1u << 26) |  /* WGP_MODE (RDNA only) */
                                     (1u << 27);    /* MEM_ORDERED (RDNA only) */
         }
 
-        /* compute_pgm_rsrc2 — GFX9: TGID at bits 11/12/13 */
-        uint32_t tgid_x = cdna ? 11u : 7u;
-        uint32_t tgid_y = cdna ? 12u : 8u;
-        uint32_t tgid_z = cdna ? 13u : 9u;
-        kd.compute_pgm_rsrc2 = ((F->scratch_bytes > 0) ? 1u : 0u) | /* SCRATCH_EN */
-                               (4u << 1) |            /* USER_SGPR_COUNT = 4 */
-                               (1u << tgid_x) |       /* TGID_X_EN */
-                               (1u << tgid_y) |       /* TGID_Y_EN */
-                               (1u << tgid_z);         /* TGID_Z_EN */
-
-        /* kernel_code_properties */
-        kd.kernel_code_properties = (1u << 0) |  /* ENABLE_SGPR_DISPATCH_PTR */
-                                    (1u << 1);   /* ENABLE_SGPR_KERNARG_PTR */
-
-        /* Write the 64 bytes */
-        if (A->code_len + 64 <= AMD_CODE_SIZE) {
-            memcpy(A->code + A->code_len, &kd, 64);
-            A->code_len += 64;
+        /* compute_pgm_rsrc2 — [0] SCRATCH_EN, [5:1] USER_SGPR_COUNT,
+           [7] TGID_X, [8] TGID_Y, [9] TGID_Z, [12:11] VGPR_WORKITEM_ID.
+           Layout matches what isel's scan_kernel_needs() decided. */
+        {
+            uint32_t user_sgpr = 2u; /* s[0:1] = kernarg only */
+            uint32_t rsrc2 = ((F->scratch_bytes > 0) ? 1u : 0u) |
+                             (user_sgpr << 1) |
+                             (1u << 7);       /* TGID_X always enabled */
+            if (F->max_dim >= 1) rsrc2 |= (1u << 8);  /* TGID_Y */
+            if (F->max_dim >= 2) rsrc2 |= (1u << 9);  /* TGID_Z */
+            rsrc2 |= ((uint32_t)F->max_dim << 11);    /* VGPR_WORKITEM_ID */
+            kd.compute_pgm_rsrc2 = rsrc2;
         }
 
-        /* Pad to 256 bytes after descriptor */
+        /* compute_pgm_rsrc3 — ACCUM_OFFSET for CDNA (GFX90A/GFX942).
+         * Tells the HW where ArchVGPRs end and AccVGPRs begin.
+         * GFX942 unified VGPRs: all are ArchVGPR, so offset = vgpr_blocks. */
+        if (cdna) {
+            uint32_t ao_gran = (A->target == AMD_TARGET_GFX942) ? 8u : 4u;
+            uint32_t accum_off = (F->num_vgprs > 0)
+                ? (uint32_t)((F->num_vgprs + ao_gran - 1) / ao_gran - 1) : 0;
+            kd.compute_pgm_rsrc3 = accum_off & 0x3F;
+        }
+
+        /* kernel_code_properties */
+        kd.kernel_code_properties = (1u << 3);   /* ENABLE_SGPR_KERNARG_PTR */
+        /* CDNA flat scratch via src_private_base — does NOT need
+         * ENABLE_PRIVATE_SEGMENT. Runtime/CP sets up FLAT_SCRATCH
+         * from SCRATCH_EN + private_segment_fixed_size. */
+
+        if (rodata_len + 64 <= sizeof(rodata)) {
+            memcpy(rodata + rodata_len, &kd, 64);
+            rodata_len += 64;
+        }
+
+        /* ---- Code → A->code (.text, 256-byte aligned for HW prefetcher) ---- */
         for (uint32_t pad = 0; A->code_len % 256 != 0 && A->code_len < AMD_CODE_SIZE && pad < 256; pad++)
             A->code[A->code_len++] = 0;
-
         code_offsets[num_kernels] = A->code_len;
         num_kernels++;
 
-        /* Encode the function's instructions */
         encode_function(A, fi);
     }
 
@@ -1815,6 +1900,58 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     for (uint32_t fi = 0; fi < A->num_mfuncs; fi++) {
         if (A->mfuncs[fi].is_kernel) continue;
         encode_function(A, fi);
+    }
+
+    /* ---- Build .debug_bc section ----
+     * Maps code offsets to source lines. Currently we emit what we know,
+     * which is per-instruction byte offsets. Line numbers are zero until
+     * the frontend grows source location tracking. But the section exists,
+     * the format is defined, and the ABEND dump machinery can read it.
+     * Patience, grasshopper. */
+    static uint8_t dbcbuf[65536];
+    uint32_t dbc_len = 0;
+
+    {
+        /* Count total instructions across all functions */
+        uint32_t n_ent = 0;
+        for (uint32_t fi = 0; fi < A->num_mfuncs && n_ent < 8000; fi++) {
+            const mfunc_t *F = &A->mfuncs[fi];
+            for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+                uint32_t mb_idx = F->first_block + bi;
+                if (mb_idx >= AMD_MAX_MBLOCKS) break;
+                n_ent += A->mblocks[mb_idx].num_insts;
+            }
+        }
+        if (n_ent > 8000) n_ent = 8000;
+
+        /* Header: "BCDB" + count */
+        if (8 + n_ent * 8 <= sizeof(dbcbuf)) {
+            dbcbuf[0] = 'B'; dbcbuf[1] = 'C';
+            dbcbuf[2] = 'D'; dbcbuf[3] = 'B';
+            memcpy(dbcbuf + 4, &n_ent, 4);
+            dbc_len = 8;
+
+            /* Entries: offset + line (line=0 for now) */
+            uint32_t ei = 0;
+            for (uint32_t fi = 0; fi < A->num_mfuncs && ei < n_ent; fi++) {
+                const mfunc_t *F2 = &A->mfuncs[fi];
+                for (uint32_t bi = 0; bi < F2->num_blocks && ei < n_ent; bi++) {
+                    uint32_t mb_idx = F2->first_block + bi;
+                    if (mb_idx >= AMD_MAX_MBLOCKS) break;
+                    const mblock_t *MB = &A->mblocks[mb_idx];
+                    for (uint32_t ii = 0; ii < MB->num_insts && ei < n_ent; ii++) {
+                        uint32_t mi_idx = MB->first_inst + ii;
+                        if (mi_idx >= AMD_MAX_MINSTS) break;
+                        uint32_t off = A->inst_off[mi_idx];
+                        uint32_t ln  = 0; /* no source lines yet */
+                        memcpy(dbcbuf + dbc_len,     &off, 4);
+                        memcpy(dbcbuf + dbc_len + 4, &ln,  4);
+                        dbc_len += 8;
+                        ei++;
+                    }
+                }
+            }
+        }
     }
 
     /* Build note section (msgpack metadata) */
@@ -1855,7 +1992,7 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         char kd_name[256];
         snprintf(kd_name, sizeof(kd_name), "%s.kd", name);
 
-        mp_fixmap(mp_buf, &mp_pos, 10);
+        mp_fixmap(mp_buf, &mp_pos, 15);
 
         mp_fixstr(mp_buf, &mp_pos, ".name");
         mp_str(mp_buf, &mp_pos, name);
@@ -1865,6 +2002,9 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
 
         mp_str(mp_buf, &mp_pos, ".kernarg_segment_size");
         mp_uint(mp_buf, &mp_pos, F->kernarg_bytes);
+
+        mp_str(mp_buf, &mp_pos, ".kernarg_segment_align");
+        mp_uint(mp_buf, &mp_pos, 8);
 
         mp_str(mp_buf, &mp_pos, ".group_segment_fixed_size");
         mp_uint(mp_buf, &mp_pos, F->lds_bytes);
@@ -1881,11 +2021,83 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         mp_fixstr(mp_buf, &mp_pos, ".vgpr_count");
         mp_uint(mp_buf, &mp_pos, F->num_vgprs);
 
-        mp_str(mp_buf, &mp_pos, ".max_flat_workgroup_size");
-        mp_uint(mp_buf, &mp_pos, 256);
+        mp_str(mp_buf, &mp_pos, ".agpr_count");
+        mp_uint(mp_buf, &mp_pos, 0);
 
+        mp_str(mp_buf, &mp_pos, ".sgpr_spill_count");
+        mp_uint(mp_buf, &mp_pos, 0);
+
+        mp_str(mp_buf, &mp_pos, ".vgpr_spill_count");
+        mp_uint(mp_buf, &mp_pos, 0);
+
+        mp_str(mp_buf, &mp_pos, ".max_flat_workgroup_size");
+        mp_uint(mp_buf, &mp_pos, F->launch_bounds_max > 0 ? F->launch_bounds_max : 1024);
+
+        mp_str(mp_buf, &mp_pos, ".uses_dynamic_stack");
+        mp_buf[mp_pos++] = 0xC2; /* msgpack false */
+
+        /* .args — the runtime needs this to map kernarg buffer properly.
+         * Without it, hipModuleLaunchKernel refuses to dispatch. */
         mp_fixstr(mp_buf, &mp_pos, ".args");
-        mp_fixarray(mp_buf, &mp_pos, 0); /* empty args for now */
+        {
+            /* Find matching BIR function for param type info */
+            const bir_func_t *BF = NULL;
+            for (uint32_t bfi = 0; bfi < A->bir->num_funcs; bfi++)
+                if (A->bir->funcs[bfi].name == F->name) {
+                    BF = &A->bir->funcs[bfi]; break;
+                }
+            uint32_t np = BF ? BF->num_params : 0;
+            if (np > 15) np = 15;
+            /* 6 hidden args for block_count + group_size if needed */
+            uint32_t n_hidden = F->needs_dispatch ? 6 : 0;
+            mp_fixarray(mp_buf, &mp_pos, (uint8_t)(np + n_hidden));
+            for (uint32_t pi = 0; pi < np; pi++) {
+                int is_ptr = 0;
+                uint32_t arg_sz = 8; /* default 8-byte aligned */
+                if (BF) {
+                    const bir_type_t *ft = &A->bir->types[BF->type];
+                    uint32_t pt_idx = A->bir->type_fields[ft->count + pi];
+                    const bir_type_t *pt = &A->bir->types[pt_idx];
+                    is_ptr = (pt->kind == BIR_TYPE_PTR);
+                    if (!is_ptr)
+                        arg_sz = (pt->width > 0) ? (uint32_t)(pt->width / 8) : 4;
+                }
+                if (is_ptr) {
+                    mp_fixmap(mp_buf, &mp_pos, 4);
+                    mp_str(mp_buf, &mp_pos, ".address_space");
+                    mp_fixstr(mp_buf, &mp_pos, "global");
+                } else {
+                    mp_fixmap(mp_buf, &mp_pos, 3);
+                }
+                mp_fixstr(mp_buf, &mp_pos, ".offset");
+                mp_uint(mp_buf, &mp_pos, pi * 8);
+                mp_fixstr(mp_buf, &mp_pos, ".size");
+                mp_uint(mp_buf, &mp_pos, arg_sz);
+                mp_str(mp_buf, &mp_pos, ".value_kind");
+                mp_str(mp_buf, &mp_pos, is_ptr ? "global_buffer" : "by_value");
+            }
+            /* Hidden dispatch args — runtime populates these automatically */
+            if (F->needs_dispatch) {
+                uint32_t hk = np * 8;
+                static const struct { const char *kind; uint32_t off; uint32_t sz; } hargs[] = {
+                    { "hidden_block_count_x", 0,  4 },
+                    { "hidden_block_count_y", 4,  4 },
+                    { "hidden_block_count_z", 8,  4 },
+                    { "hidden_group_size_x",  12, 2 },
+                    { "hidden_group_size_y",  14, 2 },
+                    { "hidden_group_size_z",  16, 2 },
+                };
+                for (uint32_t hi = 0; hi < 6; hi++) {
+                    mp_fixmap(mp_buf, &mp_pos, 3);
+                    mp_fixstr(mp_buf, &mp_pos, ".offset");
+                    mp_uint(mp_buf, &mp_pos, hk + hargs[hi].off);
+                    mp_fixstr(mp_buf, &mp_pos, ".size");
+                    mp_uint(mp_buf, &mp_pos, hargs[hi].sz);
+                    mp_str(mp_buf, &mp_pos, ".value_kind");
+                    mp_str(mp_buf, &mp_pos, hargs[hi].kind);
+                }
+            }
+        }
 
         ki++;
     }
@@ -1905,102 +2117,198 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     while (note_len % 4 != 0 && note_len < sizeof(note_buf))
         note_buf[note_len++] = 0;
 
-    /* Build string tables */
-    /* .shstrtab: section names (total < 50 bytes, 256 is generous) */
+    /* ---- Build the DSO envelope ----
+     *
+     * The HSA runtime loads code objects like a drunk bouncer inspects IDs:
+     * it WILL check program headers, dynamic symbols, and ABI version,
+     * and it WILL reject you if any are missing. Our previous bare ELF
+     * worked fine for the emulator but real hardware has standards.
+     *
+     * Sections: 0=NULL 1=.note 2=.dynsym 3=.hash 4=.dynstr
+     *           5=.rodata 6=.text 7=.dynamic 8=.symtab 9=.strtab
+     *           10=.shstrtab 11=.debug_bc
+     *
+     * Program headers: PT_PHDR, PT_LOAD(R), PT_LOAD(RX), PT_LOAD(RW),
+     *                  PT_NOTE, PT_DYNAMIC
+     */
+
+    /* ---- .shstrtab: section names ---- */
     #define SHSTRTAB_MAX 256
     static char shstrtab[SHSTRTAB_MAX];
     uint32_t shstrtab_len = 0;
+    #define SHSTR(var, s) do { \
+        var = shstrtab_len; \
+        uint32_t l = (uint32_t)sizeof(s); \
+        if (shstrtab_len + l <= SHSTRTAB_MAX) { \
+            memcpy(shstrtab + shstrtab_len, s, l); shstrtab_len += l; } \
+    } while(0)
     shstrtab[shstrtab_len++] = '\0';
-    uint32_t text_name_off = shstrtab_len;
-    if (shstrtab_len + 6 <= SHSTRTAB_MAX) { memcpy(shstrtab + shstrtab_len, ".text", 6); shstrtab_len += 6; }
-    uint32_t note_name_off = shstrtab_len;
-    if (shstrtab_len + 6 <= SHSTRTAB_MAX) { memcpy(shstrtab + shstrtab_len, ".note", 6); shstrtab_len += 6; }
-    uint32_t symtab_name_off = shstrtab_len;
-    if (shstrtab_len + 8 <= SHSTRTAB_MAX) { memcpy(shstrtab + shstrtab_len, ".symtab", 8); shstrtab_len += 8; }
-    uint32_t strtab_name_off = shstrtab_len;
-    if (shstrtab_len + 8 <= SHSTRTAB_MAX) { memcpy(shstrtab + shstrtab_len, ".strtab", 8); shstrtab_len += 8; }
-    uint32_t shstrtab_name_off = shstrtab_len;
-    if (shstrtab_len + 10 <= SHSTRTAB_MAX) { memcpy(shstrtab + shstrtab_len, ".shstrtab", 10); shstrtab_len += 10; }
+    uint32_t sn_note, sn_dynsym, sn_hash, sn_dynstr, sn_rodata;
+    uint32_t sn_text, sn_dynamic, sn_symtab, sn_strtab, sn_shstrtab;
+    uint32_t sn_dbgbc;
+    SHSTR(sn_note,     ".note");
+    SHSTR(sn_dynsym,   ".dynsym");
+    SHSTR(sn_hash,     ".hash");
+    SHSTR(sn_dynstr,   ".dynstr");
+    SHSTR(sn_rodata,   ".rodata");
+    SHSTR(sn_text,     ".text");
+    SHSTR(sn_dynamic,  ".dynamic");
+    SHSTR(sn_symtab,   ".symtab");
+    SHSTR(sn_strtab,   ".strtab");
+    SHSTR(sn_shstrtab, ".shstrtab");
+    SHSTR(sn_dbgbc,    ".debug_bc");
+    #undef SHSTR
 
-    /* .strtab: symbol names */
+    /* ---- .dynstr + .strtab: kernel name strings ---- */
     #define STRTAB_MAX 4096
+    static char dynstr[STRTAB_MAX];
     static char strtab[STRTAB_MAX];
-    uint32_t strtab_len = 0;
+    uint32_t dynstr_len = 0, strtab_len = 0;
+    dynstr[dynstr_len++] = '\0';
     strtab[strtab_len++] = '\0';
 
-    /* Build symbol table */
-    static elf64_sym_t symtab[256];
-    uint32_t num_syms = 1; /* null symbol at index 0 */
-    memset(&symtab[0], 0, sizeof(elf64_sym_t));
+    /* Kernel name indices — need these before layout for symbol building */
+    static uint32_t dk_name[64], df_name[64]; /* .dynstr offsets */
+    static uint32_t sk_name[64], sf_name[64]; /* .strtab offsets */
 
     ki = 0;
-    for (uint32_t fi = 0; fi < A->num_mfuncs && ki < num_kernels; fi++) {
+    for (uint32_t fi = 0; fi < A->num_mfuncs && ki < num_kernels && ki < 64; fi++) {
         if (!A->mfuncs[fi].is_kernel) continue;
         const char *name = A->bir->strings + A->mfuncs[fi].name;
+        char kd[256];
+        snprintf(kd, sizeof(kd), "%s.kd", name);
+        uint32_t kl = (uint32_t)strlen(kd) + 1;
+        uint32_t nl = (uint32_t)strlen(name) + 1;
 
-        /* Kernel descriptor symbol (STT_OBJECT) */
-        char kd_sym[256];
-        snprintf(kd_sym, sizeof(kd_sym), "%s.kd", name);
-        uint32_t kd_name_idx = strtab_len;
-        uint32_t kd_sym_len = (uint32_t)strlen(kd_sym) + 1;
-        if (strtab_len + kd_sym_len <= STRTAB_MAX) {
-            memcpy(strtab + strtab_len, kd_sym, kd_sym_len);
-            strtab_len += kd_sym_len;
-        }
+        /* .dynstr */
+        dk_name[ki] = dynstr_len;
+        if (dynstr_len + kl <= STRTAB_MAX) { memcpy(dynstr + dynstr_len, kd, kl); dynstr_len += kl; }
+        df_name[ki] = dynstr_len;
+        if (dynstr_len + nl <= STRTAB_MAX) { memcpy(dynstr + dynstr_len, name, nl); dynstr_len += nl; }
 
-        if (num_syms < 256) {
-            symtab[num_syms].st_name = kd_name_idx;
-            symtab[num_syms].st_info = (STB_GLOBAL << 4) | STT_OBJECT;
-            symtab[num_syms].st_other = 0;
-            symtab[num_syms].st_shndx = 1; /* .text section */
-            symtab[num_syms].st_value = kd_offsets[ki];
-            symtab[num_syms].st_size = 64;
-            num_syms++;
-        }
-
-        /* Function symbol (STT_FUNC) */
-        uint32_t func_name_idx = strtab_len;
-        uint32_t name_len = (uint32_t)strlen(name) + 1;
-        if (strtab_len + name_len <= STRTAB_MAX) {
-            memcpy(strtab + strtab_len, name, name_len);
-            strtab_len += name_len;
-        }
-
-        if (num_syms < 256) {
-            symtab[num_syms].st_name = func_name_idx;
-            symtab[num_syms].st_info = (STB_GLOBAL << 4) | STT_FUNC;
-            symtab[num_syms].st_other = 0;
-            symtab[num_syms].st_shndx = 1;
-            symtab[num_syms].st_value = code_offsets[ki];
-            symtab[num_syms].st_size = A->code_len - code_offsets[ki];
-            num_syms++;
-        }
-
+        /* .strtab (same names, separate table) */
+        sk_name[ki] = strtab_len;
+        if (strtab_len + kl <= STRTAB_MAX) { memcpy(strtab + strtab_len, kd, kl); strtab_len += kl; }
+        sf_name[ki] = strtab_len;
+        if (strtab_len + nl <= STRTAB_MAX) { memcpy(strtab + strtab_len, name, nl); strtab_len += nl; }
         ki++;
     }
 
-    /* Write ELF file */
+    /* ---- Compute sizes ---- */
+    uint32_t ndynsym = 1 + 2 * num_kernels; /* null + (kd + func) per kernel */
+    uint32_t dynsym_size = ndynsym * 24;
+    /* SysV hash: 1 bucket, all symbols chained. Simple as a bucket. */
+    uint32_t hash_size = (2 + 1 + ndynsym) * 4; /* nbucket + nchain + bucket[1] + chain[ndynsym] */
+    uint32_t dyn_nent = 6; /* HASH, SYMTAB, STRTAB, STRSZ, SYMENT, NULL */
+    uint32_t dyn_size = dyn_nent * 16;
+
+    /* ---- Compute file layout ----
+     * R segment (VA = file offset): ehdr + phdrs + .note + .dynsym + .hash + .dynstr + .rodata
+     * RX segment (VA = file_offset + 0x1000): .text
+     * RW segment (VA = file_offset + 0x2000): .dynamic */
+
+    #define N_PHDR 6
+    uint64_t phdr_off  = 64;
+    uint64_t phdr_size = N_PHDR * 56;
+    uint64_t note_off  = (phdr_off + phdr_size + 3) & ~3ULL;
+    uint64_t dsym_off  = (note_off + note_len + 7) & ~7ULL;
+    uint64_t hash_off  = (dsym_off + dynsym_size + 3) & ~3ULL;
+    uint64_t dstr_off  = hash_off + hash_size;
+
+    uint64_t rod_off   = (dstr_off + dynstr_len + 63) & ~63ULL; /* 64-align for KD */
+    uint64_t rod_va    = rod_off; /* R segment: VA = file offset */
+    uint64_t seg_r_end = rod_off + rodata_len;
+
+    uint64_t text_off  = (seg_r_end + 255) & ~255ULL; /* 256-align for code */
+    uint64_t text_va   = text_off + 0x1000;
+    uint64_t text_size = A->code_len;
+
+    uint64_t dyn_off   = (text_off + text_size + 7) & ~7ULL;
+    uint64_t dyn_va    = dyn_off + 0x2000;
+
+    uint64_t sym_off   = (dyn_off + dyn_size + 7) & ~7ULL;
+    uint64_t sym_size  = ndynsym * 24; /* .symtab mirrors .dynsym */
+    uint64_t str_off   = sym_off + sym_size;
+    uint64_t dbc_off   = (str_off + strtab_len + 3) & ~3ULL;
+    uint64_t shs_off   = dbc_off + dbc_len;
+    uint64_t shdr_off  = (shs_off + shstrtab_len + 7) & ~7ULL;
+
+    /* Fix up kernel_code_entry_byte_offset now that VAs are known.
+     * Offset 16 in the KD = signed distance from KD (.rodata) to code (.text). */
+    for (uint32_t ri = 0; ri < num_kernels; ri++) {
+        int64_t entry_off = (int64_t)((text_va + code_offsets[ri]) -
+                                      (rod_va + rodata_kd_off[ri]));
+        memcpy(rodata + rodata_kd_off[ri] + 16, &entry_off, 8);
+    }
+
+    /* ---- Build .dynsym + .symtab (now we know VAs) ---- */
+    static elf64_sym_t dynsym[256];
+    static elf64_sym_t symtab[256];
+    memset(&dynsym[0], 0, 24);
+    memset(&symtab[0], 0, 24);
+    uint32_t si = 1;
+
+    ki = 0;
+    for (uint32_t fi = 0; fi < A->num_mfuncs && ki < num_kernels && ki < 64; fi++) {
+        if (!A->mfuncs[fi].is_kernel) continue;
+
+        /* .kd descriptor (STT_OBJECT) in .rodata (section 5) */
+        uint64_t kd_va = rod_va + rodata_kd_off[ki];
+        dynsym[si].st_name = dk_name[ki];
+        dynsym[si].st_info = (STB_GLOBAL << 4) | STT_OBJECT;
+        dynsym[si].st_shndx = 5; /* .rodata */
+        dynsym[si].st_value = kd_va;
+        dynsym[si].st_size = 64;
+
+        symtab[si].st_name = sk_name[ki];
+        symtab[si].st_info = (STB_GLOBAL << 4) | STT_OBJECT;
+        symtab[si].st_shndx = 5;
+        symtab[si].st_value = kd_va;
+        symtab[si].st_size = 64;
+        si++;
+
+        /* Function entry (STT_FUNC) in .text (section 6) */
+        uint64_t fn_va = text_va + code_offsets[ki];
+        dynsym[si].st_name = df_name[ki];
+        dynsym[si].st_info = (STB_GLOBAL << 4) | STT_FUNC;
+        dynsym[si].st_shndx = 6; /* .text */
+        dynsym[si].st_value = fn_va;
+        dynsym[si].st_size = A->code_len - code_offsets[ki];
+
+        symtab[si].st_name = sf_name[ki];
+        symtab[si].st_info = (STB_GLOBAL << 4) | STT_FUNC;
+        symtab[si].st_shndx = 6;
+        symtab[si].st_value = fn_va;
+        symtab[si].st_size = A->code_len - code_offsets[ki];
+        si++;
+        ki++;
+    }
+    uint32_t num_syms = si;
+
+    /* ---- Build .hash (SysV, 1 bucket — all symbols in one chain) ---- */
+    static uint32_t hash_buf[256];
+    hash_buf[0] = 1;         /* nbucket */
+    hash_buf[1] = num_syms;  /* nchain  */
+    hash_buf[2] = (num_syms > 1) ? 1 : 0; /* bucket[0] = first real sym */
+    hash_buf[3] = 0;         /* chain[0] = end (null sym) */
+    for (uint32_t hi = 1; hi < num_syms && hi + 3 < 256; hi++)
+        hash_buf[3 + hi] = (hi + 1 < num_syms) ? hi + 1 : 0;
+
+    /* ---- Build .dynamic ---- */
+    static elf64_dyn_t dynamic[8];
+    dynamic[0].d_tag = DT_HASH;   dynamic[0].d_val = hash_off; /* R seg: VA = file off */
+    dynamic[1].d_tag = DT_SYMTAB; dynamic[1].d_val = dsym_off;
+    dynamic[2].d_tag = DT_STRTAB; dynamic[2].d_val = dstr_off;
+    dynamic[3].d_tag = DT_STRSZ;  dynamic[3].d_val = dynstr_len;
+    dynamic[4].d_tag = DT_SYMENT; dynamic[4].d_val = 24;
+    dynamic[5].d_tag = DT_NULL;   dynamic[5].d_val = 0;
+
+    /* ---- Write ELF ---- */
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         fprintf(stderr, "error: cannot open '%s' for writing\n", path);
         return BC_ERR_IO;
     }
-
-    /* Compute layout */
-    uint64_t text_off = 64; /* after ELF header */
-    uint64_t text_size = A->code_len;
-    uint64_t note_off = text_off + text_size;
-    /* Align note to 4 bytes */
-    note_off = (note_off + 3) & ~3ULL;
-    uint64_t symtab_off = note_off + note_len;
-    symtab_off = (symtab_off + 7) & ~7ULL;
-    uint64_t symtab_size = num_syms * 24;
-    uint64_t strtab_off = symtab_off + symtab_size;
-    uint64_t shstrtab_off = strtab_off + strtab_len;
-    uint64_t shdr_off = (shstrtab_off + shstrtab_len + 7) & ~7ULL;
-
-    /* Sections: 0=NULL, 1=.text, 2=.note, 3=.symtab, 4=.strtab, 5=.shstrtab */
-    uint16_t num_sections = 6;
 
     /* ELF header */
     elf64_ehdr_t ehdr;
@@ -2013,84 +2321,240 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
     ehdr.e_ident[5] = 1;    /* ELFDATA2LSB */
     ehdr.e_ident[6] = 1;    /* EV_CURRENT */
     ehdr.e_ident[7] = ELFOSABI_AMDGPU_HSA;
-    ehdr.e_type = 2;        /* ET_EXEC (shared object would be 3) */
+    ehdr.e_ident[8] = 4;    /* ABI version 4 — code object v6 */
+    ehdr.e_type = 3;         /* ET_DYN */
     ehdr.e_machine = EM_AMDGPU;
     ehdr.e_version = 1;
-    ehdr.e_entry = 0;
-    ehdr.e_phoff = 0;
+    ehdr.e_phoff = phdr_off;
     ehdr.e_shoff = shdr_off;
     ehdr.e_flags = A->elf_mach;
     ehdr.e_ehsize = 64;
-    ehdr.e_phentsize = 0;
-    ehdr.e_phnum = 0;
+    ehdr.e_phentsize = 56;
+    ehdr.e_phnum = N_PHDR;
     ehdr.e_shentsize = 64;
-    ehdr.e_shnum = num_sections;
-    ehdr.e_shstrndx = 5;    /* .shstrtab index */
+    ehdr.e_shnum = 12;      /* +.rodata +.debug_bc */
+    ehdr.e_shstrndx = 10;   /* .shstrtab */
     fwrite(&ehdr, 1, 64, fp);
 
-    /* .text section */
-    fwrite(A->code, 1, A->code_len, fp);
+    /* Program headers */
+    elf64_phdr_t phdrs[N_PHDR];
+    memset(phdrs, 0, sizeof(phdrs));
+
+    /* 0: PT_PHDR — the program headers themselves */
+    phdrs[0].p_type   = PT_PHDR;
+    phdrs[0].p_flags  = PF_R;
+    phdrs[0].p_offset = phdr_off;
+    phdrs[0].p_vaddr  = phdr_off;
+    phdrs[0].p_paddr  = phdr_off;
+    phdrs[0].p_filesz = phdr_size;
+    phdrs[0].p_memsz  = phdr_size;
+    phdrs[0].p_align  = 8;
+
+    /* 1: PT_LOAD (R) — ehdr + phdrs + note + dynsym + hash + dynstr */
+    phdrs[1].p_type   = PT_LOAD;
+    phdrs[1].p_flags  = PF_R;
+    phdrs[1].p_offset = 0;
+    phdrs[1].p_vaddr  = 0;
+    phdrs[1].p_paddr  = 0;
+    phdrs[1].p_filesz = seg_r_end;
+    phdrs[1].p_memsz  = seg_r_end;
+    phdrs[1].p_align  = 0x1000;
+
+    /* 2: PT_LOAD (RX) — .text (KDs + code) */
+    phdrs[2].p_type   = PT_LOAD;
+    phdrs[2].p_flags  = PF_R | PF_X;
+    phdrs[2].p_offset = text_off;
+    phdrs[2].p_vaddr  = text_va;
+    phdrs[2].p_paddr  = text_va;
+    phdrs[2].p_filesz = text_size;
+    phdrs[2].p_memsz  = text_size;
+    phdrs[2].p_align  = 0x1000;
+
+    /* 3: PT_LOAD (RW) — .dynamic */
+    phdrs[3].p_type   = PT_LOAD;
+    phdrs[3].p_flags  = PF_R | PF_W;
+    phdrs[3].p_offset = dyn_off;
+    phdrs[3].p_vaddr  = dyn_va;
+    phdrs[3].p_paddr  = dyn_va;
+    phdrs[3].p_filesz = dyn_size;
+    phdrs[3].p_memsz  = dyn_size;
+    phdrs[3].p_align  = 0x1000;
+
+    /* 4: PT_NOTE — metadata */
+    phdrs[4].p_type   = PT_NOTE;
+    phdrs[4].p_flags  = PF_R;
+    phdrs[4].p_offset = note_off;
+    phdrs[4].p_vaddr  = note_off;
+    phdrs[4].p_paddr  = note_off;
+    phdrs[4].p_filesz = note_len;
+    phdrs[4].p_memsz  = note_len;
+    phdrs[4].p_align  = 4;
+
+    /* 5: PT_DYNAMIC — so the loader finds .dynsym et al */
+    phdrs[5].p_type   = PT_DYNAMIC;
+    phdrs[5].p_flags  = PF_R | PF_W;
+    phdrs[5].p_offset = dyn_off;
+    phdrs[5].p_vaddr  = dyn_va;
+    phdrs[5].p_paddr  = dyn_va;
+    phdrs[5].p_filesz = dyn_size;
+    phdrs[5].p_memsz  = dyn_size;
+    phdrs[5].p_align  = 8;
+
+    fwrite(phdrs, 56, N_PHDR, fp);
+
+    /* .note */
     fwrite_pad(fp, 4);
-
-    /* .note section */
     fwrite(note_buf, 1, note_len, fp);
-    fwrite_pad(fp, 8);
 
-    /* .symtab */
+    /* .dynsym */
+    fwrite_pad(fp, 8);
+    fwrite(dynsym, 24, num_syms, fp);
+
+    /* .hash */
+    fwrite_pad(fp, 4);
+    fwrite(hash_buf, 4, 3 + num_syms, fp);
+
+    /* .dynstr */
+    fwrite(dynstr, 1, dynstr_len, fp);
+
+    /* .rodata (kernel descriptors, 64-byte aligned) */
+    fwrite_pad(fp, 64);
+    fwrite(rodata, 1, rodata_len, fp);
+
+    /* .text (code only, 256-byte aligned for HW prefetcher) */
+    fwrite_pad(fp, 256);
+    fwrite(A->code, 1, A->code_len, fp);
+
+    /* .dynamic */
+    fwrite_pad(fp, 8);
+    fwrite(dynamic, 16, dyn_nent, fp);
+
+    /* .symtab (non-loaded, no PT_LOAD needed) */
+    fwrite_pad(fp, 8);
     fwrite(symtab, 24, num_syms, fp);
 
     /* .strtab */
     fwrite(strtab, 1, strtab_len, fp);
 
+    /* .debug_bc */
+    fwrite_pad(fp, 4);
+    if (dbc_len > 0)
+        fwrite(dbcbuf, 1, dbc_len, fp);
+
     /* .shstrtab */
     fwrite(shstrtab, 1, shstrtab_len, fp);
     fwrite_pad(fp, 8);
 
-    /* Section header table */
-    elf64_shdr_t shdrs[6];
+    /* ---- Section header table ----
+     * 0=NULL 1=.note 2=.dynsym 3=.hash 4=.dynstr 5=.rodata
+     * 6=.text 7=.dynamic 8=.symtab 9=.strtab 10=.shstrtab 11=.debug_bc */
+    elf64_shdr_t shdrs[12];
     memset(shdrs, 0, sizeof(shdrs));
 
-    /* 0: NULL */
-    /* 1: .text */
-    shdrs[1].sh_name = text_name_off;
-    shdrs[1].sh_type = SHT_PROGBITS;
-    shdrs[1].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-    shdrs[1].sh_offset = text_off;
-    shdrs[1].sh_size = text_size;
-    shdrs[1].sh_addralign = 256;
+    /* 0: NULL (already zeroed) */
 
-    /* 2: .note */
-    shdrs[2].sh_name = note_name_off;
-    shdrs[2].sh_type = SHT_NOTE;
-    shdrs[2].sh_offset = note_off;
-    shdrs[2].sh_size = note_len;
-    shdrs[2].sh_addralign = 4;
+    /* 1: .note */
+    shdrs[1].sh_name  = sn_note;
+    shdrs[1].sh_type  = SHT_NOTE;
+    shdrs[1].sh_flags = SHF_ALLOC;
+    shdrs[1].sh_addr  = note_off;
+    shdrs[1].sh_offset = note_off;
+    shdrs[1].sh_size  = note_len;
+    shdrs[1].sh_addralign = 4;
 
-    /* 3: .symtab */
-    shdrs[3].sh_name = symtab_name_off;
-    shdrs[3].sh_type = SHT_SYMTAB;
-    shdrs[3].sh_offset = symtab_off;
-    shdrs[3].sh_size = symtab_size;
-    shdrs[3].sh_link = 4;    /* .strtab */
-    shdrs[3].sh_info = 1;    /* first non-local symbol */
-    shdrs[3].sh_addralign = 8;
-    shdrs[3].sh_entsize = 24;
+    /* 2: .dynsym */
+    shdrs[2].sh_name  = sn_dynsym;
+    shdrs[2].sh_type  = SHT_DYNSYM;
+    shdrs[2].sh_flags = SHF_ALLOC;
+    shdrs[2].sh_addr  = dsym_off;
+    shdrs[2].sh_offset = dsym_off;
+    shdrs[2].sh_size  = dynsym_size;
+    shdrs[2].sh_link  = 4;  /* .dynstr */
+    shdrs[2].sh_info  = 1;  /* first global */
+    shdrs[2].sh_addralign = 8;
+    shdrs[2].sh_entsize = 24;
 
-    /* 4: .strtab */
-    shdrs[4].sh_name = strtab_name_off;
-    shdrs[4].sh_type = SHT_STRTAB;
-    shdrs[4].sh_offset = strtab_off;
-    shdrs[4].sh_size = strtab_len;
+    /* 3: .hash */
+    shdrs[3].sh_name  = sn_hash;
+    shdrs[3].sh_type  = SHT_HASH;
+    shdrs[3].sh_flags = SHF_ALLOC;
+    shdrs[3].sh_addr  = hash_off;
+    shdrs[3].sh_offset = hash_off;
+    shdrs[3].sh_size  = hash_size;
+    shdrs[3].sh_link  = 2;  /* .dynsym */
+    shdrs[3].sh_addralign = 4;
+    shdrs[3].sh_entsize = 4;
+
+    /* 4: .dynstr */
+    shdrs[4].sh_name  = sn_dynstr;
+    shdrs[4].sh_type  = SHT_STRTAB;
+    shdrs[4].sh_flags = SHF_ALLOC;
+    shdrs[4].sh_addr  = dstr_off;
+    shdrs[4].sh_offset = dstr_off;
+    shdrs[4].sh_size  = dynstr_len;
     shdrs[4].sh_addralign = 1;
 
-    /* 5: .shstrtab */
-    shdrs[5].sh_name = shstrtab_name_off;
-    shdrs[5].sh_type = SHT_STRTAB;
-    shdrs[5].sh_offset = shstrtab_off;
-    shdrs[5].sh_size = shstrtab_len;
-    shdrs[5].sh_addralign = 1;
+    /* 5: .rodata (kernel descriptors) */
+    shdrs[5].sh_name  = sn_rodata;
+    shdrs[5].sh_type  = SHT_PROGBITS;
+    shdrs[5].sh_flags = SHF_ALLOC;
+    shdrs[5].sh_addr  = rod_off;
+    shdrs[5].sh_offset = rod_off;
+    shdrs[5].sh_size  = rodata_len;
+    shdrs[5].sh_addralign = 64;
 
-    fwrite(shdrs, 64, num_sections, fp);
+    /* 6: .text */
+    shdrs[6].sh_name  = sn_text;
+    shdrs[6].sh_type  = SHT_PROGBITS;
+    shdrs[6].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    shdrs[6].sh_addr  = text_va;
+    shdrs[6].sh_offset = text_off;
+    shdrs[6].sh_size  = text_size;
+    shdrs[6].sh_addralign = 256;
+
+    /* 7: .dynamic */
+    shdrs[7].sh_name  = sn_dynamic;
+    shdrs[7].sh_type  = SHT_DYNAMIC;
+    shdrs[7].sh_flags = SHF_ALLOC | SHF_WRITE;
+    shdrs[7].sh_addr  = dyn_va;
+    shdrs[7].sh_offset = dyn_off;
+    shdrs[7].sh_size  = dyn_size;
+    shdrs[7].sh_link  = 4;  /* .dynstr */
+    shdrs[7].sh_addralign = 8;
+    shdrs[7].sh_entsize = 16;
+
+    /* 8: .symtab (non-loaded) */
+    shdrs[8].sh_name  = sn_symtab;
+    shdrs[8].sh_type  = SHT_SYMTAB;
+    shdrs[8].sh_offset = sym_off;
+    shdrs[8].sh_size  = sym_size;
+    shdrs[8].sh_link  = 9;  /* .strtab */
+    shdrs[8].sh_info  = 1;
+    shdrs[8].sh_addralign = 8;
+    shdrs[8].sh_entsize = 24;
+
+    /* 9: .strtab */
+    shdrs[9].sh_name  = sn_strtab;
+    shdrs[9].sh_type  = SHT_STRTAB;
+    shdrs[9].sh_offset = str_off;
+    shdrs[9].sh_size  = strtab_len;
+    shdrs[9].sh_addralign = 1;
+
+    /* 10: .shstrtab */
+    shdrs[10].sh_name  = sn_shstrtab;
+    shdrs[10].sh_type  = SHT_STRTAB;
+    shdrs[10].sh_offset = shs_off;
+    shdrs[10].sh_size  = shstrtab_len;
+    shdrs[10].sh_addralign = 1;
+
+    /* 11: .debug_bc (non-loaded debug section) */
+    shdrs[11].sh_name  = sn_dbgbc;
+    shdrs[11].sh_type  = SHT_PROGBITS;
+    shdrs[11].sh_offset = dbc_off;
+    shdrs[11].sh_size  = dbc_len;
+    shdrs[11].sh_addralign = 4;
+
+    fwrite(shdrs, 64, 12, fp);
 
     fclose(fp);
 
