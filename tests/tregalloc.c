@@ -50,7 +50,7 @@ static int max_reg_count(const char *buf, const char *field)
 
 /* Compare MOV counts and register usage between graph coloring and
  * linear scan.  Returns 0 if GC is no worse than LS, -1 on regression. */
-static int compare_regalloc(const char *cu, const char *extra)
+static int cmp_ra(const char *cu, const char *extra)
 {
     char cmd[TH_BUFSZ];
     int rc;
@@ -109,7 +109,7 @@ static int compare_regalloc(const char *cu, const char *extra)
 
 #define RA_TEST(name, cu, extra) \
     static void name(void) { \
-        CHECK(compare_regalloc(cu, extra) == 0); \
+        CHECK(cmp_ra(cu, extra) == 0); \
         PASS(); \
     } \
     TH_REG("regalloc", name)

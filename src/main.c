@@ -190,9 +190,9 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--no-dce") == 0)
             no_dce = 1;
         else if (strcmp(argv[i], "--no-graphcolor") == 0)
-            amdgpu_force_linear_scan = 1;
+            amd_ra_lin = 1;
         else if (strcmp(argv[i], "--max-vgprs") == 0 && i + 1 < argc)
-            amdgpu_max_vgprs = atoi(argv[++i]);
+            amd_max_vgpr = atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;

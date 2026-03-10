@@ -254,7 +254,7 @@ static void expire_old(uint32_t point)
     RA.num_active = j;
 }
 
-static void rewrite_operands(amd_module_t *A, const mfunc_t *F)
+static void rw_ops(amd_module_t *A, const mfunc_t *F)
 {
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
         const mblock_t *MB = &A->mblocks[F->first_block + bi];
@@ -287,7 +287,7 @@ static void rewrite_operands(amd_module_t *A, const mfunc_t *F)
 }
 
 /* Dead copy elimination: kill MOVs where src == dst. */
-static void dead_copy_elim(amd_module_t *A, const mfunc_t *F)
+static void dce_copy(amd_module_t *A, const mfunc_t *F)
 {
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
         const mblock_t *MB = &A->mblocks[F->first_block + bi];
@@ -337,7 +337,7 @@ static void dead_copy_elim(amd_module_t *A, const mfunc_t *F)
     }
 }
 
-static void finalize_reg_counts(const amd_module_t *A, mfunc_t *F)
+static void fin_regs(const amd_module_t *A, mfunc_t *F)
 {
     if (F->num_sgprs == 0) F->num_sgprs = 1;
     if (F->num_vgprs == 0) F->num_vgprs = 1;
@@ -358,7 +358,7 @@ static void finalize_reg_counts(const amd_module_t *A, mfunc_t *F)
 
 /* ---- Linear Scan (fallback) ---- */
 
-static void regalloc_linear(amd_module_t *A, uint32_t mf_idx)
+static void ra_lin(amd_module_t *A, uint32_t mf_idx)
 {
     mfunc_t *F = &A->mfuncs[mf_idx];
 
@@ -439,9 +439,9 @@ static void regalloc_linear(amd_module_t *A, uint32_t mf_idx)
     /* Record usage for kernel descriptor */
     F->num_sgprs = RA.max_sgpr;
     F->num_vgprs = RA.max_vgpr;
-    finalize_reg_counts(A, F);
-    rewrite_operands(A, F);
-    dead_copy_elim(A, F);
+    fin_regs(A, F);
+    rw_ops(A, F);
+    dce_copy(A, F);
 }
 
 /* ---- Graph Coloring Register Allocation ---- */
@@ -611,7 +611,7 @@ static void ra_build_cfg(const amd_module_t *A, const mfunc_t *F)
      live_in[B]  = use[B] ∪ (live_out[B] − def[B])
      live_out[B] = ∪ { live_in[S] : S ∈ successors(B) }
    Iterates until fixpoint. */
-static void ra_compute_liveness(const amd_module_t *A, const mfunc_t *F,
+static void ra_cpliv(const amd_module_t *A, const mfunc_t *F,
                                 uint32_t nv)
 {
     uint32_t nb = F->num_blocks;
@@ -669,7 +669,7 @@ static void ra_compute_liveness(const amd_module_t *A, const mfunc_t *F,
     }
 }
 
-static void ra_build_ifg_from_liveness(const amd_module_t *A,
+static void ra_blifg(const amd_module_t *A,
                                        const mfunc_t *F,
                                        uint32_t nv)
 {
@@ -741,7 +741,7 @@ static void ra_build_ifg_from_liveness(const amd_module_t *A,
 
 }
 
-static void regalloc_graphcolor(amd_module_t *A, uint32_t mf_idx)
+static void ra_gc(amd_module_t *A, uint32_t mf_idx)
 {
     mfunc_t *F = &A->mfuncs[mf_idx];
     uint32_t max_iters = 4;
@@ -749,7 +749,7 @@ static void regalloc_graphcolor(amd_module_t *A, uint32_t mf_idx)
 
     if (F->num_blocks > RA_MAX_BLOCKS) {
         /* Too many blocks --fall back to linear scan */
-        regalloc_linear(A, mf_idx);
+        ra_lin(A, mf_idx);
         return;
     }
 
@@ -815,18 +815,18 @@ static void regalloc_graphcolor(amd_module_t *A, uint32_t mf_idx)
 
         /* --- Build CFG and compute per-block liveness --- */
         ra_build_cfg(A, F);
-        ra_compute_liveness(A, F, nv);
+        ra_cpliv(A, F, nv);
 
         /* --- Build interference graph from liveness --- */
-        ra_build_ifg_from_liveness(A, F, nv);
+        ra_blifg(A, F, nv);
 
         /* --- Compute K (available physical regs per file) --- */
         uint16_t sgpr_start = F->is_kernel ? F->first_alloc_sgpr : 0;
         if (sgpr_start < AMD_KERN_RESERVED_SGPR && F->is_kernel)
             sgpr_start = AMD_KERN_RESERVED_SGPR;
         uint32_t K_sgpr = (AMD_MAX_SGPRS > sgpr_start) ? AMD_MAX_SGPRS - sgpr_start : 0;
-        uint32_t K_vgpr = (amdgpu_max_vgprs > 0 && amdgpu_max_vgprs < AMD_MAX_VGPRS)
-                           ? (uint32_t)amdgpu_max_vgprs : AMD_MAX_VGPRS;
+        uint32_t K_vgpr = (amd_max_vgpr > 0 && amd_max_vgpr < AMD_MAX_VGPRS)
+                           ? (uint32_t)amd_max_vgpr : AMD_MAX_VGPRS;
 
         /* --- Copy coalescing (conservative, Briggs criterion) ---
            Only merge two non-interfering copy-related nodes if the
@@ -1285,26 +1285,26 @@ static void regalloc_graphcolor(amd_module_t *A, uint32_t mf_idx)
 
     if (!gc_success) {
         /* Spill iterations exhausted --fall back to linear scan */
-        regalloc_linear(A, mf_idx);
+        ra_lin(A, mf_idx);
         return;
     }
 
-    finalize_reg_counts(A, F);
-    rewrite_operands(A, F);
-    dead_copy_elim(A, F);
+    fin_regs(A, F);
+    rw_ops(A, F);
+    dce_copy(A, F);
 }
 
 /* Global flag: set by --no-graphcolor to force linear scan */
-int amdgpu_force_linear_scan = 0;
+int amd_ra_lin = 0;
 /* If non-zero, cap available VGPRs for regalloc (forces spills for testing) */
-int amdgpu_max_vgprs = 0;
+int amd_max_vgpr = 0;
 
-static void regalloc_function(amd_module_t *A, uint32_t mf_idx)
+static void ra_func(amd_module_t *A, uint32_t mf_idx)
 {
-    if (amdgpu_force_linear_scan || A->vreg_count > RA_MAX_NODES) {
-        regalloc_linear(A, mf_idx);
+    if (amd_ra_lin || A->vreg_count > RA_MAX_NODES) {
+        ra_lin(A, mf_idx);
     } else {
-        regalloc_graphcolor(A, mf_idx);
+        ra_gc(A, mf_idx);
     }
 }
 
@@ -1550,7 +1550,7 @@ void amdgpu_regalloc(amd_module_t *A)
 {
     amdgpu_phi_elim(A);
     for (uint32_t fi = 0; fi < A->num_mfuncs; fi++)
-        regalloc_function(A, fi);
+        ra_func(A, fi);
 }
 
 void amdgpu_emit_asm(const amd_module_t *amd, FILE *out)
