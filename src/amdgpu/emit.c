@@ -451,7 +451,7 @@ static void ra_lin(amd_module_t *A, uint32_t mf_idx)
 typedef struct {
     uint32_t vreg;
     uint32_t degree;
-    float    spill_cost;
+    uint32_t cost;
     uint16_t color;
     uint16_t alias;
     uint8_t  file;
@@ -783,7 +783,7 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
                             uint16_t nidx = (uint16_t)ra_num_nodes++;
                             ra_nodes[nidx].vreg = vr;
                             ra_nodes[nidx].degree = 0;
-                            ra_nodes[nidx].spill_cost = 1.0f;
+                            ra_nodes[nidx].cost = 1;
                             ra_nodes[nidx].color = 0xFFFF;
                             ra_nodes[nidx].alias = nidx;
                             ra_nodes[nidx].file = A->reg_file[vr];
@@ -791,7 +791,7 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
                             ra_nodes[nidx].in_graph = 1;
                             ra_vreg_to_node[vr] = nidx;
                         } else if (ra_vreg_to_node[vr] != 0xFFFF) {
-                            ra_nodes[ra_vreg_to_node[vr]].spill_cost += 1.0f;
+                            ra_nodes[ra_vreg_to_node[vr]].cost++;
                         }
                     }
                 }
@@ -904,7 +904,7 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
             if (ra_nodes[n].in_graph) nodes_left++;
         }
 
-        while (nodes_left > 0) {
+        for (uint32_t guard = 0; guard < RA_MAX_NODES && nodes_left > 0; guard++) {
             int found = 0;
             for (uint32_t n = 0; n < ra_num_nodes; n++) {
                 if (!ra_nodes[n].in_graph) continue;
@@ -926,20 +926,24 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
             }
 
             if (!found) {
-                /* No simplify candidate --pick lowest spill_cost/degree
+                /* No simplify candidate --pick lowest cost/degree
                    as potential spill (optimistic: it might still color).
                    Nodes with many uses are expensive to spill; nodes with
-                   high degree free the most neighbors when removed. */
+                   high degree free the most neighbors when removed.
+                   Compare via cross-multiply to stay integer:
+                     cost_n/(deg_n+1) < cost_best/(deg_best+1)
+                   ⟺ cost_n*(deg_best+1) < cost_best*(deg_n+1)  */
                 uint32_t best = 0;
-                float best_ratio = 1e30f;
+                uint32_t best_cost = 0, best_deg = 0;
                 int have_best = 0;
                 for (uint32_t n = 0; n < ra_num_nodes; n++) {
                     if (!ra_nodes[n].in_graph) continue;
-                    float ratio = ra_nodes[n].spill_cost
-                                / (float)(ra_nodes[n].degree + 1);
-                    if (!have_best || ratio < best_ratio) {
+                    uint32_t cn = ra_nodes[n].cost;
+                    uint32_t dn = ra_nodes[n].degree + 1;
+                    if (!have_best || cn * (best_deg + 1) < best_cost * dn) {
                         best = n;
-                        best_ratio = ratio;
+                        best_cost = cn;
+                        best_deg = ra_nodes[n].degree;
                         have_best = 1;
                     }
                 }
@@ -1084,79 +1088,77 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
                         }
                         if (has_use) {
                             uint32_t new_vr = A->vreg_count;
-                            if (new_vr < AMD_MAX_VREGS) {
+                            if (new_vr >= AMD_MAX_VREGS) continue;
+                            A->vreg_count++;
+
+                            if (spill_file[si] == 0 &&
+                                A->vreg_count < AMD_MAX_VREGS) {
+                                /* SGPR spill reload: scratch is vector memory,
+                                   so load into a temp VGPR then readfirstlane
+                                   into the SGPR.
+                                   scratch_load_dword vTmp, off, spill_off
+                                   v_readfirstlane_b32 sNew, vTmp */
+                                uint32_t vtmp = A->vreg_count;
+                                A->reg_file[vtmp] = 1; /* VGPR */
                                 A->vreg_count++;
 
-                                if (spill_file[si] == 0) {
-                                    /* SGPR spill reload: scratch is vector memory,
-                                       so load into a temp VGPR then readfirstlane
-                                       into the SGPR.
-                                       scratch_load_dword vTmp, off, spill_off
-                                       v_readfirstlane_b32 sNew, vTmp */
-                                    uint32_t vtmp = A->vreg_count;
-                                    if (vtmp >= AMD_MAX_VREGS) goto skip_reload;
-                                    A->reg_file[vtmp] = 1; /* VGPR */
-                                    A->vreg_count++;
+                                A->reg_file[new_vr] = 0; /* SGPR */
 
-                                    A->reg_file[new_vr] = 0; /* SGPR */
+                                for (uint8_t u = orig.num_defs;
+                                     u < orig.num_defs + orig.num_uses && u < MINST_MAX_OPS; u++) {
+                                    if (operand_vreg(&orig.operands[u]) == sv)
+                                        orig.operands[u].reg_num = (uint16_t)new_vr;
+                                }
 
-                                    for (uint8_t u = orig.num_defs;
-                                         u < orig.num_defs + orig.num_uses && u < MINST_MAX_OPS; u++) {
-                                        if (operand_vreg(&orig.operands[u]) == sv)
-                                            orig.operands[u].reg_num = (uint16_t)new_vr;
-                                    }
+                                /* scratch_load_dword vTmp */
+                                if (out_count < out_cap) {
+                                    minst_t *ld = &ra_output[out_count++];
+                                    memset(ld, 0, sizeof(minst_t));
+                                    ld->op = AMD_SCRATCH_LOAD_DWORD;
+                                    ld->num_defs = 1;
+                                    ld->num_uses = 2;
+                                    ld->operands[0].kind = MOP_VREG_V;
+                                    ld->operands[0].reg_num = (uint16_t)vtmp;
+                                    ld->operands[1].kind = MOP_IMM;
+                                    ld->operands[1].imm = 0;
+                                    ld->operands[2].kind = MOP_IMM;
+                                    ld->operands[2].imm = (int32_t)spill_off[si];
+                                }
+                                /* v_readfirstlane_b32 sNew, vTmp */
+                                if (out_count < out_cap) {
+                                    minst_t *rfl = &ra_output[out_count++];
+                                    memset(rfl, 0, sizeof(minst_t));
+                                    rfl->op = AMD_V_READFIRSTLANE_B32;
+                                    rfl->num_defs = 1;
+                                    rfl->num_uses = 1;
+                                    rfl->operands[0].kind = MOP_VREG_S;
+                                    rfl->operands[0].reg_num = (uint16_t)new_vr;
+                                    rfl->operands[1].kind = MOP_VREG_V;
+                                    rfl->operands[1].reg_num = (uint16_t)vtmp;
+                                }
+                            } else {
+                                A->reg_file[new_vr] = 1; /* VGPR */
 
-                                    /* scratch_load_dword vTmp */
-                                    if (out_count < out_cap) {
-                                        minst_t *ld = &ra_output[out_count++];
-                                        memset(ld, 0, sizeof(minst_t));
-                                        ld->op = AMD_SCRATCH_LOAD_DWORD;
-                                        ld->num_defs = 1;
-                                        ld->num_uses = 2;
-                                        ld->operands[0].kind = MOP_VREG_V;
-                                        ld->operands[0].reg_num = (uint16_t)vtmp;
-                                        ld->operands[1].kind = MOP_IMM;
-                                        ld->operands[1].imm = 0;
-                                        ld->operands[2].kind = MOP_IMM;
-                                        ld->operands[2].imm = (int32_t)spill_off[si];
-                                    }
-                                    /* v_readfirstlane_b32 sNew, vTmp */
-                                    if (out_count < out_cap) {
-                                        minst_t *rfl = &ra_output[out_count++];
-                                        memset(rfl, 0, sizeof(minst_t));
-                                        rfl->op = AMD_V_READFIRSTLANE_B32;
-                                        rfl->num_defs = 1;
-                                        rfl->num_uses = 1;
-                                        rfl->operands[0].kind = MOP_VREG_S;
-                                        rfl->operands[0].reg_num = (uint16_t)new_vr;
-                                        rfl->operands[1].kind = MOP_VREG_V;
-                                        rfl->operands[1].reg_num = (uint16_t)vtmp;
-                                    }
-                                } else {
-                                    A->reg_file[new_vr] = 1; /* VGPR */
+                                for (uint8_t u = orig.num_defs;
+                                     u < orig.num_defs + orig.num_uses && u < MINST_MAX_OPS; u++) {
+                                    if (operand_vreg(&orig.operands[u]) == sv)
+                                        orig.operands[u].reg_num = (uint16_t)new_vr;
+                                }
 
-                                    for (uint8_t u = orig.num_defs;
-                                         u < orig.num_defs + orig.num_uses && u < MINST_MAX_OPS; u++) {
-                                        if (operand_vreg(&orig.operands[u]) == sv)
-                                            orig.operands[u].reg_num = (uint16_t)new_vr;
-                                    }
-
-                                    if (out_count < out_cap) {
-                                        minst_t *ld = &ra_output[out_count++];
-                                        memset(ld, 0, sizeof(minst_t));
-                                        ld->op = AMD_SCRATCH_LOAD_DWORD;
-                                        ld->num_defs = 1;
-                                        ld->num_uses = 2;
-                                        ld->operands[0].kind = MOP_VREG_V;
-                                        ld->operands[0].reg_num = (uint16_t)new_vr;
-                                        ld->operands[1].kind = MOP_IMM;
-                                        ld->operands[1].imm = 0;
-                                        ld->operands[2].kind = MOP_IMM;
-                                        ld->operands[2].imm = (int32_t)spill_off[si];
-                                    }
+                                if (out_count < out_cap) {
+                                    minst_t *ld = &ra_output[out_count++];
+                                    memset(ld, 0, sizeof(minst_t));
+                                    ld->op = AMD_SCRATCH_LOAD_DWORD;
+                                    ld->num_defs = 1;
+                                    ld->num_uses = 2;
+                                    ld->operands[0].kind = MOP_VREG_V;
+                                    ld->operands[0].reg_num = (uint16_t)new_vr;
+                                    ld->operands[1].kind = MOP_IMM;
+                                    ld->operands[1].imm = 0;
+                                    ld->operands[2].kind = MOP_IMM;
+                                    ld->operands[2].imm = (int32_t)spill_off[si];
                                 }
                             }
-                            skip_reload:;
                         }
                     }
 
