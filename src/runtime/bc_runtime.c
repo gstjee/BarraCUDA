@@ -188,11 +188,19 @@ typedef struct {
     pfn_queue_load_write_idx_t  queue_load_write_idx;
     pfn_queue_store_write_idx_t queue_store_write_idx;
 
+    /* AMD memory pool extensions — because hsa_memory_allocate
+     * gives memory the scalar unit can't read on MI300X. Cheers AMD. */
+    pfn_amd_pool_alloc_t    amd_palloc;
+    pfn_amd_pool_free_t     amd_pfree;
+    pfn_amd_iterate_pools_t amd_ipools;
+    pfn_amd_pool_get_info_t amd_pinfo;
+
     /* Device state */
     hsa_agent_t  gpu_agent;
     hsa_queue_t *queue;
     hsa_region_t kernarg_region;
     hsa_region_t device_region;
+    hsa_amd_memory_pool_t kernarg_pool;  /* AMD pool: the one that works */
     int          initialized;
 
     /* ABEND fault diagnostics — heap-allocated (~37KB) */
@@ -257,6 +265,25 @@ static hsa_status_t find_device_cb(hsa_region_t region, void *data)
     D->region_get_info(region, HSA_REGION_INFO_GLOBAL_FLAGS, &flags);
     if (flags & HSA_REGION_FLAG_COARSE) {
         D->device_region = region;
+        return HSA_STATUS_INFO_BREAK;
+    }
+    return HSA_STATUS_SUCCESS;
+}
+
+/* ---- AMD Pool Discovery ---- */
+
+/* Find the kernarg pool the way HIP does it, not the way the HSA
+ * spec says to. The spec is a lovely work of fiction. */
+static hsa_status_t find_kpool_cb(hsa_amd_memory_pool_t pool, void *data)
+{
+    bc_device_impl_t *D = (bc_device_impl_t *)data;
+    uint32_t segment = 0;
+    D->amd_pinfo(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &segment);
+    if (segment != HSA_AMD_SEGMENT_GLOBAL) return HSA_STATUS_SUCCESS;
+    uint32_t flags = 0;
+    D->amd_pinfo(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags);
+    if (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG) {
+        D->kernarg_pool = pool;
         return HSA_STATUS_INFO_BREAK;
     }
     return HSA_STATUS_SUCCESS;
@@ -332,6 +359,10 @@ int bc_device_init(bc_device_t *dev)
     LOAD(exec_destroy,       "hsa_executable_destroy");
     LOAD(queue_load_write_idx,  "hsa_queue_load_write_index_relaxed");
     LOAD(queue_store_write_idx, "hsa_queue_store_write_index_relaxed");
+    LOAD(amd_palloc,  "hsa_amd_memory_pool_allocate");
+    LOAD(amd_pfree,   "hsa_amd_memory_pool_free");
+    LOAD(amd_ipools,  "hsa_amd_agent_iterate_memory_pools");
+    LOAD(amd_pinfo,   "hsa_amd_memory_pool_get_info");
 
     hsa_status_t st = D->hsa_init();
     if (st != HSA_STATUS_SUCCESS) {
@@ -366,6 +397,18 @@ int bc_device_init(bc_device_t *dev)
         dlclose(D->hsa_lib);
         return BC_RT_ERR_NO_MEM;
     }
+
+    /* AMD pool discovery — find kernarg pool the way HIP does it */
+    D->kernarg_pool.handle = 0;
+    D->amd_ipools(D->gpu_agent, find_kpool_cb, D);
+    if (D->kernarg_pool.handle == 0) {
+        fprintf(stderr, "bc_runtime: AMD kernarg pool not found\n");
+        D->hsa_shut_down();
+        dlclose(D->hsa_lib);
+        return BC_RT_ERR_NO_MEM;
+    }
+    fprintf(stderr, "bc_runtime: AMD kernarg pool found (handle=0x%lx)\n",
+            (unsigned long)D->kernarg_pool.handle);
 
     /* ABEND diagnostics — init before queue so we can hook the
      * queue error callback. Aperture violations are queue errors,
@@ -596,14 +639,14 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
     void *kernarg_buf = NULL;
     uint32_t alloc_sz = kern->kernarg_size;
     if (args_size > alloc_sz) alloc_sz = args_size;
-    st = D->mem_alloc(D->kernarg_region, alloc_sz, &kernarg_buf);
+    st = D->amd_palloc(D->kernarg_pool, alloc_sz, 0, &kernarg_buf);
     if (st != HSA_STATUS_SUCCESS || !kernarg_buf) {
-        fprintf(stderr, "bc_runtime: kernarg alloc failed (0x%x)\n", st);
+        fprintf(stderr, "bc_runtime: kernarg pool alloc failed (0x%x)\n", st);
         return BC_RT_ERR_HSA;
     }
 
     memset(kernarg_buf, 0, alloc_sz);
-    D->mem_copy(kernarg_buf, args, args_size);
+    memcpy(kernarg_buf, args, args_size);
 
     /* Update dispatch dims + kernarg snapshot for ABEND dump */
     if (D->abend) {
@@ -626,7 +669,7 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
     st = D->signal_create(1, 0, NULL, &signal);
     if (st != HSA_STATUS_SUCCESS) {
         fprintf(stderr, "bc_runtime: signal_create failed (0x%x)\n", st);
-        D->mem_free(kernarg_buf);
+        D->amd_pfree(kernarg_buf);
         return BC_RT_ERR_HSA;
     }
 
@@ -662,15 +705,6 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
         (HSA_FENCE_SCOPE_SYSTEM << HSA_PKT_HEADER_SCRELEASE)
     );
 
-    /* Dump raw packet for debugging */
-    {
-        uint64_t *raw = (uint64_t *)pkt;
-        fprintf(stderr, "AQL pkt @%p (64 bytes):\n", (void*)pkt);
-        fprintf(stderr, "  [00] %016lx  [08] %016lx\n", raw[0], raw[1]);
-        fprintf(stderr, "  [16] %016lx  [24] %016lx\n", raw[2], raw[3]);
-        fprintf(stderr, "  [32] %016lx  [40] %016lx\n", raw[4], raw[5]);
-        fprintf(stderr, "  [48] %016lx  [56] %016lx\n", raw[6], raw[7]);
-    }
     __atomic_store_n(&pkt->header, header, __ATOMIC_RELEASE);
 
     D->queue_store_write_idx(D->queue, idx + 1);
@@ -687,7 +721,7 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
      * set up an ab_ctx_t via ab_init/ab_snag can check A->faulted. */
 
     D->signal_destroy(signal);
-    D->mem_free(kernarg_buf);
+    D->amd_pfree(kernarg_buf);
 
     return BC_RT_OK;
 }
