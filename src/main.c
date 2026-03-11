@@ -106,6 +106,7 @@ int main(int argc, char *argv[])
     int no_dce = 0;
     int no_sched = 0;
     int no_pp = 0;
+    int snap_mode = 0;
     amd_target_t amd_target = AMD_TARGET_GFX1100;
     uint32_t     amd_elfm  = 0x41;       /* EF_AMDGPU_MACH for exact chip */
     const char  *amd_chip  = "gfx1100";  /* chip string for ELF metadata */
@@ -207,6 +208,8 @@ int main(int argc, char *argv[])
             amd_ra_lin = 1;
         else if (strcmp(argv[i], "--max-vgprs") == 0 && i + 1 < argc)
             amd_max_vgpr = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--snap") == 0)
+            snap_mode = 1;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -396,6 +399,7 @@ int main(int argc, char *argv[])
                     }
                     amd->target = amd_target;
                     amd->elf_mach = amd_elfm;
+                    amd->snap_mode = (uint8_t)snap_mode;
                     snprintf(amd->chip_name, sizeof(amd->chip_name),
                              "%s", amd_chip);
                     int arc = amdgpu_compile(bir_module, amd);

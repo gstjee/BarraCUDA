@@ -1156,8 +1156,10 @@ static void check_var_decl(sema_ctx_t *S, uint32_t node)
 
     uint32_t var_type = resolve_typespec(S, type_n, n->d.oper.flags);
 
+    /* Parser stores bracket-dimension count in d.oper.op */
+    int pdims = n->d.oper.op;
     uint32_t next = ND(S, name_n)->next_sibling;
-    if (next && ND(S, next)->type == AST_INT_LIT) {
+    if (pdims > 0 && next && ND(S, next)->type == AST_INT_LIT) {
         int64_t count = parse_int_value(S->src + ND(S, next)->d.text.offset,
                                         (int)ND(S, next)->d.text.len);
         uint32_t arr_t = st_array(S, var_type, (uint16_t)count);
@@ -1167,9 +1169,7 @@ static void check_var_decl(sema_ctx_t *S, uint32_t node)
         if (init_n) check_expr(S, init_n);
         return;
     }
-    if (next && ND(S, next)->type == AST_IDENT) {
-        /* Disambiguate arr[N] vs initializer: only treat as array size
-           when ident is an enum constant and base type isn't enum/struct */
+    if (pdims > 0 && next && ND(S, next)->type == AST_IDENT) {
         char aname[128];
         get_text(S, next, aname, sizeof(aname));
         const sema_sym_t *as = find_sym(S, aname);

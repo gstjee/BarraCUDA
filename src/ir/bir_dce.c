@@ -34,7 +34,7 @@ static int is_inline_block_ref(uint16_t op, uint8_t j)
 {
     switch (op) {
     case BIR_BR:      return j == 0;
-    case BIR_BR_COND: return j == 1 || j == 2;
+    case BIR_BR_COND: return j >= 1 && j <= 3;
     case BIR_SWITCH:  return j == 1;
     case BIR_PHI:     return j % 2 == 0;
     default:          return 0;

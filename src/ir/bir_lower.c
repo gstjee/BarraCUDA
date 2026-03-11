@@ -771,10 +771,17 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             return BIR_VAL_NONE;
         }
         if (s->is_alloca) {
-            /* Arrays decay to pointer — return alloca addr directly.
-             * Loading from an array alloca reads uninit scratch. */
+            /* Arrays and structs decay to pointer — return alloca addr
+             * directly.  Loading from an array alloca reads uninit
+             * scratch.  Loading a whole struct produces a bulk load
+             * that isel can't decompose into per-field dwords — the
+             * assignment path needs the pointer to fire its per-field
+             * copy decomposition.  Without this, fbank[slot] = site
+             * stores only field 0 and the rest read back as whatever
+             * the silicon had for breakfast. */
             if (s->type < L->M->num_types &&
-                L->M->types[s->type].kind == BIR_TYPE_ARRAY)
+                (L->M->types[s->type].kind == BIR_TYPE_ARRAY ||
+                 L->M->types[s->type].kind == BIR_TYPE_STRUCT))
                 return BIR_MAKE_VAL(s->ref);
             uint32_t inst = emit(L, BIR_LOAD, s->type, 1, 0);
             set_op(L, inst, 0, BIR_MAKE_VAL(s->ref));
@@ -985,10 +992,11 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             uint32_t lhs   = lower_expr(L, lhs_n);
             uint32_t rhs_b = new_block(L, "land.rhs");
             uint32_t end_b = new_block(L, "land.end");
-            uint32_t br    = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            uint32_t br    = emit(L, BIR_BR_COND, bir_type_void(L->M), 4, 0);
             set_op(L, br, 0, lhs);
             set_op(L, br, 1, rhs_b);
             set_op(L, br, 2, end_b);
+            set_op(L, br, 3, end_b);
             set_block(L, rhs_b);
             uint32_t rhs = lower_expr(L, rhs_n);
             uint32_t s1  = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
@@ -1015,10 +1023,11 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
             uint32_t lhs   = lower_expr(L, lhs_n);
             uint32_t rhs_b = new_block(L, "lor.rhs");
             uint32_t end_b = new_block(L, "lor.end");
-            uint32_t br    = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            uint32_t br    = emit(L, BIR_BR_COND, bir_type_void(L->M), 4, 0);
             set_op(L, br, 0, lhs);
             set_op(L, br, 1, end_b);  /* true → skip RHS */
             set_op(L, br, 2, rhs_b);  /* false → eval RHS */
+            set_op(L, br, 3, end_b);
             set_block(L, rhs_b);
             uint32_t rhs = lower_expr(L, rhs_n);
             uint32_t s1  = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
@@ -2013,13 +2022,17 @@ static uint32_t lower_lvalue(lower_t *L, uint32_t node)
         uint32_t pt = ref_type(L, obj_ptr);
         uint32_t st = ptr_inner(L, pt);
 
+        /* Preserve source address space: local alloca → private,
+         * global array element → global. Don't assume private —
+         * cells[i].mat needs a global load, not a scratch read. */
+        uint8_t src_as = L->M->types[pt].addrspace;
         for (int si = 0; si < L->nstructs; si++) {
             if (L->structs[si].bir_type != st) continue;
             for (int fi = 0; fi < L->structs[si].num_fields; fi++) {
                 if (strcmp(L->structs[si].field_names[fi], fname) != 0)
                     continue;
                 uint32_t ft  = L->structs[si].field_types[fi];
-                uint32_t fpt = bir_type_ptr(L->M, ft, BIR_AS_PRIVATE);
+                uint32_t fpt = bir_type_ptr(L->M, ft, src_as);
                 uint32_t idx = BIR_MAKE_CONST(bir_const_int(L->M,
                     bir_type_int(L->M, 32), fi));
                 uint32_t gep = emit(L, BIR_GEP, fpt, 2, 0);
@@ -2056,13 +2069,16 @@ static void lower_var_decl(lower_t *L, uint32_t node)
 
     uint32_t elem_t = resolve_type(L, type_n, n->d.oper.flags, n->cuda_flags);
 
-    /* Collect array dimensions: float a[16][16] → dims={16,16}, ndim=2 */
+    /* Collect array dimensions: float a[16][16] → dims={16,16}, ndim=2.
+     * Parser stores the bracket-dimension count in d.oper.op so we don't
+     * accidentally eat `int step = 4096` as `int step[4096]`. */
     uint32_t next = ND(L, name_n)->next_sibling;
     int is_array = 0;
     uint32_t dims[8];
     int ndim = 0;
+    int max_dims = n->d.oper.op;  /* how many [N] the parser saw */
 
-    while (next && ndim < 8) {
+    while (next && ndim < 8 && ndim < max_dims) {
         if (ND(L, next)->type == AST_INT_LIT) {
             dims[ndim++] = (uint32_t)parse_int_text(
                 L->src + ND(L, next)->d.text.offset,
@@ -2107,8 +2123,8 @@ static void lower_var_decl(lower_t *L, uint32_t node)
         uint32_t alloca = emit(L, BIR_ALLOCA, ptr_t, 0, 0);
         add_sym(L, name, alloca, arr_t, 1);
         /* Array initializer list: int arr[3] = {1, 2, 3}; */
-        uint32_t init_n = ND(L, next)->next_sibling;
-        if (init_n && ND(L, init_n)->type == AST_INIT_LIST) {
+        if (next && ND(L, next)->type == AST_INIT_LIST) {
+            uint32_t init_n = next;
             uint32_t ept = bir_type_ptr(L->M, elem_t, BIR_AS_PRIVATE);
             uint32_t el = ND(L, init_n)->first_child;
             uint32_t idx = 0;
@@ -2161,9 +2177,55 @@ static void lower_var_decl(lower_t *L, uint32_t node)
         }
     } else if (init_n && ND(L, init_n)->type != AST_NONE) {
         uint32_t init_v = lower_expr(L, init_n);
-        uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
-        set_op(L, st, 0, init_v);
-        set_op(L, st, 1, BIR_MAKE_VAL(alloca));
+
+        /* Struct copy from pointer: Part p = parts[tid];
+         * lower_expr returned a GEP (ptr to struct in global/shared),
+         * not the struct value. Field-by-field copy required, or we'd
+         * dump 8 bytes of raw pointer into the alloca and the remaining
+         * fields would contain whatever the silicon was dreaming about. */
+        uint32_t vt = ref_type(L, init_v);
+        int did_copy = 0;
+        if (is_ptr_type(L, vt) &&
+            elem_t < L->M->num_types &&
+            L->M->types[elem_t].kind == BIR_TYPE_STRUCT) {
+            struct_def_t *sd = NULL;
+            for (int si = 0; si < L->nstructs; si++) {
+                if (L->structs[si].bir_type == elem_t) {
+                    sd = &L->structs[si]; break;
+                }
+            }
+            if (sd) {
+                uint8_t src_as = L->M->types[vt].addrspace;
+                uint32_t t32 = bir_type_int(L->M, 32);
+                for (int fi = 0; fi < sd->num_fields && fi < 16; fi++) {
+                    uint32_t ci = BIR_MAKE_CONST(
+                        bir_const_int(L->M, t32, fi));
+                    uint32_t spt = bir_type_ptr(L->M,
+                        sd->field_types[fi], src_as);
+                    uint32_t sg = emit(L, BIR_GEP, spt, 2, 0);
+                    set_op(L, sg, 0, init_v);
+                    set_op(L, sg, 1, ci);
+                    uint32_t ld = emit(L, BIR_LOAD,
+                        sd->field_types[fi], 1, 0);
+                    set_op(L, ld, 0, BIR_MAKE_VAL(sg));
+                    uint32_t dpt = bir_type_ptr(L->M,
+                        sd->field_types[fi], BIR_AS_PRIVATE);
+                    uint32_t dg = emit(L, BIR_GEP, dpt, 2, 0);
+                    set_op(L, dg, 0, BIR_MAKE_VAL(alloca));
+                    set_op(L, dg, 1, ci);
+                    uint32_t s = emit(L, BIR_STORE,
+                        bir_type_void(L->M), 2, 0);
+                    set_op(L, s, 0, BIR_MAKE_VAL(ld));
+                    set_op(L, s, 1, BIR_MAKE_VAL(dg));
+                }
+                did_copy = 1;
+            }
+        }
+        if (!did_copy) {
+            uint32_t st = emit(L, BIR_STORE, bir_type_void(L->M), 2, 0);
+            set_op(L, st, 0, init_v);
+            set_op(L, st, 1, BIR_MAKE_VAL(alloca));
+        }
     }
 }
 
@@ -2211,10 +2273,11 @@ static void lower_stmt(lower_t *L, uint32_t node)
         uint32_t else_b = else_n ? new_block(L, "if.else") : 0;
         uint32_t end_b  = new_block(L, "if.end");
 
-        uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+        uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 4, 0);
         set_op(L, br, 0, cond);
         set_op(L, br, 1, then_b);
         set_op(L, br, 2, else_n ? else_b : end_b);
+        set_op(L, br, 3, end_b);
 
         /* Then */
         set_block(L, then_b);
@@ -2275,10 +2338,11 @@ static void lower_stmt(lower_t *L, uint32_t node)
         set_block(L, cond_b);
         if (cond_n && ND(L, cond_n)->type != AST_NONE) {
             uint32_t cv = lower_expr(L, cond_n);
-            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 4, 0);
             set_op(L, br, 0, cv);
             set_op(L, br, 1, body_b);
             set_op(L, br, 2, end_b);
+            set_op(L, br, 3, end_b);
         } else {
             /* Infinite loop: for(;;) */
             uint32_t br = emit(L, BIR_BR, bir_type_void(L->M), 1, 0);
@@ -2330,10 +2394,11 @@ static void lower_stmt(lower_t *L, uint32_t node)
         set_block(L, cond_b);
         {
             uint32_t cv = lower_expr(L, cond_n);
-            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 4, 0);
             set_op(L, br, 0, cv);
             set_op(L, br, 1, body_b);
             set_op(L, br, 2, end_b);
+            set_op(L, br, 3, end_b);
         }
 
         set_block(L, body_b);
@@ -2377,10 +2442,11 @@ static void lower_stmt(lower_t *L, uint32_t node)
         set_block(L, cond_b);
         {
             uint32_t cv = lower_expr(L, cond_n);
-            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 3, 0);
+            uint32_t br = emit(L, BIR_BR_COND, bir_type_void(L->M), 4, 0);
             set_op(L, br, 0, cv);
             set_op(L, br, 1, body_b);
             set_op(L, br, 2, end_b);
+            set_op(L, br, 3, end_b);
         }
 
         if (L->loop_depth > 0) L->loop_depth--;
@@ -2748,14 +2814,18 @@ static void collect_struct(lower_t *L, uint32_t node)
                     extra = ND(L, extra)->next_sibling;
                 }
 
-                /* Check for chained var_decl siblings (different types) */
+                /* Check for chained var_decl siblings (different types).
+                 * Each has its own type_spec — resolve it, or we'd
+                 * paint every field the same colour as the first. */
                 uint32_t chain = ND(L, member)->next_sibling;
                 while (chain && ND(L, chain)->type == AST_VAR_DECL) {
-                    uint32_t cft = ND(L, chain)->first_child;
-                    uint32_t cfn = cft ? ND(L, cft)->next_sibling : 0;
+                    uint32_t cft_n = ND(L, chain)->first_child;
+                    uint32_t cfn = cft_n ? ND(L, cft_n)->next_sibling : 0;
                     if (cfn && ND(L, cfn)->type == AST_IDENT
                         && sd->num_fields < 16) {
-                        sd->field_types[sd->num_fields] = ft;
+                        uint32_t cft = resolve_type(L, cft_n,
+                            ND(L, chain)->d.oper.flags, 0);
+                        sd->field_types[sd->num_fields] = cft;
                         get_text(L, cfn, sd->field_names[sd->num_fields],
                                  sizeof(sd->field_names[0]));
                         sd->num_fields++;

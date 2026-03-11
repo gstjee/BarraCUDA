@@ -4,6 +4,7 @@
 #ifdef __linux__
 
 #include "bc_runtime.h"
+#include "bc_abend.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -23,7 +24,15 @@ typedef struct { uint64_t handle; } hsa_executable_t;
 typedef struct { uint64_t handle; } hsa_executable_symbol_t;
 typedef struct { uint64_t handle; } hsa_code_object_reader_t;
 typedef struct { uint64_t handle; } hsa_loaded_code_object_t;
+typedef struct { uint64_t handle; } hsa_amd_memory_pool_t;
 typedef int64_t hsa_signal_value_t;
+
+/* AMD memory pool constants */
+#define HSA_AMD_SEGMENT_GLOBAL                    0
+#define HSA_AMD_MEMORY_POOL_INFO_SEGMENT          0
+#define HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS     1
+#define HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG   1
+#define HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE      2
 
 /* HSA queue — layout must match ABI exactly */
 typedef struct {
@@ -138,6 +147,15 @@ typedef uint64_t (*pfn_queue_load_write_idx_t)(const hsa_queue_t*);
 typedef void (*pfn_queue_store_write_idx_t)(
     const hsa_queue_t*, uint64_t);
 
+/* AMD memory pool extensions */
+typedef hsa_status_t (*pfn_amd_pool_alloc_t)(
+    hsa_amd_memory_pool_t, size_t, uint32_t, void**);
+typedef hsa_status_t (*pfn_amd_pool_free_t)(void*);
+typedef hsa_status_t (*pfn_amd_iterate_pools_t)(
+    hsa_agent_t, hsa_status_t(*)(hsa_amd_memory_pool_t, void*), void*);
+typedef hsa_status_t (*pfn_amd_pool_get_info_t)(
+    hsa_amd_memory_pool_t, uint32_t, void*);
+
 /* ---- Internal Device Structure ---- */
 
 typedef struct {
@@ -176,6 +194,9 @@ typedef struct {
     hsa_region_t kernarg_region;
     hsa_region_t device_region;
     int          initialized;
+
+    /* ABEND fault diagnostics — heap-allocated (~37KB) */
+    ab_ctx_t    *abend;
 } bc_device_impl_t;
 
 _Static_assert(sizeof(bc_device_impl_t) <= BC_DEVICE_OPAQUE_SIZE,
@@ -239,6 +260,35 @@ static hsa_status_t find_device_cb(hsa_region_t region, void *data)
         return HSA_STATUS_INFO_BREAK;
     }
     return HSA_STATUS_SUCCESS;
+}
+
+/* ---- Queue Error Callback ---- */
+
+/* Called by HSA when the queue faults — aperture violations, invalid
+ * packets, the usual GPU misdemeanours. Maps HSA status to an ABEND
+ * code and fires the dump. This is where the magic happens. */
+static void bc_qerr(hsa_status_t status, hsa_queue_t *source, void *data)
+{
+    (void)source;
+    ab_ctx_t *A = (ab_ctx_t *)data;
+    if (!A) return;
+
+    /* Map HSA queue error to ABEND code.
+     * HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION = 41 (0x29)
+     * HSA_STATUS_ERROR_MEMORY_FAULT = 43 (0x2B) */
+    uint16_t code = AB_G0FF;
+    if (status == 41)       /* MEMORY_APERTURE_VIOLATION */
+        code = AB_G0C5;
+    else if (status == 43)  /* MEMORY_FAULT */
+        code = AB_G0C4;
+    else if (status == 42)  /* ILLEGAL_INSTRUCTION */
+        code = AB_G0C1;
+
+    A->code = code;
+    A->reason = (uint32_t)status;
+    A->faulted = 1;
+
+    ab_dump(A, stderr);
 }
 
 /* ---- Init / Shutdown ---- */
@@ -317,13 +367,21 @@ int bc_device_init(bc_device_t *dev)
         return BC_RT_ERR_NO_MEM;
     }
 
+    /* ABEND diagnostics — init before queue so we can hook the
+     * queue error callback. Aperture violations are queue errors,
+     * not VM faults, so the system event handler alone won't catch them. */
+    D->abend = (ab_ctx_t *)calloc(1, sizeof(ab_ctx_t));
+    if (D->abend)
+        ab_init(D->abend, D->hsa_lib);
+
     uint32_t queue_size = 0;
     D->agent_get_info(D->gpu_agent, HSA_AGENT_INFO_QUEUE_MAX_SIZE,
                       &queue_size);
     if (queue_size == 0) queue_size = 128;
 
     st = D->queue_create(D->gpu_agent, queue_size, HSA_QUEUE_TYPE_SINGLE,
-                         NULL, NULL, UINT32_MAX, UINT32_MAX, &D->queue);
+                         bc_qerr, D->abend, UINT32_MAX, UINT32_MAX,
+                         &D->queue);
     if (st != HSA_STATUS_SUCCESS) {
         fprintf(stderr, "bc_runtime: queue_create failed (0x%x)\n", st);
         D->hsa_shut_down();
@@ -332,6 +390,7 @@ int bc_device_init(bc_device_t *dev)
     }
 
     D->initialized = 1;
+
     fprintf(stderr, "bc_runtime: GPU ready, queue size %u\n", queue_size);
     return BC_RT_OK;
 }
@@ -341,6 +400,7 @@ void bc_device_shutdown(bc_device_t *dev)
     bc_device_impl_t *D = D_of(dev);
     if (!D->initialized) return;
 
+    if (D->abend) { ab_shut(D->abend); free(D->abend); }
     if (D->queue)    D->queue_destroy(D->queue);
     D->hsa_shut_down();
     if (D->hsa_lib)  dlclose(D->hsa_lib);
@@ -434,6 +494,15 @@ int bc_load_kernel(bc_device_t *dev, const char *hsaco_path,
     out->_exec = exec.handle;
     out->_reader = reader.handle;
 
+    /* Load source map and stash kernel name for ABEND dumps */
+    if (D->abend) {
+        ab_slod(D->abend, hsaco_buf, (uint32_t)n);
+        /* Pre-fill dispatch context with kernel info so the dump
+         * has something useful even if ab_snag hasn't been called */
+        ab_snag(D->abend, out, kernel_name, "gfx942",
+                0, 0, 0, 0, 0, 0, NULL, 0);
+    }
+
     fprintf(stderr, "bc_runtime: loaded '%s' (kernarg=%u, lds=%u, "
             "scratch=%u)\n", kernel_name, out->kernarg_size,
             out->group_size, out->private_size);
@@ -476,6 +545,15 @@ void bc_free(bc_device_t *dev, void *ptr)
     D->mem_free(ptr);
 }
 
+void bc_trak(bc_device_t *dev, void *ptr, size_t size,
+             const char *label, int flags)
+{
+    bc_device_impl_t *D = D_of(dev);
+    if (D->abend)
+        ab_trak(D->abend, (uint64_t)(uintptr_t)ptr,
+                (uint64_t)size, label, (uint8_t)flags);
+}
+
 int bc_copy_h2d(bc_device_t *dev, void *dst, const void *src, size_t size)
 {
     bc_device_impl_t *D = D_of(dev);
@@ -516,16 +594,33 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
     if (block_z == 0) block_z = 1;
 
     void *kernarg_buf = NULL;
-    st = D->mem_alloc(D->kernarg_region, kern->kernarg_size, &kernarg_buf);
+    uint32_t alloc_sz = kern->kernarg_size;
+    if (args_size > alloc_sz) alloc_sz = args_size;
+    st = D->mem_alloc(D->kernarg_region, alloc_sz, &kernarg_buf);
     if (st != HSA_STATUS_SUCCESS || !kernarg_buf) {
         fprintf(stderr, "bc_runtime: kernarg alloc failed (0x%x)\n", st);
         return BC_RT_ERR_HSA;
     }
 
-    uint32_t copy_size = args_size;
-    if (copy_size > kern->kernarg_size) copy_size = kern->kernarg_size;
-    memset(kernarg_buf, 0, kern->kernarg_size);
-    memcpy(kernarg_buf, args, copy_size);
+    memset(kernarg_buf, 0, alloc_sz);
+    D->mem_copy(kernarg_buf, args, args_size);
+
+    /* Update dispatch dims + kernarg snapshot for ABEND dump */
+    if (D->abend) {
+        D->abend->dctx.grid[0] = grid_x;
+        D->abend->dctx.grid[1] = grid_y;
+        D->abend->dctx.grid[2] = grid_z;
+        D->abend->dctx.block[0] = block_x;
+        D->abend->dctx.block[1] = block_y;
+        D->abend->dctx.block[2] = block_z;
+        if (args && args_size > 0) {
+            uint32_t snap = args_size;
+            if (snap > sizeof(D->abend->args_snap))
+                snap = (uint32_t)sizeof(D->abend->args_snap);
+            memcpy(D->abend->args_snap, args, snap);
+            D->abend->dctx.args_sz = snap;
+        }
+    }
 
     hsa_signal_t signal;
     st = D->signal_create(1, 0, NULL, &signal);
@@ -567,6 +662,15 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
         (HSA_FENCE_SCOPE_SYSTEM << HSA_PKT_HEADER_SCRELEASE)
     );
 
+    /* Dump raw packet for debugging */
+    {
+        uint64_t *raw = (uint64_t *)pkt;
+        fprintf(stderr, "AQL pkt @%p (64 bytes):\n", (void*)pkt);
+        fprintf(stderr, "  [00] %016lx  [08] %016lx\n", raw[0], raw[1]);
+        fprintf(stderr, "  [16] %016lx  [24] %016lx\n", raw[2], raw[3]);
+        fprintf(stderr, "  [32] %016lx  [40] %016lx\n", raw[4], raw[5]);
+        fprintf(stderr, "  [48] %016lx  [56] %016lx\n", raw[6], raw[7]);
+    }
     __atomic_store_n(&pkt->header, header, __ATOMIC_RELEASE);
 
     D->queue_store_write_idx(D->queue, idx + 1);
@@ -620,6 +724,10 @@ void *bc_alloc(bc_device_t *dev, size_t size)
 
 void bc_free(bc_device_t *dev, void *ptr)
 { (void)dev; (void)ptr; }
+
+void bc_trak(bc_device_t *dev, void *ptr, size_t size,
+             const char *label, int flags)
+{ (void)dev; (void)ptr; (void)size; (void)label; (void)flags; }
 
 int bc_copy_h2d(bc_device_t *dev, void *dst, const void *src, size_t size)
 { (void)dev; (void)dst; (void)src; (void)size; return BC_RT_ERR_DLOPEN; }

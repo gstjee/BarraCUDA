@@ -836,7 +836,7 @@ static void step7_compact(m2r_t *S)
                 case BIR_BR:
                     is_block_ref = (j == 0); break;
                 case BIR_BR_COND:
-                    is_block_ref = (j == 1 || j == 2); break;
+                    is_block_ref = (j >= 1 && j <= 3); break;
                 case BIR_SWITCH:
                     is_block_ref = (j == 1); break;
                 case BIR_PHI:

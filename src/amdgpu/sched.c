@@ -21,6 +21,7 @@
 #define SCHED_LATENCY_SMEM  20
 #define SCHED_LATENCY_DS    4
 #define SCHED_LATENCY_ALU   1
+#define SCHED_MAX_SMEM_FLY  10     /* GFX942: >11 outstanding SMEM → fault */
 
 /* Wait kind tags */
 #define WAIT_VMEM  0
@@ -71,6 +72,13 @@ static uint16_t      s_barrier_pos[SCHED_MAX_BARRIERS];
 static uint16_t      s_num_barriers;
 static minst_t       s_output[AMD_MAX_MINSTS];
 
+/* Per-VGPR VMEM pending-write tracker.  Turns out "is this
+ * a load" is the wrong question when 200 of them are in the
+ * post simultaneously.  The right question is "has this
+ * particular register arrived yet."  Wisdom is retrospective. */
+static uint8_t       s_vmem_pending[AMD_MAX_VREGS];
+static uint8_t       s_has_vmem_store;  /* VMEM store in flight */
+
 /* ---- Instruction classification ---- */
 
 static int is_wait_op(uint16_t op)
@@ -96,10 +104,37 @@ static int is_pseudo_start(uint16_t op)
            op == AMD_PSEUDO_DEF;
 }
 
-static int is_global_load(uint16_t op)
+/* Atomic opcodes must stay contiguous in amd_op_t.  If you
+ * rearrange the enum the range check quietly stops working
+ * and you get to explain to someone why their atomics return
+ * feelings instead of values.  This catches it at compile time. */
+typedef char sched_assert_atomics_contiguous_[
+    (AMD_GLOBAL_ATOMIC_CMPSWAP - AMD_GLOBAL_ATOMIC_ADD == 8) ? 1 : -1
+];
+
+static int is_vmem_write(uint16_t op)
 {
-    return op == AMD_GLOBAL_LOAD_DWORD || op == AMD_GLOBAL_LOAD_DWORDX2 ||
-           op == AMD_SCRATCH_LOAD_DWORD || op == AMD_FLAT_LOAD_DWORD;
+    /* Anything that writes a VGPR through the VMEM pipe.
+     * Classified by pipeline behaviour, not by an opcode list
+     * that someone has to remember to update.  Memory is short
+     * and schedules are long. */
+    if (op == AMD_GLOBAL_LOAD_DWORD || op == AMD_GLOBAL_LOAD_DWORDX2)
+        return 1;
+    if (op == AMD_SCRATCH_LOAD_DWORD || op == AMD_FLAT_LOAD_DWORD)
+        return 1;
+    /* Atomic-with-return: contiguous range (guarded above) */
+    if (op >= AMD_GLOBAL_ATOMIC_ADD && op <= AMD_GLOBAL_ATOMIC_CMPSWAP)
+        return 1;
+    return 0;
+}
+
+static int is_vmem_store(uint16_t op)
+{
+    /* Stores don't write VGPRs but they do occupy the VMEM pipe.
+     * A load that arrives before the store commits reads whatever
+     * was there previously, which is never what you wanted. */
+    return op == AMD_GLOBAL_STORE_DWORD || op == AMD_GLOBAL_STORE_DWORDX2 ||
+           op == AMD_SCRATCH_STORE_DWORD || op == AMD_FLAT_STORE_DWORD;
 }
 
 static int is_scalar_load(uint16_t op)
@@ -140,7 +175,7 @@ static int sop2_writes_scc(uint16_t op)
 
 static uint32_t inst_latency(uint16_t op)
 {
-    if (is_global_load(op))  return SCHED_LATENCY_VMEM;
+    if (is_vmem_write(op))   return SCHED_LATENCY_VMEM;
     if (is_scalar_load(op))  return SCHED_LATENCY_SMEM;
     if (is_ds_load(op))      return SCHED_LATENCY_DS;
     return SCHED_LATENCY_ALU;
@@ -148,7 +183,7 @@ static uint32_t inst_latency(uint16_t op)
 
 static uint8_t load_wait_kind(uint16_t op)
 {
-    if (is_global_load(op))  return WAIT_VMEM;
+    if (is_vmem_write(op))   return WAIT_VMEM;
     if (is_scalar_load(op))  return WAIT_SMEM;
     return WAIT_DS;
 }
@@ -247,7 +282,7 @@ static int build_dag(uint16_t n)
         nd->epoch = cur_epoch;
         nd->deps_overflow = 0;
 
-        if (is_global_load(op) || is_scalar_load(op) || is_ds_load(op)) {
+        if (is_vmem_write(op) || is_scalar_load(op) || is_ds_load(op)) {
             nd->is_load = 1;
             nd->wait_kind = load_wait_kind(op);
         }
@@ -559,7 +594,10 @@ static uint32_t schedule_block(const minst_t *insts, uint32_t n,
     }
 
     memset(s_load_waited, 0, (size_t)sn);
+    memset(s_vmem_pending, 0, sizeof(s_vmem_pending));
+    s_has_vmem_store = 0;
     uint16_t fn = 0;
+    uint16_t smem_fly = 0;
 
     for (uint16_t i = 0; i < out; i++) {
         const minst_t *mi = &s_scheduled[i];
@@ -568,17 +606,28 @@ static uint32_t schedule_block(const minst_t *insts, uint32_t n,
         uint8_t needs_wait[3] = {0, 0, 0};
         uint8_t total_ops = mi->num_defs + mi->num_uses;
 
-        /* CDNA flat scratch: fence preceding stores before private load.
-         * Flat stores are async -- the private aperture can't snoop
-         * the write buffer, so we must drain vmcnt first. */
-        if (mi->op == AMD_FLAT_LOAD_DWORD)
+        /* ---- Store-to-load ordering ----
+         * Scratch stores are async.  A scratch load issued after
+         * a store can arrive first, like a letter posted Tuesday
+         * arriving before Monday's.  Royal Mail would be proud.
+         * Only wait when there's actually a store outstanding. */
+        if ((mi->op == AMD_FLAT_LOAD_DWORD ||
+             mi->op == AMD_SCRATCH_LOAD_DWORD) && s_has_vmem_store)
             needs_wait[WAIT_VMEM] = 1;
 
+        /* ---- Per-VGPR RAW hazard check ----
+         * If a source register is still waiting on VMEM, reading
+         * it now gets you whatever was in there before.  Quite
+         * rude of the hardware, but there it is. */
         for (uint8_t u = mi->num_defs; u < total_ops; u++) {
             const moperand_t *mop = &mi->operands[u];
             if (!is_trackable(mop)) continue;
             uint32_t k = op_key(mop);
             if (k < AMD_MAX_VREGS) {
+                /* Has this register's post arrived yet? */
+                if (s_vmem_pending[k])
+                    needs_wait[WAIT_VMEM] = 1;
+                /* Also check the per-load tracker for good measure */
                 uint16_t li = s_vreg_load[k];
                 if (li != 0xFFFF && !s_load_waited[li]) {
                     needs_wait[s_nodes[li].wait_kind] = 1;
@@ -589,6 +638,8 @@ static uint32_t schedule_block(const minst_t *insts, uint32_t n,
             if (mop->kind == MOP_SGPR) {
                 uint32_t k2 = PHYS_SGPR_KEY(mop->reg_num + 1);
                 if (k2 < AMD_MAX_VREGS) {
+                    if (s_vmem_pending[k2])
+                        needs_wait[WAIT_VMEM] = 1;
                     uint16_t li2 = s_vreg_load[k2];
                     if (li2 != 0xFFFF && !s_load_waited[li2]) {
                         needs_wait[s_nodes[li2].wait_kind] = 1;
@@ -599,10 +650,14 @@ static uint32_t schedule_block(const minst_t *insts, uint32_t n,
         }
 
         if (orig < sn && s_nodes[orig].is_barrier) {
-            for (uint16_t j = 0; j < sn; j++) {
-                if (s_nodes[j].is_load && !s_load_waited[j]) {
-                    needs_wait[s_nodes[j].wait_kind] = 1;
-                    s_load_waited[j] = 1;
+            /* Only wait on loads already emitted — same principle as
+             * the regular wait handler below.  Marking future loads
+             * as waited caused missing vmcnt after exec restores. */
+            for (uint16_t p = 0; p < i; p++) {
+                uint16_t oi = s_order[p];
+                if (oi < sn && s_nodes[oi].is_load && !s_load_waited[oi]) {
+                    needs_wait[s_nodes[oi].wait_kind] = 1;
+                    s_load_waited[oi] = 1;
                 }
             }
         }
@@ -610,10 +665,14 @@ static uint32_t schedule_block(const minst_t *insts, uint32_t n,
         for (int k = 0; k < 3; k++) {
             if (needs_wait[k]) {
                 fn = emit_wait(fn, k, target);
-                /* s_waitcnt/s_wait_*cnt(0) retires ALL outstanding loads
-                 * of this kind that were issued before this point. Only
-                 * mark loads already emitted -- future loads in the
-                 * scheduled order haven't been issued yet. */
+                if (k == WAIT_SMEM) smem_fly = 0;
+                /* vmcnt(0): everything in the VMEM pipe retires.
+                 * Clean slate.  Almost therapeutic. */
+                if (k == WAIT_VMEM) {
+                    memset(s_vmem_pending, 0, sizeof(s_vmem_pending));
+                    s_has_vmem_store = 0;
+                }
+                /* Mark loads already emitted as waited */
                 for (uint16_t p = 0; p < i; p++) {
                     uint16_t oi = s_order[p];
                     if (oi < sn && s_nodes[oi].is_load &&
@@ -625,6 +684,37 @@ static uint32_t schedule_block(const minst_t *insts, uint32_t n,
 
         if (fn >= SCHED_MAX_BLOCK * 2) return 0;
         s_final[fn++] = *mi;
+
+        /* Note which VGPRs this instruction owes us.
+         * We'll collect when someone tries to read them. */
+        if (is_vmem_write(mi->op)) {
+            for (uint8_t d = 0; d < mi->num_defs; d++) {
+                if (is_trackable(&mi->operands[d])) {
+                    uint32_t k = op_key(&mi->operands[d]);
+                    if (k < AMD_MAX_VREGS)
+                        s_vmem_pending[k] = 1;
+                }
+            }
+        }
+        if (is_vmem_store(mi->op))
+            s_has_vmem_store = 1;
+
+        /* GFX942 errata: >11 outstanding SMEM loads causes
+         * MEMORY_APERTURE_VIOLATION. Drain periodically. */
+        if (orig < sn && s_nodes[orig].is_load &&
+            s_nodes[orig].wait_kind == WAIT_SMEM) {
+            smem_fly++;
+            if (smem_fly >= SCHED_MAX_SMEM_FLY) {
+                fn = emit_wait(fn, WAIT_SMEM, target);
+                smem_fly = 0;
+                for (uint16_t p = 0; p <= i; p++) {
+                    uint16_t oi = s_order[p];
+                    if (oi < sn && s_nodes[oi].is_load &&
+                        s_nodes[oi].wait_kind == WAIT_SMEM)
+                        s_load_waited[oi] = 1;
+                }
+            }
+        }
     }
 
     /* Trailing waits: loads consumed in successor blocks */

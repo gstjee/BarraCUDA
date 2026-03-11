@@ -25,7 +25,6 @@ static struct {
     /* Scratch offset tracking */
     uint32_t        scratch_offset;
     uint8_t         has_scratch;    /* BIR pre-scan: function uses alloca */
-    uint16_t        sgpr_priv;      /* CDNA: SGPR pair for src_private_base */
 
     /* LDS (shared memory) offset tracking */
     uint32_t        lds_offset;
@@ -46,14 +45,14 @@ static struct {
         uint32_t saved_vreg;    /* virtual SGPR holding saved EXEC */
         uint32_t false_bir;     /* BIR block for else path */
         uint32_t merge_bir;     /* BIR block for merge (post-dominator) */
+        uint32_t cond_bir;      /* BIR block where saveexec lives (loop header) */
         int      has_else;      /* 1 = diamond (then + else), 0 = triangle */
+        int      in_then;       /* 1 = then-region, 0 = else-region */
     } div_stack[MAX_DIV_REGIONS];
     uint32_t        div_depth;
 
-    /* Branch suppression for divergent diamonds: then-block's BR to merge
-       gets suppressed so it falls through to the else-block. */
-    uint32_t        suppress_src;   /* BIR block whose BR to suppress */
-    uint32_t        suppress_dst;   /* target BIR block of the suppressed BR */
+    /* Current machine block index (for fallthrough detection) */
+    uint32_t        current_mb;
 
     /* Saved thread IDs: v0/v1/v2 must be copied before param loads clobber them */
     uint32_t        saved_tid[3];   /* virtual VGPR holding saved threadIdx.x/y/z */
@@ -66,16 +65,25 @@ static struct {
     uint8_t         needs_dispatch; /* this kernel uses dispatch_ptr */
     uint8_t         max_dim;        /* highest dim needed (0=x, 1=xy, 2=xyz) */
 
+    /* Current machine function (set after MF creation, read by isel_*) */
+    mfunc_t         *mf;
+
+    /* Scratch frame pointer SGPR (set to 0 at entry, used as SADDR) */
+    uint16_t        sgpr_scrfp;
+
     /* Hidden kernarg offset for __device__/__constant__ global pointers */
     uint32_t        hkrarg;
+
+    /* SNAP: MVS-style parameter dump for when printf isn't
+     * an option and staring at assembly isn't a lifestyle. */
+    uint16_t        snap_sgprs[64];  /* which SGPR holds each param */
+    uint32_t        snap_nparam;     /* how many we're watching */
+    uint32_t        snap_koff;       /* kernarg offset of the evidence bag */
+    uint16_t        snap_base;       /* SGPR pair pointing to said bag */
 
     /* Block mapping: BIR block index -> machine block index */
     uint32_t        block_map[BIR_MAX_BLOCKS];
 } S;
-
-/* ---- Target Helpers ---- */
-
-static int is_cdna(void) { return S.amd->target <= AMD_TARGET_GFX942; }
 
 /* ---- Divergence Analysis ---- */
 
@@ -121,38 +129,97 @@ static uint32_t get_op(const bir_inst_t *I, uint32_t idx)
     return BIR_VAL_NONE;
 }
 
-/* Find the unconditional branch target of a BIR block, or 0xFFFFFFFF if none */
-static uint32_t bir_block_successor(uint32_t bir_bi)
-{
-    if (bir_bi >= S.bir->num_blocks) return 0xFFFFFFFF;
-    const bir_block_t *B = &S.bir->blocks[bir_bi];
-    if (B->num_insts == 0) return 0xFFFFFFFF;
-    const bir_inst_t *last = &S.bir->insts[B->first_inst + B->num_insts - 1];
-    if (last->op == BIR_BR)
-        return last->operands[0];
-    return 0xFFFFFFFF;
-}
+/* ---- Block Linearisation ----
+ *
+ * BIR creates blocks in declaration order: outer merge/else BEFORE inner
+ * then/else for nested control flow. Hardware needs true-block physically
+ * after divergent branch (cbranch_execz falls through to true-lanes).
+ * Walk CFG depth-first, suppressing then→merge edges in diamonds so the
+ * else-block lands next after the then-region.  Russian dolls, but with
+ * worse documentation and more explicit lane masking. */
 
-/* Find the merge block for a divergent if-then or if-then-else.
-   Triangle: then→false (false IS the merge).
-   Diamond: then→merge AND false→merge (both converge). */
-static uint32_t find_merge_block(uint32_t true_bir, uint32_t false_bir)
+typedef struct { uint32_t bi; uint32_t supp; } bord_t;
+#define BLK_ORD_MAX 8192
+#define BLK_STK_MAX 512
+
+static uint32_t s_blk_ord[BLK_ORD_MAX];
+static uint8_t  s_blk_vis[BLK_ORD_MAX];
+
+static uint32_t build_blk_ord(const bir_func_t *F, const bir_module_t *M)
 {
-    uint32_t true_succ = bir_block_successor(true_bir);
-    if (true_succ == false_bir)
-        return false_bir; /* triangle: then branches to false/merge */
-    uint32_t false_succ = bir_block_successor(false_bir);
-    if (true_succ != 0xFFFFFFFF && true_succ == false_succ)
-        return true_succ; /* diamond: both converge */
-    return false_bir; /* fallback: treat as triangle */
+    uint32_t nb = F->num_blocks;
+    if (nb > BLK_ORD_MAX) nb = BLK_ORD_MAX;
+    memset(s_blk_vis, 0, nb);
+
+    uint32_t n = 0;
+    bord_t stk[BLK_STK_MAX];
+    uint32_t top = 0;
+
+    stk[top++] = (bord_t){0, 0xFFFFFFFF};
+
+    while (top > 0 && n < nb) {
+        bord_t w = stk[--top];
+        if (w.bi >= nb || s_blk_vis[w.bi]) continue;
+        s_blk_vis[w.bi] = 1;
+        s_blk_ord[n++] = w.bi;
+
+        uint32_t bir_bi = F->first_block + w.bi;
+        if (bir_bi >= M->num_blocks) continue;
+        const bir_block_t *B = &M->blocks[bir_bi];
+        if (B->num_insts == 0) continue;
+
+        const bir_inst_t *last = &M->insts[B->first_inst + B->num_insts - 1];
+
+        if (last->op == BIR_BR) {
+            uint32_t tgt = last->operands[0];
+            if (tgt >= F->first_block && tgt < F->first_block + nb) {
+                uint32_t rel = tgt - F->first_block;
+                if (rel != w.supp && top < BLK_STK_MAX)
+                    stk[top++] = (bord_t){rel, w.supp};
+            }
+        } else if (last->op == BIR_BR_COND && last->num_operands >= 4) {
+            uint32_t T  = last->operands[1] - F->first_block;
+            uint32_t Fb = last->operands[2] - F->first_block;
+            uint32_t Mb = last->operands[3] - F->first_block;
+            int has_else = (Fb != Mb);
+
+            /* Push in reverse order (LIFO): merge, else, then */
+            if (top + 3 <= BLK_STK_MAX) {
+                stk[top++] = (bord_t){Mb, w.supp};     /* merge last */
+                if (has_else) {
+                    stk[top++] = (bord_t){Fb, w.supp};  /* else second */
+                    stk[top++] = (bord_t){T, Mb};        /* then first */
+                } else {
+                    stk[top++] = (bord_t){T, w.supp};   /* triangle */
+                }
+            }
+        } else if (last->op == BIR_BR_COND) {
+            /* 3-operand fallback (shouldn't happen, but be safe) */
+            uint32_t T  = last->operands[1] - F->first_block;
+            uint32_t Fb = last->operands[2] - F->first_block;
+            if (top + 2 <= BLK_STK_MAX) {
+                stk[top++] = (bord_t){Fb, w.supp};
+                stk[top++] = (bord_t){T, w.supp};
+            }
+        }
+        /* BIR_RET, BIR_UNREACHABLE, BIR_SWITCH: no special ordering needed */
+    }
+
+    /* Unreachable blocks: append in BIR order so nothing vanishes */
+    for (uint32_t bi = 0; bi < nb && n < nb; bi++) {
+        if (!s_blk_vis[bi]) s_blk_ord[n++] = bi;
+    }
+    return n;
 }
 
 /*
  * Forward dataflow. Seeds: THREAD_ID = divergent, BLOCK_ID/DIM/GRID_DIM = uniform,
  * constants = uniform, PARAMs = uniform. Propagate: any divergent input -> divergent output.
- * PHI: divergent if any incoming value is divergent.
+ * PHI: divergent if any incoming value is divergent, OR if the PHI's block
+ * is a merge point of a divergent branch (different EXEC masks on each edge).
  * Iterate until fixpoint (bounded: each bit set at most once).
  */
+
 static void divergence_analysis(const bir_func_t *F)
 {
     const bir_module_t *M = S.bir;
@@ -206,11 +273,33 @@ static void divergence_analysis(const bir_func_t *F)
                 int any_div = 0;
 
                 if (I->op == BIR_PHI) {
-                    /* PHI: check value operands (every other one) */
+                    /* PHI: divergent if any incoming VALUE is divergent */
                     for (uint32_t k = 1; k < nops; k += 2) {
                         if (val_is_divergent(get_op(I, k))) {
                             any_div = 1;
                             break;
+                        }
+                    }
+                    /* Also divergent if incoming BLOCKS have divergent
+                     * terminators.  Example: `a && b` short-circuits to
+                     * phi [cond: 0], [rhs: result] — both values uniform,
+                     * but which one arrives depends on per-lane divergent
+                     * control flow.  Without this, the combined condition
+                     * is treated as uniform and s_cbranch_scc1 replaces
+                     * s_and_saveexec, killing the while loop. */
+                    if (!any_div) {
+                        for (uint32_t k = 0; k < nops; k += 2) {
+                            uint32_t src_blk = get_op(I, k);
+                            if (src_blk >= BIR_MAX_BLOCKS) continue;
+                            const bir_block_t *SB = &M->blocks[src_blk];
+                            if (SB->num_insts == 0) continue;
+                            uint32_t term_idx = SB->first_inst + SB->num_insts - 1;
+                            const bir_inst_t *term = &M->insts[term_idx];
+                            if (term->op == BIR_BR_COND &&
+                                val_is_divergent(term->operands[0])) {
+                                any_div = 1;
+                                break;
+                            }
                         }
                     }
                 } else if (I->op == BIR_LOAD) {
@@ -530,6 +619,50 @@ static moperand_t ensure_vgpr(moperand_t op)
     return mop_vreg_v((uint16_t)v);
 }
 
+/* ---- SNAP: what MVS had in 1972 and CUDA still doesn't ----
+ * Each kernel parameter's SGPR value gets written to a host-visible
+ * diagnostic buffer.  When things go sideways you read the buffer
+ * instead of staring at assembly like it owes you money. */
+static void snap_emit(void)
+{
+    if (!S.amd->snap_mode || !S.is_kernel || S.snap_nparam == 0) return;
+
+    /* Where shall we send the evidence? */
+    uint16_t sb = S.next_param_sgpr;
+    if (sb & 1) sb++;
+    S.next_param_sgpr = sb + 2;
+    S.snap_base = sb;
+
+    emit2(AMD_S_LOAD_DWORDX2, mop_sgpr(sb),
+          mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)S.snap_koff));
+    emit_wait_smem();
+
+    /* Photograph each suspect and file it in the buffer */
+    uint32_t np = S.snap_nparam;
+    if (np > 64) np = 64;
+
+    for (uint32_t i = 0; i < np; i++) {
+        uint32_t voff = new_vreg(1);
+        uint32_t vdat = new_vreg(1);
+        emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)voff),
+              mop_imm((int32_t)(i * 4)));
+        emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vdat),
+              mop_sgpr(S.snap_sgprs[i]));
+
+        moperand_t ops[MINST_MAX_OPS];
+        ops[0] = mop_vreg_v((uint16_t)voff);
+        ops[1] = mop_vreg_v((uint16_t)vdat);
+        ops[2] = mop_sgpr(sb);
+        emit_minst(AMD_GLOBAL_STORE_DWORD, 0, 3, ops, 0);
+    }
+
+    /* Wait for the photographs to develop before proceeding */
+    emit0_0(AMD_S_WAITCNT, AMD_WAIT_VMCNT0);
+
+    printf("  snap: %u params instrumented, buffer at kernarg+%u\n",
+           np, S.snap_koff);
+}
+
 /* Get the BIR type width in bits. Default 32 for pointers, etc. */
 static int bir_type_width(uint32_t tidx)
 {
@@ -672,7 +805,7 @@ static void isel_arith(uint32_t idx, const bir_inst_t *I, int div)
         /* CDNA s_add/s_sub hazard: yields 0 when both operands come
          * fresh from SMEM loads.  Promote to VALU even when both are
          * scalar vregs — the pipe hasn't settled yet. */
-        if (!vprom && is_cdna() &&
+        if (!vprom && S.mf->smem_hz &&
             (I->op == BIR_ADD || I->op == BIR_SUB) &&
             src0.kind == MOP_VREG_S && src1.kind == MOP_VREG_S)
             vprom = 1;
@@ -1156,18 +1289,26 @@ static void isel_load(uint32_t idx, const bir_inst_t *I, int div)
         break;
     }
     case BIR_AS_PRIVATE: {
-        moperand_t vaddr = ensure_vgpr(resolve_val(I->operands[0], div));
-        if (is_cdna()) {
-            /* Fence preceding flat_stores before reading back */
-            emit_wait_vm();
-            /* v250 = FLAT_SCRATCH_LO + alloca_offset (wave scratch base) */
-            emit2(AMD_V_ADD_U32, mop_vgpr(AMD_VGPR_SCR_LO),
-                  mop_sgpr(S.sgpr_priv), vaddr);
-            emit2(AMD_FLAT_LOAD_DWORD, mop_vreg_v((uint16_t)vr),
-                  mop_vgpr(AMD_VGPR_SCR_LO), mop_imm(0));
+        /* Check for constant scratch offset (alloca + constant GEP) */
+        int32_t scr_off = -1;
+        if (I->operands[0] != BIR_VAL_NONE && !BIR_VAL_IS_CONST(I->operands[0])) {
+            uint32_t si = BIR_VAL_INDEX(I->operands[0]);
+            if (si < BIR_MAX_INSTS) scr_off = S.amd->val_scroff[si];
+        }
+        moperand_t ops[MINST_MAX_OPS];
+        ops[0] = mop_vreg_v((uint16_t)vr);
+        if (scr_off >= 0 && scr_off < 4096) {
+            /* SADDR-only: scratch_load_dword vdst, off, sN offset:K */
+            ops[1] = mop_sgpr(S.sgpr_scrfp);
+            ops[2] = mop_imm(scr_off);
+            emit_minst(AMD_SCRATCH_LOAD_DWORD, 1, 2, ops, 0);
         } else {
-            emit2(AMD_SCRATCH_LOAD_DWORD, mop_vreg_v((uint16_t)vr),
-                  vaddr, mop_imm(0));
+            /* SVS fallback: VADDR + SADDR */
+            moperand_t vaddr = ensure_vgpr(resolve_val(I->operands[0], div));
+            ops[1] = vaddr;
+            ops[2] = mop_sgpr(S.sgpr_scrfp);
+            ops[3] = mop_imm(0);
+            emit_minst(AMD_SCRATCH_LOAD_DWORD, 1, 3, ops, 0);
         }
         emit_wait_vm();
         break;
@@ -1211,19 +1352,27 @@ static void isel_store(const bir_inst_t *I, int div)
         break;
     }
     case BIR_AS_PRIVATE: {
-        moperand_t vaddr = ensure_vgpr(resolve_val(I->operands[1], div));
+        /* Check for constant scratch offset */
+        int32_t scr_off = -1;
+        if (I->operands[1] != BIR_VAL_NONE && !BIR_VAL_IS_CONST(I->operands[1])) {
+            uint32_t si = BIR_VAL_INDEX(I->operands[1]);
+            if (si < BIR_MAX_INSTS) scr_off = S.amd->val_scroff[si];
+        }
         moperand_t ops[MINST_MAX_OPS];
-        if (is_cdna()) {
-            /* v250 = FLAT_SCRATCH_LO + alloca_offset (wave scratch base) */
-            emit2(AMD_V_ADD_U32, mop_vgpr(AMD_VGPR_SCR_LO),
-                  mop_sgpr(S.sgpr_priv), vaddr);
-            ops[0] = mop_vgpr(AMD_VGPR_SCR_LO);
-            ops[1] = ensure_vgpr(val);
-            ops[2] = mop_imm(0);
-            emit_minst(AMD_FLAT_STORE_DWORD, 0, 3, ops, 0);
-        } else {
-            ops[0] = vaddr; ops[1] = ensure_vgpr(val); ops[2] = mop_imm(0);
+        if (scr_off >= 0 && scr_off < 4096) {
+            /* SADDR-only: scratch_store_dword off, vdata, sN offset:K */
+            ops[0] = ensure_vgpr(val);
+            ops[1] = mop_sgpr(S.sgpr_scrfp);
+            ops[2] = mop_imm(scr_off);
             emit_minst(AMD_SCRATCH_STORE_DWORD, 0, 3, ops, 0);
+        } else {
+            /* SVS fallback: VADDR + SADDR */
+            moperand_t vaddr = ensure_vgpr(resolve_val(I->operands[1], div));
+            ops[0] = vaddr;
+            ops[1] = ensure_vgpr(val);
+            ops[2] = mop_sgpr(S.sgpr_scrfp);
+            ops[3] = mop_imm(0);
+            emit_minst(AMD_SCRATCH_STORE_DWORD, 0, 4, ops, 0);
         }
         break;
     }
@@ -1251,10 +1400,30 @@ static void isel_gep(uint32_t idx, const bir_inst_t *I, int div)
     }
 
     if (sbase != 0xFFFF) {
-        /* saddr path: propagate SGPR pair, compute 32-bit VGPR offset */
+        /* saddr path: propagate SGPR pair, compute 32-bit VGPR offset.
+         *
+         * Param base offsets are always 0 — re-materialise a fresh
+         * zero each time instead of referencing the original VGPR.
+         * The linear-scan regalloc doesn't extend live ranges across
+         * loop back edges, so the param VGPR can be clobbered inside
+         * a loop body and the next iteration reads garbage. Fresh
+         * vreg, short live range, no surprises. */
         S.amd->val_sbase[idx] = sbase;
 
-        moperand_t base_off = ensure_vgpr(resolve_val(base_val, 1));
+        moperand_t base_off;
+        int is_param = 0;
+        if (!BIR_VAL_IS_CONST(base_val) && base_val != BIR_VAL_NONE) {
+            uint32_t bi = BIR_VAL_INDEX(base_val);
+            if (bi < S.bir->num_insts && S.bir->insts[bi].op == BIR_PARAM)
+                is_param = 1;
+        }
+        if (is_param) {
+            uint32_t fresh = new_vreg(1);
+            emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)fresh), mop_imm(0));
+            base_off = mop_vreg_v((uint16_t)fresh);
+        } else {
+            base_off = ensure_vgpr(resolve_val(base_val, 1));
+        }
         moperand_t acc = base_off;
 
         for (uint32_t k = 1; k < nops; k++) {
@@ -1297,7 +1466,7 @@ static void isel_gep(uint32_t idx, const bir_inst_t *I, int div)
             acc = mop_vreg_v((uint16_t)tmp);
         }
         emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), acc);
-    } else if (is_cdna()) {
+    } else if (S.mf->smem_hz) {
         /* CDNA GEP: the MI300X s_add_i32 zero-result errata strikes
          * again.  Two SMEM-sourced operands → s_add returns 0, your
          * pointer goes to la-la land, and the GPU segfaults with the
@@ -1334,6 +1503,28 @@ static void isel_gep(uint32_t idx, const bir_inst_t *I, int div)
         }
         emit1(AMD_S_MOV_B32, mop_vreg_s((uint16_t)vr), acc);
     }
+
+    /* Propagate constant scratch offset through GEP.
+     * If base is an alloca (or prior GEP) with known offset and all
+     * indices are constants, compute the new offset for SADDR-only mode. */
+    if (idx < BIR_MAX_INSTS && !BIR_VAL_IS_CONST(base_val) && base_val != BIR_VAL_NONE) {
+        uint32_t bi = BIR_VAL_INDEX(base_val);
+        if (bi < BIR_MAX_INSTS && S.amd->val_scroff[bi] >= 0) {
+            int32_t off = S.amd->val_scroff[bi];
+            int all_const = 1;
+            for (uint32_t k = 1; k < nops && all_const; k++) {
+                uint32_t opval = get_op(I, k);
+                if (BIR_VAL_IS_CONST(opval)) {
+                    int32_t cv = (int32_t)S.bir->consts[BIR_VAL_INDEX(opval)].d.ival;
+                    off += cv * (int32_t)elem_sz;
+                } else {
+                    all_const = 0;
+                }
+            }
+            if (all_const)
+                S.amd->val_scroff[idx] = off;
+        }
+    }
 }
 
 static void isel_alloca(uint32_t idx, const bir_inst_t *I)
@@ -1342,7 +1533,11 @@ static void isel_alloca(uint32_t idx, const bir_inst_t *I)
     uint32_t align = 1u << I->subop;
     S.scratch_offset = (S.scratch_offset + align - 1) & ~(align - 1);
 
-    /* Allocate a vreg holding the scratch offset */
+    /* Record constant scratch offset for immediate folding */
+    if (idx < BIR_MAX_INSTS)
+        S.amd->val_scroff[idx] = (int32_t)S.scratch_offset;
+
+    /* Allocate a vreg holding the scratch offset (for dynamic GEPs) */
     uint32_t vr = map_bir_val(idx, 1);
     /* v_mov_b32 vr, scratch_offset */
     emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_imm((int32_t)S.scratch_offset));
@@ -1393,15 +1588,54 @@ static void isel_branch(const bir_inst_t *I)
     uint32_t target_bir = I->operands[0];
     if (target_bir >= BIR_MAX_BLOCKS) return;
 
-    /* Suppress then→merge branches in divergent diamonds.
-       The then-block falls through to the else-block instead. */
-    if (S.suppress_src == S.current_bir_block &&
-        S.suppress_dst == target_bir) {
-        S.suppress_src = 0xFFFFFFFF;
-        S.suppress_dst = 0xFFFFFFFF;
-        return;
+    /* Suppress then→merge branches in active divergent diamonds.
+     * In a diamond, the then-path falls through to the else-block
+     * instead of jumping to merge. Works for nested structures too —
+     * inner merge→outer merge gets suppressed at any depth.
+     * Like a shift handover: you don't leave until the next crew arrives. */
+    for (uint32_t di = 0; di < S.div_depth; di++) {
+        if (S.div_stack[di].has_else && S.div_stack[di].in_then &&
+            S.div_stack[di].merge_bir == target_bir) {
+            return; /* suppress: fall through to else instead */
+        }
     }
-    emit0_1(AMD_S_BRANCH, mop_label(S.block_map[target_bir]));
+
+    /* Back-edge to divergent loop header: restore EXEC before re-entry.
+     * Without this, saveexec AND's the already-narrowed EXEC on every
+     * iteration.  Lanes that die during physics stay dead forever — the
+     * mask is a one-way valve that only removes threads.
+     *
+     * A while(a && b) compiles to multiple BIR blocks (while.cond →
+     * land.rhs → land.end), each potentially pushing a div_stack entry.
+     * The back-edge targets while.cond, so we must restore ALL entries
+     * pushed since while.cond — innermost first, like unwinding a stack.
+     * The GPU equivalent of "everyone back to starting positions." */
+    {
+        uint32_t target_mb = S.block_map[target_bir];
+        if (target_mb <= S.current_mb) {
+            /* Back-edge detected.  Restore every div_stack entry whose
+             * saveexec was pushed in a block at or after the target. */
+            for (uint32_t di = S.div_depth; di > 0; di--) {
+                uint32_t cb = S.div_stack[di - 1].cond_bir;
+                uint32_t cb_mb = S.block_map[cb];
+                if (cb_mb >= target_mb) {
+                    uint16_t sv = (uint16_t)S.div_stack[di - 1].saved_vreg;
+                    moperand_t sv_op = S.mf->exec_w ?
+                        mop_sgpr(sv) : mop_vreg_s(sv);
+                    emit2(S.mf->exec_w ? AMD_S_OR_B64 : AMD_S_OR_B32,
+                          mop_special(AMD_SPEC_EXEC),
+                          mop_special(AMD_SPEC_EXEC), sv_op);
+                }
+            }
+        }
+    }
+
+    /* Fallthrough: if target is the next physical block, skip the branch */
+    uint32_t target_mb = S.block_map[target_bir];
+    if (target_mb == S.current_mb + 1)
+        return;
+
+    emit0_1(AMD_S_BRANCH, mop_label(target_mb));
 }
 
 static void isel_br_cond(const bir_inst_t *I, int cond_div)
@@ -1422,7 +1656,7 @@ static void isel_br_cond(const bir_inst_t *I, int cond_div)
         emit0_2(AMD_V_CMP_NE_U32, mop_imm(0), vcond);
 
         uint32_t saved;
-        if (is_cdna()) {
+        if (S.mf->exec_w) {
             /* Wave64: reuse SGPR pairs by depth — dead after merge */
             if (S.esave_base == 0xFFFF) {
                 S.esave_base = S.next_param_sgpr;
@@ -1442,23 +1676,19 @@ static void isel_br_cond(const bir_inst_t *I, int cond_div)
         emit0_1(AMD_S_CBRANCH_EXECZ, mop_label(false_mb));
         /* Fall through to true block (next in layout) */
 
-        /* Find the merge point and record the divergent region */
-        uint32_t merge_bir = find_merge_block(true_bir, false_bir);
+        /* Merge point: operand[3] if available, else fall back to false */
+        uint32_t merge_bir = (I->num_operands >= 4) ?
+                              I->operands[3] : false_bir;
         int has_else = (merge_bir != false_bir);
 
         if (S.div_depth < MAX_DIV_REGIONS) {
             S.div_stack[S.div_depth].saved_vreg = saved;
             S.div_stack[S.div_depth].false_bir = false_bir;
             S.div_stack[S.div_depth].merge_bir = merge_bir;
+            S.div_stack[S.div_depth].cond_bir = S.current_bir_block;
             S.div_stack[S.div_depth].has_else = has_else;
+            S.div_stack[S.div_depth].in_then = 1;
             S.div_depth++;
-        }
-
-        /* For diamonds, suppress then-block's branch to merge
-           so it falls through to the else-block */
-        if (has_else) {
-            S.suppress_src = true_bir;
-            S.suppress_dst = merge_bir;
         }
     } else {
         /* Uniform branch: compare and branch on SCC */
@@ -1579,6 +1809,10 @@ static void isel_param(uint32_t idx, const bir_inst_t *I)
             if (base_sgpr & 1) base_sgpr++;
             S.next_param_sgpr = base_sgpr + 2;
 
+            /* SNAP: note which drawer this param lives in */
+            if (S.amd->snap_mode && S.snap_nparam < 64)
+                S.snap_sgprs[S.snap_nparam++] = base_sgpr;
+
             emit2(AMD_S_LOAD_DWORDX2, mop_sgpr(base_sgpr),
                   mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)offset));
             emit_wait_smem();
@@ -1590,10 +1824,26 @@ static void isel_param(uint32_t idx, const bir_inst_t *I)
             S.amd->reg_file[vr] = 1;
             emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_imm(0));
         } else {
-            uint32_t vr = map_bir_val(idx, 0);
-            emit2(AMD_S_LOAD_DWORD, mop_vreg_s((uint16_t)vr),
+            /* GFX942 workaround: s_load_dword mixed with a burst of
+               s_load_dwordx2 causes MEMORY_APERTURE_VIOLATION.
+               Promote scalar params to dwordx2 via physical SGPR pair,
+               then s_mov the low half into a vreg for normal SSA flow. */
+            uint16_t base_sgpr = S.next_param_sgpr;
+            if (base_sgpr + 1 >= AMD_MAX_SGPRS) return;
+            if (base_sgpr & 1) base_sgpr++;
+            S.next_param_sgpr = base_sgpr + 2;
+
+            /* SNAP: record which SGPR pair holds this param */
+            if (S.amd->snap_mode && S.snap_nparam < 64)
+                S.snap_sgprs[S.snap_nparam++] = base_sgpr;
+
+            emit2(AMD_S_LOAD_DWORDX2, mop_sgpr(base_sgpr),
                   mop_sgpr(S.sgpr_kernarg), mop_imm((int32_t)offset));
             emit_wait_smem();
+
+            uint32_t vr = map_bir_val(idx, 0);
+            emit1(AMD_S_MOV_B32, mop_vreg_s((uint16_t)vr),
+                  mop_sgpr(base_sgpr));
         }
     } else {
         /* Device function: params in v0, v1, ... */
@@ -1603,6 +1853,10 @@ static void isel_param(uint32_t idx, const bir_inst_t *I)
         if (param_idx < 32)
             emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)vr), mop_vgpr((uint16_t)param_idx));
     }
+
+    /* SNAP: last param loaded — take the photograph */
+    if (S.amd->snap_mode && S.is_kernel && param_idx + 1 == S.num_params)
+        snap_emit();
 }
 
 static void isel_thread_model(uint32_t idx, const bir_inst_t *I)
@@ -1668,12 +1922,13 @@ static void isel_barrier(void)
 static void isel_atomic(uint32_t idx, const bir_inst_t *I, int div)
 {
     /* ops[0] = address, ops[1] = value (ops[2] = compare for CAS) */
-    moperand_t addr = ensure_vgpr(resolve_val(I->operands[0], div));
     uint32_t nops = get_num_ops(I);
     uint32_t ptr_type = 0;
+    uint16_t sbase = 0xFFFF;
     if (I->operands[0] != BIR_VAL_NONE && !BIR_VAL_IS_CONST(I->operands[0])) {
         uint32_t si = BIR_VAL_INDEX(I->operands[0]);
         if (si < S.bir->num_insts) ptr_type = S.bir->insts[si].type;
+        if (si < BIR_MAX_INSTS) sbase = S.amd->val_sbase[si];
     }
     int as = get_addrspace(ptr_type);
 
@@ -1682,6 +1937,7 @@ static void isel_atomic(uint32_t idx, const bir_inst_t *I, int div)
 
     if (as == BIR_AS_SHARED) {
         /* DS atomics */
+        moperand_t addr = ensure_vgpr(resolve_val(I->operands[0], div));
         moperand_t val = (nops > 1) ? ensure_vgpr(resolve_val(I->operands[1], 1)) : mop_imm(0);
         uint16_t ds_op;
         switch (I->op) {
@@ -1715,11 +1971,19 @@ static void isel_atomic(uint32_t idx, const bir_inst_t *I, int div)
         }
         if (I->op == BIR_ATOMIC_CAS && nops > 2) {
             moperand_t cmp = ensure_vgpr(resolve_val(I->operands[2], 1));
+            moperand_t ca = ensure_vgpr(resolve_val(I->operands[0], div));
             moperand_t ops[MINST_MAX_OPS];
-            ops[0] = dst; ops[1] = addr; ops[2] = val; ops[3] = cmp;
+            ops[0] = dst; ops[1] = ca; ops[2] = val; ops[3] = cmp;
+            emit_minst(glb_op, 1, 3, ops, AMD_FLAG_GLC);
+        } else if (sbase != 0xFFFF) {
+            /* saddr form: vOffset, vData, s[base:base+1] */
+            moperand_t voff = ensure_vgpr(resolve_val(I->operands[0], 1));
+            moperand_t ops[MINST_MAX_OPS];
+            ops[0] = dst; ops[1] = voff; ops[2] = val; ops[3] = mop_sgpr(sbase);
             emit_minst(glb_op, 1, 3, ops, AMD_FLAG_GLC);
         } else {
-            emit2f(glb_op, dst, addr, val, AMD_FLAG_GLC);
+            moperand_t va = ensure_vgpr(resolve_val(I->operands[0], div));
+            emit2f(glb_op, dst, va, val, AMD_FLAG_GLC);
         }
         emit_wait_vm();
     }
@@ -2003,8 +2267,7 @@ static void isel_function(uint32_t fi)
     S.lds_offset = 0;
     S.hkrarg = F->num_params * 8;
     S.div_depth = 0;
-    S.suppress_src = 0xFFFFFFFF;
-    S.suppress_dst = 0xFFFFFFFF;
+    S.current_mb = 0;
     S.current_bir_block = 0;
 
     /* Scan BIR to determine hidden kernarg needs */
@@ -2025,10 +2288,22 @@ static void isel_function(uint32_t fi)
     if (S.is_kernel && S.needs_dispatch)
         S.hkrarg = (uint32_t)(F->num_params * 8) + 24u;
 
+    /* SNAP: reserve 8 bytes for the diagnostic buffer pointer.
+     * The host leaves a forwarding address here.  We write each
+     * param's value to it on entry, like a witness statement. */
+    S.snap_nparam = 0;
+    S.snap_koff = 0;
+    S.snap_base = 0;
+    if (A->snap_mode && S.is_kernel) {
+        S.snap_koff = S.hkrarg;
+        S.hkrarg += 8;
+    }
+
     /* Pointer params get physical SGPR pairs starting after reserved regs */
     S.next_param_sgpr = S.kern_reserved;
     if (S.next_param_sgpr & 1) S.next_param_sgpr++; /* align to even */
     S.esave_base = 0xFFFF;
+    S.sgpr_scrfp = 0; /* set in prologue if scratch used */
     S.max_ddep = 0;
 
     /* Skip host-only functions */
@@ -2044,7 +2319,7 @@ static void isel_function(uint32_t fi)
     MF->name = F->name;
     MF->first_block = A->num_mblocks;
     MF->is_kernel = S.is_kernel;
-    MF->wavefront_size = is_cdna() ? AMD_WAVE64 : AMD_WAVE_SIZE;
+    MF->bir_func = (uint16_t)fi;
     MF->lds_bytes = 0;
     MF->scratch_bytes = 0;
     MF->kernarg_bytes = F->num_params * 8;
@@ -2053,17 +2328,40 @@ static void isel_function(uint32_t fi)
     MF->needs_dispatch = S.needs_dispatch;
     MF->max_dim = S.max_dim;
 
-    /* Pre-create machine blocks and build block map */
-    for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
-        uint32_t bir_bi = F->first_block + bi;
-        uint32_t mb_idx = A->num_mblocks + bi;
+    /* Stamp resource plan — target decisions made once, right here.
+     * Downstream reads MF fields, never interrogates the target enum. */
+    {
+        int cdna = (A->target <= AMD_TARGET_GFX942);
+        MF->exec_w   = cdna ? 1 : 0;
+        MF->smem_hz  = cdna ? 1 : 0;
+        MF->scr_afs  = cdna ? 1 : 0;
+        MF->rp_pad   = 0;
+        MF->imp_sgp  = cdna ? 6 : 0;
+        MF->sgp_min  = cdna ? 2 : 0;
+        MF->wavefront_size = cdna ? AMD_WAVE64 : AMD_WAVE_SIZE;
+        MF->r1_mode  = (3u << 16) | (3u << 18) | (1u << 21) | (1u << 23);
+        if (!cdna)
+            MF->r1_mode |= (1u << 26) | (1u << 27);
+    }
+    S.mf = MF;
+
+    /* Build execution-order block list. Nested diamonds must be fully
+     * contained within their parent's then/else regions, otherwise the
+     * hardware falls through into someone else's merge block. */
+    uint32_t n_exec = build_blk_ord(F, M);
+
+    /* Pre-create machine blocks in execution order */
+    for (uint32_t i = 0; i < n_exec; i++) {
+        uint32_t bir_bi = F->first_block + s_blk_ord[i];
+        uint32_t mb_idx = A->num_mblocks + i;
         if (mb_idx >= AMD_MAX_MBLOCKS) break;
         S.block_map[bir_bi] = mb_idx;
         A->mblocks[mb_idx].bir_block = bir_bi;
     }
 
-    /* Select instructions block by block */
-    for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+    /* Select instructions in execution order */
+    for (uint32_t i = 0; i < n_exec; i++) {
+        uint32_t bi = s_blk_ord[i];
         uint32_t bir_bi = F->first_block + bi;
         const bir_block_t *B = &M->blocks[bir_bi];
         uint32_t mb_idx = A->num_mblocks;
@@ -2073,6 +2371,7 @@ static void isel_function(uint32_t fi)
         MB->first_inst = A->num_minsts;
         MB->bir_block = bir_bi;
         S.current_bir_block = bir_bi;
+        S.current_mb = mb_idx;
 
         /* EXEC mask restore for divergent regions.
            At else-block start: flip to false lanes.
@@ -2080,10 +2379,12 @@ static void isel_function(uint32_t fi)
            Like changing shifts — the work never stops, the crew just rotates. */
         for (uint32_t di = 0; di < S.div_depth; di++) {
             if (S.div_stack[di].has_else && S.div_stack[di].false_bir == bir_bi) {
-                /* Else block: xor EXEC to get false lanes */
+                /* Else block: transition from then-region to else-region */
+                S.div_stack[di].in_then = 0;
+                /* xor EXEC to get false lanes */
                 uint16_t sv = (uint16_t)S.div_stack[di].saved_vreg;
-                moperand_t sv_op = is_cdna() ? mop_sgpr(sv) : mop_vreg_s(sv);
-                emit2(is_cdna() ? AMD_S_XOR_B64 : AMD_S_XOR_B32,
+                moperand_t sv_op = S.mf->exec_w ? mop_sgpr(sv) : mop_vreg_s(sv);
+                emit2(S.mf->exec_w ? AMD_S_XOR_B64 : AMD_S_XOR_B32,
                       mop_special(AMD_SPEC_EXEC),
                       mop_special(AMD_SPEC_EXEC), sv_op);
                 /* If all false lanes are off, skip else body */
@@ -2095,8 +2396,8 @@ static void isel_function(uint32_t fi)
             if (S.div_stack[di - 1].merge_bir == bir_bi) {
                 /* Merge block: restore all lanes */
                 uint16_t sv = (uint16_t)S.div_stack[di - 1].saved_vreg;
-                moperand_t sv_op = is_cdna() ? mop_sgpr(sv) : mop_vreg_s(sv);
-                emit2(is_cdna() ? AMD_S_OR_B64 : AMD_S_OR_B32,
+                moperand_t sv_op = S.mf->exec_w ? mop_sgpr(sv) : mop_vreg_s(sv);
+                emit2(S.mf->exec_w ? AMD_S_OR_B64 : AMD_S_OR_B32,
                       mop_special(AMD_SPEC_EXEC),
                       mop_special(AMD_SPEC_EXEC), sv_op);
                 /* Pop the region */
@@ -2113,20 +2414,14 @@ static void isel_function(uint32_t fi)
                 emit1(AMD_V_MOV_B32, mop_vreg_v((uint16_t)S.saved_tid[d]),
                       mop_vgpr((uint16_t)d));
             }
-            /* CDNA flat scratch: read src_private_base hi word into v251.
-               scratch_store doesn't work on GFX942 — HIP uses flat_store
-               with the private aperture tag instead. Cheers, AMD. */
-            if (is_cdna() && S.has_scratch) {
-                uint16_t sp = S.next_param_sgpr;
-                if (sp & 1) sp++;
-                S.sgpr_priv = sp;
-                S.next_param_sgpr = sp + 2;
-                /* s_mov_b64 s[sp:sp+1], src_private_base */
-                emit1(AMD_S_MOV_B64, mop_sgpr(sp),
-                      mop_special(AMD_SPEC_PRIV_BASE));
-                /* v_mov_b32 v251, s[sp+1]  (aperture tag) */
-                emit1(AMD_V_MOV_B32, mop_vgpr(AMD_VGPR_SCR_HI),
-                      mop_sgpr((uint16_t)(sp + 1)));
+
+            /* Scratch frame pointer: SADDR for scratch_load/store.
+             * GFX942 architected flat scratch: CP sets FLAT_SCRATCH.
+             * We just need an SGPR=0 as the frame base offset. */
+            if (S.has_scratch) {
+                S.sgpr_scrfp = S.next_param_sgpr++;
+                emit1(AMD_S_MOV_B32, mop_sgpr(S.sgpr_scrfp),
+                      mop_imm(0));
             }
         }
 
@@ -2282,7 +2577,7 @@ static void isel_function(uint32_t fi)
     MF->kernarg_bytes = S.hkrarg;
     MF->lds_bytes = (uint16_t)S.lds_offset;
     MF->first_alloc_sgpr = S.next_param_sgpr;
-    if (is_cdna() && S.esave_base != 0xFFFF) {
+    if (S.mf->exec_w && S.esave_base != 0xFFFF) {
         uint16_t etop = (uint16_t)(S.esave_base + S.max_ddep * 2);
         if (etop > MF->first_alloc_sgpr)
             MF->first_alloc_sgpr = etop;
@@ -2311,11 +2606,15 @@ int amdgpu_compile(const bir_module_t *bir, amd_module_t *amd)
     memset(amd->reg_map, 0, sizeof(amd->reg_map));
     memset(amd->reg_file, 0, sizeof(amd->reg_file));
     memset(amd->val_sbase, 0xFF, sizeof(amd->val_sbase));
+    memset(amd->val_scroff, 0xFF, sizeof(amd->val_scroff)); /* -1 = dynamic */
 
     /* Process each function */
     for (uint32_t fi = 0; fi < bir->num_funcs; fi++) {
         isel_function(fi);
     }
+
+    /* Resource plan: scan BIR, print kernel summaries */
+    amd_rplan(amd);
 
     return BC_OK;
 }

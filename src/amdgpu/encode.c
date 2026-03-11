@@ -230,7 +230,10 @@ static void encode_vop1(amd_module_t *A, const minst_t *mi, uint16_t hw_op)
     /* [31:25]=0111111 [24:17]=VDST [16:9]=OP [8:0]=SRC0 */
     uint32_t literal = 0;
     int need_lit = 0;
-    uint8_t vdst = (mi->num_defs > 0 && mi->operands[0].kind == MOP_VGPR) ?
+    /* v_readfirstlane_b32 has an SGPR destination — accept both files */
+    uint8_t vdst = (mi->num_defs > 0 &&
+                    (mi->operands[0].kind == MOP_VGPR ||
+                     mi->operands[0].kind == MOP_SGPR)) ?
                    (uint8_t)mi->operands[0].reg_num : 0;
     uint16_t src0 = (mi->num_uses > 0) ?
                     encode_vsrc(&mi->operands[mi->num_defs], &literal, &need_lit) : 0;
@@ -348,13 +351,24 @@ static void encode_flat_global(amd_module_t *A, const minst_t *mi, uint16_t hw_o
     /* Default null SADDR (GFX11 default, adjusted per-target below) */
     uint32_t saddr = 0x7C;
 
-    /* Walk use operands: 1st VGPR=addr, 2nd VGPR=data, SGPR=saddr, IMM=offset */
+    /* Walk use operands: 1st VGPR=addr, 2nd VGPR=data, SGPR=saddr, IMM=offset.
+     * Scratch SADDR-only stores have one VGPR (data only, no VADDR) —
+     * detect this and put the single VGPR in data, leave addr=0. */
     uint8_t use_base = mi->num_defs;
     int got_addr = 0;
+    int n_vgprs = 0;
+    int has_sgpr = 0;
+    for (uint8_t k = use_base; k < (uint8_t)(use_base + mi->num_uses) && k < MINST_MAX_OPS; k++) {
+        if (mi->operands[k].kind == MOP_VGPR) n_vgprs++;
+        if (mi->operands[k].kind == MOP_SGPR) has_sgpr = 1;
+    }
+    /* SADDR-only scratch store: single VGPR is data, addr=0 (off) */
+    int saddr_only_store = (is_scratch && mi->num_defs == 0 && n_vgprs == 1 && has_sgpr);
     for (uint8_t k = use_base; k < (uint8_t)(use_base + mi->num_uses) && k < MINST_MAX_OPS; k++) {
         const moperand_t *op = &mi->operands[k];
         if (op->kind == MOP_VGPR) {
-            if (!got_addr) { addr = (uint8_t)op->reg_num; got_addr = 1; }
+            if (saddr_only_store) { data = (uint8_t)op->reg_num; }
+            else if (!got_addr) { addr = (uint8_t)op->reg_num; got_addr = 1; }
             else { data = (uint8_t)op->reg_num; }
         } else if (op->kind == MOP_SGPR) {
             saddr = op->reg_num;

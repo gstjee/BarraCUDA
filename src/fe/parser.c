@@ -165,6 +165,26 @@ static void add_child(parser_t *P, uint32_t parent, uint32_t child)
     }
 }
 
+/* ---- Type name registry for cast disambiguation ---- */
+
+static void reg_tname(parser_t *P, uint32_t off, uint16_t len)
+{
+    if (P->num_tnames >= 128) return;
+    P->tnames[P->num_tnames].off = off;
+    P->tnames[P->num_tnames].len = len;
+    P->num_tnames++;
+}
+
+static int is_reg_type(const parser_t *P, uint32_t off, uint16_t len)
+{
+    for (int i = 0; i < P->num_tnames; i++) {
+        if (P->tnames[i].len == len &&
+            memcmp(P->src + P->tnames[i].off, P->src + off, len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int is_type_keyword(int type)
 {
     switch (type) {
@@ -367,13 +387,29 @@ static int looks_like_cast(parser_t *P)
     int t = peek_type(P, 1);
     if (is_type_keyword(t)) return 1;
     if (t == TOK_CU_DEVICE || t == TOK_CU_HOST) return 1;
-    /* C++ casts handled directly in parse_primary now */
-    if (t == TOK_IDENT && peek_type(P, 2) == TOK_RPAREN &&
-        can_start_unary(peek_type(P, 3)))
-        return 1;
-    /* (ident*) or (ident**) — pointer cast to struct/vector type */
-    if (t == TOK_IDENT && peek_type(P, 2) == TOK_STAR)
-        return 1;
+    if (t == TOK_IDENT) {
+        const token_t *id = &P->tokens[P->pos + 1 < P->num_tokens
+                                        ? P->pos + 1 : P->num_tokens - 1];
+        int known = is_reg_type(P, id->offset, (uint16_t)id->len);
+        if (peek_type(P, 2) == TOK_RPAREN) {
+            int after = peek_type(P, 3);
+            /* (ident) *expr — the classic C ambiguity. Could be
+             * cast+deref OR multiplication. Only treat as cast if
+             * we KNOW it's a type. Cost of getting this wrong: one
+             * GPU aperture fault and an afternoon of disassembly. */
+            if (after == TOK_STAR || after == TOK_AMP) {
+                if (known) return 1;
+            } else if (can_start_unary(after)) {
+                /* (ident)0, (ident)x etc. — no mul/deref ambiguity,
+                 * safe to assume cast (covers template params too) */
+                return 1;
+            }
+        }
+        /* (ident*) or (ident**) — pointer cast to struct/vector type.
+         * Star is INSIDE the parens (part of the type), not ambiguous. */
+        if (peek_type(P, 2) == TOK_STAR)
+            return 1;
+    }
     return 0;
 }
 
@@ -990,6 +1026,11 @@ static uint32_t parse_declaration(parser_t *P)
         P->nodes[def].qualifiers = quals;
         P->nodes[def].cuda_flags = cuda;
         add_child(P, def, type_node);
+        /* Register struct/enum name so (name)*x parses as mul, not cast */
+        { uint32_t fc = P->nodes[type_node].first_child;
+          if (fc && P->nodes[fc].type == AST_IDENT)
+              reg_tname(P, P->nodes[fc].d.text.offset,
+                        (uint16_t)P->nodes[fc].d.text.len); }
         advance(P);
         if (is_enum) {
             while (cur_type(P) != TOK_RBRACE && cur_type(P) != TOK_EOF) {
@@ -1177,14 +1218,26 @@ static uint32_t parse_declaration(parser_t *P)
         P->nodes[decl_node].d.oper.flags = ptr_depth;
         add_child(P, decl_node, type_node);
         add_child(P, decl_node, name);
+        /* Register typedef name for cast disambiguation */
+        if (quals & QUAL_TYPEDEF)
+            reg_tname(P, P->nodes[name].d.text.offset,
+                      (uint16_t)P->nodes[name].d.text.len);
 
+        { int ndims = 0;
         while (cur_type(P) == TOK_LBRACKET) {
             advance(P);
             if (cur_type(P) != TOK_RBRACKET) {
                 uint32_t sz = parse_expr(P, 0);
                 add_child(P, decl_node, sz);
+                ndims++;
             }
             expect(P, TOK_RBRACKET);
+        }
+        /* Store array dimension count so lowerer can distinguish
+         * `int x[4]` (ndims=1, child=4) from `int x = 4` (ndims=0, child=4).
+         * The classic "is the next child an array size or an initializer?"
+         * ambiguity that has haunted C compilers since 1972. */
+        P->nodes[decl_node].d.oper.op = ndims;
         }
 
         if (cur_type(P) == TOK_ASSIGN) {

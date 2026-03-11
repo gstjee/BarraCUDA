@@ -1,26 +1,16 @@
-/* Struct copy from global — the operation that stumped us.
- * Buffer starts zeroed (memset by harness).  We bitcast to
- * struct Quad*, copy struct to local, then add known offsets
- * to each field to prove the fields read correctly.
- * Expected: 10.0, 20.0, 30.0, 40.0
- * Run: test_gpu_run test_scopy.hsaco test_scopy 1 */
-struct Quad { float a; float b; float c; float d; };
+/* test_scopy — 6 pointer params + scratch, close to Moa pattern.
+ * out[tid] = a[tid] + b[tid] + c[tid] + d[tid]
+ * Expected: each array has value (tid + offset), sum = 4*tid + 10 */
+__global__ void test_scopy(float *out, float *a, float *b,
+                           float *c, float *d, int n) {
+    int tid = threadIdx.x;
+    if (tid < n) {
+    float tmp[4];
+    tmp[0] = a[tid];
+    tmp[1] = b[tid];
+    tmp[2] = c[tid];
+    tmp[3] = d[tid];
 
-__global__ void test_scopy(float *out, int n) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= n) return;
-
-    /* Bitcast + struct copy from zeroed global memory.
-     * All fields should be 0.0, so we add known constants
-     * to prove each field is independently addressable
-     * and the struct didn't arrive as a pointer-shaped
-     * hallucination. */
-    struct Quad *arr = (struct Quad *)out;
-    struct Quad q;
-    q = arr[0];
-
-    out[0] = q.a + 10.0f;
-    out[1] = q.b + 20.0f;
-    out[2] = q.c + 30.0f;
-    out[3] = q.d + 40.0f;
+    out[tid] = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+    }
 }

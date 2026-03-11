@@ -18,6 +18,12 @@ typedef struct {
     uint32_t    lb_max_pending;
     uint32_t    lb_min_pending;
 
+    /* Type name registry — struct/typedef names for cast disambiguation.
+     * Without this, (var) * expr parses as cast+deref instead of mul.
+     * The classic C ambiguity that has ruined more weekends than ISO 8601. */
+    struct { uint32_t off; uint16_t len; } tnames[128];
+    int             num_tnames;
+
     bc_error_t      errors[BC_MAX_ERRORS];
     int             num_errors;
 } parser_t;
