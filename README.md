@@ -193,9 +193,8 @@ Fix the known gaps: integer literal suffixes, `const`, parameter reassignment. T
 
 ### Medium Term: Optimisation
 
-The generated code works but isn't winning any benchmarks. Done so far: instruction scheduling, constant folding, dead code elimination. Priorities:
+The generated code works but isn't winning any benchmarks. Done so far: instruction scheduling, constant folding, dead code elimination, divergence-aware SSA register allocation. Priorities:
 
-- Better register allocation (currently linear scan, consider graph colouring)
 - Loop-invariant code motion
 - Occupancy tuning based on register pressure
 
@@ -215,6 +214,8 @@ The IR (BIR) is target-independent. The backend is cleanly separated. Adding a n
 The HLASM-style short identifiers (`ra_gc`, `mk_hash`, `enc_vop3`) are culturally neutral by accident, there's nothing English about a 5-character label. If you've found a bug or have an idea, write it up in whatever language you think in.
 
 ## Changelog
+
+**2026-03-14** — Divergence-aware SSA register allocator (`--ssa-ra`). Eliminates all 186 VGPR spills on a 654-line Monte Carlo transport kernel — scratch traffic drops 78%, total instructions drop 28%. Exploits the 64:1 cost asymmetry between divergent and uniform VGPR spills on Wave64 hardware: uniform values spill via `v_readfirstlane` at 4 bytes each, divergent values stay in registers where they belong. Based on the divergence analysis of Sampaio et al. (2013). ~1,300 lines of C99, all static memory, no malloc.
 
 **2026-03-09** — Post-isel verification pass (`bc_vfy`). The encoder used to trust isel to produce valid machine instructions. It shouldn't have. `bc_vfy` runs twice (post-isel, post-RA) and catches 5 classes of encoding violation before the binary leaves the compiler. Its first run immediately found 7 isel bugs across GFX10 and GFX942 — every one a silent miscompile that would fault on hardware with "Reason: Unknown." Fixed them all. Also: `bc_abend` runtime crash diagnostics, because if IBM could do post-mortem dumps in 1964, we can do it for GPUs in 2026.
 
@@ -250,6 +251,8 @@ Apache 2.0. Do whatever you want. If this compiler somehow ends up in production
 
 ## Acknowledgements
 
+- **Fernando Magno Quintão Pereira** and the **Compilers Lab at UFMG** (Universidade Federal de Minas Gerais). Fernando reached out after seeing the project, pointed me to the divergence analysis papers, and offered guidance. The SSA register allocator exists because of that conversation.
+- **The academic community** — Cooper, Harvey & Kennedy for dominators; Braun & Hack for SSA spilling; Sampaio, Souza, Collange & Pereira for divergence analysis. I'm just a hobbyist who reads papers and writes C. The actual hard work was done by the researchers.
 - **Steven Muchnick** for *Advanced Compiler Design and Implementation*. If this compiler does anything right, that book is why.
 - **Low Level** for the Zero to Hero C course and the YouTube channel. That's where I learnt C.
 - **Abe Kornelis** for being an amazing teacher. His work on the [z390 Portable Mainframe Assembler](https://github.com/z390development/z390) project is well worth your time.
