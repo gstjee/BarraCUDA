@@ -13,3 +13,15 @@
 # OS noise
 Thumbs.db
 .DS_Store
+
+# Internal tools (not shipped with the compiler, These are surprises for later ;-) )
+/tools/
+
+# AI assistants — keep your configs to yourself
+.claude/
+.cursorrules
+.cursor/
+.gemini/
+.github/copilot/
+CLAUDE.md
+.aider*

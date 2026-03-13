@@ -201,12 +201,14 @@ static int interval_cmp_start(const void *a, const void *b)
 }
 
 /* Get the vreg referenced by an operand, or 0xFFFF if not a vreg */
-static uint16_t operand_vreg(const moperand_t *op)
+uint16_t op_vreg(const moperand_t *op)
 {
     if (op->kind == MOP_VREG_S || op->kind == MOP_VREG_V)
         return op->reg_num;
     return 0xFFFF;
 }
+/* Legacy name used throughout this file */
+static uint16_t operand_vreg(const moperand_t *op) { return op_vreg(op); }
 
 static uint32_t coalesce(amd_module_t *A, const mfunc_t *F);
 
@@ -556,7 +558,7 @@ static void expire_old(uint32_t point)
 }
 
 /* Rewrite virtual reg operands to physical */
-static void rw_ops(amd_module_t *A, const mfunc_t *F)
+void rw_ops(amd_module_t *A, const mfunc_t *F)
 {
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
         const mblock_t *MB = &A->mblocks[F->first_block + bi];
@@ -615,7 +617,7 @@ static void rw_ops(amd_module_t *A, const mfunc_t *F)
    These appear when regalloc assigns the same phys reg to both sides
    of a copy. Harmless but noisy — like a postman delivering a letter
    back to the sender. */
-static void dce_copy(amd_module_t *A, const mfunc_t *F)
+void dce_copy(amd_module_t *A, const mfunc_t *F)
 {
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
         const mblock_t *MB = &A->mblocks[F->first_block + bi];
@@ -637,7 +639,7 @@ static void dce_copy(amd_module_t *A, const mfunc_t *F)
     }
 }
 
-static void fin_regs(const amd_module_t *A, mfunc_t *F)
+void fin_regs(const amd_module_t *A, mfunc_t *F)
 {
     /* Minimum 1 SGPR/VGPR for the descriptor */
     if (F->num_sgprs == 0) F->num_sgprs = 1;
@@ -1967,17 +1969,20 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
 
 /* Global flag: set by --no-graphcolor to force linear scan */
 int amd_ra_lin = 0;
+/* SSA-based divergence-aware allocator */
+int amd_ra_ssa = 0;
 /* If non-zero, cap available VGPRs for regalloc (forces spills for testing) */
 int amd_max_vgpr = 0;
 
 static void ra_func(amd_module_t *A, uint32_t mf_idx)
 {
-    if (amd_ra_lin || A->vreg_count > RA_MAX_NODES) {
+    if (amd_ra_ssa) {
+        ra_ssa(A, mf_idx);
+    } else if (amd_ra_lin || A->vreg_count > RA_MAX_NODES) {
         ra_lin(A, mf_idx);
     } else {
         ra_gc(A, mf_idx);
     }
-
 }
 
 /* ---- Assembly Text Printer ---- */
@@ -2230,7 +2235,9 @@ static void emit_asm_function(amd_module_t *A, uint32_t mf_idx)
 
 void amdgpu_regalloc(amd_module_t *A)
 {
-    amdgpu_phi_elim(A);
+    /* SSA path does its own phi elimination post-allocation */
+    if (!amd_ra_ssa)
+        amdgpu_phi_elim(A);
     for (uint32_t fi = 0; fi < A->num_mfuncs; fi++)
         ra_func(A, fi);
 }

@@ -31,7 +31,7 @@ typedef int64_t hsa_signal_value_t;
 #define HSA_AMD_SEGMENT_GLOBAL                    0
 #define HSA_AMD_MEMORY_POOL_INFO_SEGMENT          0
 #define HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS     1
-#define HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG   1
+#define HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG   8
 #define HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE      2
 
 /* HSA queue — layout must match ABI exactly */
@@ -155,6 +155,8 @@ typedef hsa_status_t (*pfn_amd_iterate_pools_t)(
     hsa_agent_t, hsa_status_t(*)(hsa_amd_memory_pool_t, void*), void*);
 typedef hsa_status_t (*pfn_amd_pool_get_info_t)(
     hsa_amd_memory_pool_t, uint32_t, void*);
+typedef hsa_status_t (*pfn_amd_allow_access_t)(
+    uint32_t, const hsa_agent_t*, const uint32_t*, const void*);
 
 /* ---- Internal Device Structure ---- */
 
@@ -194,6 +196,7 @@ typedef struct {
     pfn_amd_pool_free_t     amd_pfree;
     pfn_amd_iterate_pools_t amd_ipools;
     pfn_amd_pool_get_info_t amd_pinfo;
+    pfn_amd_allow_access_t  amd_allow;
 
     /* Device state */
     hsa_agent_t  gpu_agent;
@@ -282,7 +285,7 @@ static hsa_status_t find_kpool_cb(hsa_amd_memory_pool_t pool, void *data)
     if (segment != HSA_AMD_SEGMENT_GLOBAL) return HSA_STATUS_SUCCESS;
     uint32_t flags = 0;
     D->amd_pinfo(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &flags);
-    if (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG) {
+    if (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE) {
         D->kernarg_pool = pool;
         return HSA_STATUS_INFO_BREAK;
     }
@@ -363,6 +366,7 @@ int bc_device_init(bc_device_t *dev)
     LOAD(amd_pfree,   "hsa_amd_memory_pool_free");
     LOAD(amd_ipools,  "hsa_amd_agent_iterate_memory_pools");
     LOAD(amd_pinfo,   "hsa_amd_memory_pool_get_info");
+    LOAD(amd_allow,   "hsa_amd_agents_allow_access");
 
     hsa_status_t st = D->hsa_init();
     if (st != HSA_STATUS_SUCCESS) {
@@ -644,6 +648,11 @@ int bc_dispatch(bc_device_t *dev, const bc_kernel_t *kern,
         fprintf(stderr, "bc_runtime: kernarg pool alloc failed (0x%x)\n", st);
         return BC_RT_ERR_HSA;
     }
+
+    /* Grant GPU access to the kernarg buffer. Without this the IOMMU
+     * doesn't map the pages and s_load_dword returns zeros silently.
+     * Undocumented, of course. Thanks AMD. */
+    D->amd_allow(1, &D->gpu_agent, NULL, kernarg_buf);
 
     memset(kernarg_buf, 0, alloc_sz);
     memcpy(kernarg_buf, args, args_size);

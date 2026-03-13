@@ -432,6 +432,7 @@ typedef struct {
     uint32_t    vreg_count;
     uint16_t    reg_map[AMD_MAX_VREGS];    /* vreg -> phys reg */
     uint8_t     reg_file[AMD_MAX_VREGS];   /* 0=SGPR, 1=VGPR */
+    uint32_t    vr_divg[AMD_MAX_VREGS / 32]; /* 1=divergent per vreg */
 
     /* BIR value -> machine vreg mapping */
     uint32_t    val_vreg[BIR_MAX_INSTS];   /* BIR inst index -> vreg */
@@ -479,8 +480,29 @@ int  amdgpu_emit_elf(amd_module_t *amd, const char *path);
 /* Set to 1 to force linear scan instead of graph coloring */
 extern int amd_ra_lin;
 
+/* Set to 1 for divergence-aware SSA register allocation */
+extern int amd_ra_ssa;
+
 /* If non-zero, cap available VGPRs for regalloc (forces spills for testing) */
 extern int amd_max_vgpr;
+
+/* ---- Divergence Helpers ---- */
+
+static inline int vr_div(const amd_module_t *A, uint16_t vr)
+{ return (int)((A->vr_divg[vr / 32] >> (vr % 32)) & 1u); }
+
+static inline void vr_sdiv(amd_module_t *A, uint16_t vr)
+{ A->vr_divg[vr / 32] |= 1u << (vr % 32); }
+
+/* ---- Shared Helpers (emit.c, un-static for ra_ssa.c) ---- */
+
+uint16_t op_vreg(const moperand_t *op);
+void     rw_ops(amd_module_t *A, const mfunc_t *F);
+void     dce_copy(amd_module_t *A, const mfunc_t *F);
+void     fin_regs(const amd_module_t *A, mfunc_t *F);
+
+/* SSA register allocator (ra_ssa.c) */
+void ra_ssa(amd_module_t *A, uint32_t mf_idx);
 
 /* Encoding table (defined in amdgpu_emit.c) */
 extern const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT];

@@ -350,15 +350,35 @@ static uint32_t new_vreg(int is_vector)
         return AMD_MAX_VREGS - 1; /* saturate — better than wandering into the void */
     S.amd->vreg_count = v + 1;
     S.amd->reg_file[v] = (uint8_t)is_vector;
+    /* Propagate divergence to per-vreg bitvector.
+     * Most paths: is_vector correlates with divergence.
+     * FP ops force VGPR even when uniform — caller uses new_vrd. */
+    if (is_vector) vr_sdiv(S.amd, (uint16_t)v);
     return v;
 }
 
-/* Map a BIR instruction result to a virtual register */
+/* Create vreg with explicit divergence (for FP ops on uniform data) */
+static uint32_t new_vrd(int is_vec, int is_div)
+{
+    uint32_t v = S.amd->vreg_count;
+    if (v >= AMD_MAX_VREGS - 1)
+        return AMD_MAX_VREGS - 1;
+    S.amd->vreg_count = v + 1;
+    S.amd->reg_file[v] = (uint8_t)is_vec;
+    if (is_div) vr_sdiv(S.amd, (uint16_t)v);
+    return v;
+}
+
+/* Map a BIR instruction result to a virtual register.
+ * is_vector picks the register file (SGPR vs VGPR).
+ * Divergence comes from BIR-level analysis — FP ops may be
+ * VGPR (is_vector=1) but uniform (!divergent). */
 static uint32_t map_bir_val(uint32_t bir_inst, int is_vector)
 {
     if (bir_inst < BIR_MAX_INSTS && S.amd->val_vreg[bir_inst] != 0xFFFFFFFF)
         return S.amd->val_vreg[bir_inst];
-    uint32_t v = new_vreg(is_vector);
+    int div = (bir_inst < BIR_MAX_INSTS) ? is_divergent(bir_inst) : is_vector;
+    uint32_t v = new_vrd(is_vector, div);
     if (bir_inst < BIR_MAX_INSTS) {
         S.amd->val_vreg[bir_inst] = v;
         S.amd->val_file[bir_inst] = (uint8_t)is_vector;
@@ -2605,6 +2625,7 @@ int amdgpu_compile(const bir_module_t *bir, amd_module_t *amd)
     memset(amd->val_file, 0, sizeof(amd->val_file));
     memset(amd->reg_map, 0, sizeof(amd->reg_map));
     memset(amd->reg_file, 0, sizeof(amd->reg_file));
+    memset(amd->vr_divg, 0, sizeof(amd->vr_divg));
     memset(amd->val_sbase, 0xFF, sizeof(amd->val_sbase));
     memset(amd->val_scroff, 0xFF, sizeof(amd->val_scroff)); /* -1 = dynamic */
 
