@@ -215,7 +215,7 @@ The HLASM-style short identifiers (`ra_gc`, `mk_hash`, `enc_vop3`) are culturall
 
 ## Changelog
 
-**2026-03-14** — Divergence-aware SSA register allocator (`--ssa-ra`). Eliminates all 186 VGPR spills on a 654-line Monte Carlo transport kernel — scratch traffic drops 78%, total instructions drop 28%. Exploits the 64:1 cost asymmetry between divergent and uniform VGPR spills on Wave64 hardware: uniform values spill via `v_readfirstlane` at 4 bytes each, divergent values stay in registers where they belong. Based on the divergence analysis of Sampaio et al. (2013). ~1,300 lines of C99, all static memory, no malloc.
+**2026-03-14** — Divergence-aware SSA register allocator (`--ssa-ra`). Eliminates all 186 VGPR spills on a 654-line Monte Carlo transport kernel — scratch traffic drops 78%, total instructions drop 28%. Exploits the 64:1 cost asymmetry between divergent and uniform VGPR spills on Wave64 hardware: uniform values spill via `v_readfirstlane` at 4 bytes each, divergent values stay in registers where they belong. Based on the divergence analysis of Sampaio et al. (2013).
 
 **2026-03-09** — Post-isel verification pass (`bc_vfy`). The encoder used to trust isel to produce valid machine instructions. It shouldn't have. `bc_vfy` runs twice (post-isel, post-RA) and catches 5 classes of encoding violation before the binary leaves the compiler. Its first run immediately found 7 isel bugs across GFX10 and GFX942 — every one a silent miscompile that would fault on hardware with "Reason: Unknown." Fixed them all. Also: `bc_abend` runtime crash diagnostics, because if IBM could do post-mortem dumps in 1964, we can do it for GPUs in 2026.
 
