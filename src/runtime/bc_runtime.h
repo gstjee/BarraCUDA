@@ -51,6 +51,12 @@ void bc_unload_kernel(bc_device_t *dev, bc_kernel_t *kern);
 void *bc_alloc(bc_device_t *dev, size_t size);
 void bc_free(bc_device_t *dev, void *ptr);
 
+/* Track a GPU allocation for ABEND fault correlation.
+ * label = short name (e.g. "parts", "xs_data"), flags = AB_FL_* from bc_abend.h.
+ * Optional — but without it the dump can't tell you what you hit. */
+void bc_trak(bc_device_t *dev, void *ptr, size_t size,
+             const char *label, int flags);
+
 int bc_copy_h2d(bc_device_t *dev, void *dst, const void *src, size_t size);
 int bc_copy_d2h(bc_device_t *dev, void *dst, const void *src, size_t size);
 

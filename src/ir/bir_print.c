@@ -279,6 +279,10 @@ static void print_inst(const bir_module_t *M, const bir_inst_t *I,
         print_block_label(M, I->operands[1], base_block, out);
         fprintf(out, ", ");
         print_block_label(M, I->operands[2], base_block, out);
+        if (I->num_operands > 3) {
+            fprintf(out, " merge ");
+            print_block_label(M, I->operands[3], base_block, out);
+        }
         break;
 
     /* Switch: switch %val, default BLOCK, [const: BLOCK], ... */

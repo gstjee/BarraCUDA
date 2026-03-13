@@ -136,6 +136,38 @@ typedef struct {
     uint8_t  spilled;
 } live_interval_t;
 
+/* Spill relay registers, reserved physical registers that shuttle
+ * values between scratch memory and the instruction stream.
+ * Like a postal depot: your letter (value) gets loaded from the
+ * warehouse (scratch) into the van (relay), delivered to the
+ * recipient (instruction), and the van goes back for more.
+ *
+ * Both RDNA and CDNA: v250-v252 relays, allocatable v0..v249.
+ * GFX942 "512 unified VGPRs" is a lie — 256 ArchVGPR + 256 AccVGPR.
+ * AccVGPRs only speak MFMA.  Regular VOP/FLAT encoding is 8-bit,
+ * so v256+ silently wraps to v0+.  We learned this the hard way.
+ *
+ * SGPR s99/s98: scalar relays.  v_readfirstlane promotes VGPR to SGPR.
+ * Two relays because some instructions have two spilled SGPR sources.
+ * One relay? The second load clobbers the first.  We learned this
+ * when k_eff came back 0.000 because every spilled comparison
+ * compared a value with itself. Whack. */
+#define RA_RELAY_V0   250   /* v250-v252 */
+#define RA_VGPR_CEIL  250   /* v0..v249 allocatable */
+#define RA_NUM_RELAY  3
+#define RA_RELAY_S    99    /* first SGPR relay */
+#define RA_RELAY_S2   98    /* second SGPR relay */
+
+/* Spill slot map -- one scratch offset per evicted vreg.
+ * 512 spills should suffice for any kernel that isn't trying
+ * to simulate the entire observable universe in registers. */
+#define RA_MAX_SPILL  512
+static struct {
+    uint16_t vreg;
+    uint16_t off;     /* byte offset in scratch memory */
+} ra_spills[RA_MAX_SPILL];
+static uint32_t ra_nspill;
+
 /* Static storage for regalloc (~4 MB) */
 static struct {
     live_interval_t intervals[AMD_MAX_VREGS];
@@ -169,14 +201,18 @@ static int interval_cmp_start(const void *a, const void *b)
 }
 
 /* Get the vreg referenced by an operand, or 0xFFFF if not a vreg */
-static uint16_t operand_vreg(const moperand_t *op)
+uint16_t op_vreg(const moperand_t *op)
 {
     if (op->kind == MOP_VREG_S || op->kind == MOP_VREG_V)
         return op->reg_num;
     return 0xFFFF;
 }
+/* Legacy name used throughout this file */
+static uint16_t operand_vreg(const moperand_t *op) { return op_vreg(op); }
 
-static void compute_live_intervals(const amd_module_t *A, const mfunc_t *F)
+static uint32_t coalesce(amd_module_t *A, const mfunc_t *F);
+
+static void compute_live_intervals(amd_module_t *A, const mfunc_t *F)
 {
     RA.num_intervals = 0;
 
@@ -221,6 +257,183 @@ static void compute_live_intervals(const amd_module_t *A, const mfunc_t *F)
         }
     }
 
+    /* ---- Coalesce on raw intervals ----
+     * Do this BEFORE the back-edge and exec-mask extensions.
+     * The extensions inflate intervals conservatively, which makes
+     * nearly every copy pair interfere.  On raw [first_def, last_use]
+     * intervals, the copy point is where src dies and dst is born —
+     * no overlap.  Coalesce first, extend the merged intervals after.
+     * Order matters: Chaitin before conservatism. */
+    coalesce(A, F);
+
+    /* ---- Loop back-edge extension ----
+     * The linear scan above computes intervals as [first_def, last_use],
+     * blissfully ignorant of control flow.  A value used inside a loop
+     * body has its register freed after the last use — but the loop
+     * iterates, and the next pass finds the register holding someone
+     * else's laundry.  MEMORY_APERTURE_VIOLATION ensues.
+     *
+     * Fix: scan for back edges (branch from block B to earlier block H).
+     * Any interval alive inside the loop [H.first_inst, B.last_inst]
+     * must extend to B.last_inst.  Iterate to fixpoint for nested loops.
+     */
+    {
+        /* Collect back edges: (header_inst, tail_inst) pairs */
+        struct { uint32_t hdr; uint32_t tail; } bedge[64];
+        uint32_t n_be = 0;
+
+        for (uint32_t bi = 0; bi < F->num_blocks && n_be < 64; bi++) {
+            const mblock_t *MB = &A->mblocks[F->first_block + bi];
+            if (MB->num_insts == 0) continue;
+            uint32_t last = MB->first_inst + MB->num_insts - 1;
+            const minst_t *mi = &A->minsts[last];
+            /* Check all operands for label targets */
+            uint8_t total = mi->num_defs + mi->num_uses;
+            if (total > MINST_MAX_OPS) total = MINST_MAX_OPS;
+            for (uint8_t k = 0; k < total; k++) {
+                if (mi->operands[k].kind == MOP_LABEL) {
+                    uint32_t tgt = (uint32_t)mi->operands[k].imm;
+                    if (tgt < F->first_block + bi && tgt >= F->first_block) {
+                        const mblock_t *H = &A->mblocks[tgt];
+                        bedge[n_be].hdr  = H->first_inst;
+                        bedge[n_be].tail = last;
+                        n_be++;
+                    }
+                }
+            }
+        }
+
+        /* Extend intervals across back edges — iterate to fixpoint */
+        int changed = 1;
+        int guard = 32;
+        while (changed && guard-- > 0) {
+            changed = 0;
+            for (uint32_t e = 0; e < n_be; e++) {
+                uint32_t hdr  = bedge[e].hdr;
+                uint32_t tail = bedge[e].tail;
+                for (uint32_t v = 0; v < A->vreg_count && v < AMD_MAX_VREGS; v++) {
+                    if (RA.intervals[v].start == 0xFFFFFFFF) continue;
+                    /* Only extend values defined AT or BEFORE the loop
+                     * header — these are loop-invariant or PHI results
+                     * that must survive the back edge.  Values defined
+                     * INSIDE the loop body get re-materialised each
+                     * iteration and don't need extension.  The previous
+                     * condition (start <= tail) was catastrophically
+                     * aggressive: every temporary in the loop got
+                     * extended, register pressure went through the roof,
+                     * the spill path panicked, and the compiler segfaulted
+                     * into a pile of smoking silicon. */
+                    if (RA.intervals[v].start <= hdr  &&
+                        RA.intervals[v].end   >= hdr  &&
+                        RA.intervals[v].end   <  tail) {
+                        RA.intervals[v].end = tail;
+                        changed = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /* ---- Exec mask region extension ----
+     * Same principle as above, different villain.  Values alive
+     * across a saveexec→restore pair must survive the entire
+     * masked region.  Without this, the linear scan sees the
+     * last use inside the mask, frees the register, and some
+     * RNG temporary moves in.  Then exec restores, the formula
+     * reads the RNG's leftovers, and k_eff goes to zero.
+     * The hardware does not care about your feelings. */
+    {
+        /* Pair saveexec/restore using a bounded nesting stack.
+         * Structured control flow means they nest properly. */
+        struct { uint32_t save; uint32_t rest; } eregion[64];
+        uint32_t n_er = 0;
+        uint32_t estack[32];
+        uint32_t esp = 0;
+
+        for (uint32_t bi = 0; bi < F->num_blocks && n_er < 64; bi++) {
+            const mblock_t *MB = &A->mblocks[F->first_block + bi];
+            for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+                uint32_t mi_idx = MB->first_inst + ii;
+                const minst_t *mi = &A->minsts[mi_idx];
+
+                /* saveexec → push */
+                if (mi->op == AMD_S_AND_SAVEEXEC_B64 ||
+                    mi->op == AMD_S_AND_SAVEEXEC_B32) {
+                    if (esp < 32)
+                        estack[esp++] = mi_idx;
+                    continue;
+                }
+
+                /* exec restore (OR/XOR to EXEC) → pop and record */
+                if ((mi->op == AMD_S_OR_B64  || mi->op == AMD_S_OR_B32 ||
+                     mi->op == AMD_S_XOR_B64 || mi->op == AMD_S_XOR_B32) &&
+                    mi->num_defs > 0 &&
+                    mi->operands[0].kind == MOP_SPECIAL &&
+                    mi->operands[0].imm == AMD_SPEC_EXEC) {
+                    if (esp > 0 && n_er < 64) {
+                        eregion[n_er].save = estack[--esp];
+                        eregion[n_er].rest = mi_idx;
+                        n_er++;
+                    }
+                }
+            }
+        }
+
+        /* Extend intervals that straddle a masked region.
+         * If you were alive before the saveexec and your last
+         * use is inside the mask, you need to survive until
+         * the restore — even if nobody mentions you in between. */
+        for (uint32_t e = 0; e < n_er; e++) {
+            uint32_t sav = eregion[e].save;
+            uint32_t rst = eregion[e].rest;
+            for (uint32_t v = 0; v < A->vreg_count && v < AMD_MAX_VREGS; v++) {
+                if (RA.intervals[v].start == 0xFFFFFFFF) continue;
+                if (RA.intervals[v].start <= sav &&
+                    RA.intervals[v].end   >= sav &&
+                    RA.intervals[v].end   <  rst) {
+                    RA.intervals[v].end = rst;
+                }
+            }
+        }
+    }
+
+    /* ---- Prologue SGPR extension ----
+     * Function parameters and system SGPRs are defined in the entry
+     * block and semantically live for the entire kernel — they're
+     * inputs, not temporaries.  The back-edge and exec-mask extensions
+     * usually get this right, but not always: a scalar param used
+     * once deep in a nested loop can fall through the cracks when
+     * diamond patterns eat the extension stack.
+     *
+     * Fix: any SGPR defined in the first block whose value escapes
+     * to a later block gets pinned to the function's last instruction.
+     * This costs a handful of SGPRs worth of pressure.  Cheap
+     * insurance against the allocator recycling k_eff's register
+     * to store someone else's loop counter. */
+    {
+        uint32_t last_inst = 0;
+        for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+            const mblock_t *MB = &A->mblocks[F->first_block + bi];
+            if (MB->num_insts > 0) {
+                uint32_t ei = MB->first_inst + MB->num_insts - 1;
+                if (ei > last_inst) last_inst = ei;
+            }
+        }
+        if (F->num_blocks > 0 && last_inst > 0) {
+            const mblock_t *MB0 = &A->mblocks[F->first_block];
+            uint32_t blk0_end = MB0->first_inst + MB0->num_insts;
+            for (uint32_t v = 0; v < A->vreg_count && v < AMD_MAX_VREGS; v++) {
+                if (RA.intervals[v].start == 0xFFFFFFFF) continue;
+                if (RA.intervals[v].file != 0) continue; /* SGPRs only */
+                if (RA.intervals[v].start < blk0_end &&
+                    RA.intervals[v].end   >= blk0_end &&
+                    RA.intervals[v].end   <  last_inst) {
+                    RA.intervals[v].end = last_inst;
+                }
+            }
+        }
+    }
+
     /* Collect valid intervals */
     RA.num_intervals = 0;
     for (uint32_t v = 0; v < A->vreg_count && v < AMD_MAX_VREGS; v++) {
@@ -231,6 +444,96 @@ static void compute_live_intervals(const amd_module_t *A, const mfunc_t *F)
 
     /* Sort by start point */
     qsort(RA.sorted, RA.num_intervals, sizeof(uint32_t), interval_cmp_start);
+}
+
+/* ---- Chaitin Coalescing (IBM Research, 1981) ----
+ * Two vregs joined by a copy whose live ranges don't overlap can
+ * share one register.  The copy evaporates.  Chaitin figured this
+ * out while building the PL.8 register allocator at Yorktown
+ * Heights; Dewar arrived at the same insight from the SPITBOL
+ * direction.  We're 45 years late to the party but the drinks
+ * are still good.
+ *
+ * This eliminates PHI copies that phi_elim inserted, which is
+ * the main source of register pressure inflation.  A kernel
+ * that needs 350 vregs often has 150 that are just copy aliases
+ * of each other.  After coalescing, the linear scan sees the
+ * truth: maybe 200 unique live values, which fit in 250 VGPRs
+ * without spilling. */
+static uint32_t coalesce(amd_module_t *A, const mfunc_t *F)
+{
+    int changed = 1;
+    int guard = 16;
+    uint32_t n_coal = 0;
+    uint32_t n_intf = 0, n_cand = 0;
+
+    while (changed && guard-- > 0) {
+        changed = 0;
+        for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
+            const mblock_t *MB = &A->mblocks[F->first_block + bi];
+            for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+                uint32_t mi_idx = MB->first_inst + ii;
+                minst_t *mi = &A->minsts[mi_idx];
+
+                if (mi->op != AMD_PSEUDO_COPY) continue;
+                if (mi->num_defs != 1 || mi->num_uses != 1) continue;
+
+                uint16_t dst = operand_vreg(&mi->operands[0]);
+                uint16_t src = operand_vreg(&mi->operands[1]);
+                if (dst == 0xFFFF || src == 0xFFFF) continue;
+                if (dst == src) continue;
+
+                /* Same register file — can't merge SGPR with VGPR */
+                if (RA.intervals[dst].file != RA.intervals[src].file)
+                    continue;
+
+                /* Both must be live (not already killed by prior merge) */
+                if (RA.intervals[dst].start == 0xFFFFFFFF ||
+                    RA.intervals[src].start == 0xFFFFFFFF) continue;
+
+                n_cand++;
+
+                /* Interference: strict overlap of closed intervals. */
+                uint32_t s1 = RA.intervals[src].start;
+                uint32_t e1 = RA.intervals[src].end;
+                uint32_t s2 = RA.intervals[dst].start;
+                uint32_t e2 = RA.intervals[dst].end;
+
+                if (s1 < e2 && s2 < e1) { n_intf++; continue; }
+
+                /* Coalesce: src absorbs dst */
+                if (s2 < s1) RA.intervals[src].start = s2;
+                if (e2 > e1) RA.intervals[src].end = e2;
+                RA.intervals[dst].start = 0xFFFFFFFF;
+                RA.intervals[dst].end = 0;
+
+                /* Rename dst→src across the entire function */
+                for (uint32_t rb = 0; rb < F->num_blocks; rb++) {
+                    const mblock_t *RB = &A->mblocks[F->first_block + rb];
+                    for (uint32_t rj = 0; rj < RB->num_insts; rj++) {
+                        minst_t *mj = &A->minsts[RB->first_inst + rj];
+                        uint8_t tot = mj->num_defs + mj->num_uses;
+                        if (tot > MINST_MAX_OPS) tot = MINST_MAX_OPS;
+                        for (uint8_t k = 0; k < tot; k++) {
+                            if (operand_vreg(&mj->operands[k]) == dst)
+                                mj->operands[k].reg_num = src;
+                        }
+                    }
+                }
+
+                /* Kill the copy — its work is done */
+                mi->op = AMD_S_NOP;
+                mi->num_defs = 0;
+                mi->num_uses = 0;
+
+                n_coal++;
+                changed = 1;
+            }
+        }
+    }
+    if (n_coal > 0)
+        fprintf(stderr, "  coalesce: %u/%u copies merged\n", n_coal, n_cand);
+    return n_coal;
 }
 
 static void expire_old(uint32_t point)
@@ -255,7 +558,7 @@ static void expire_old(uint32_t point)
 }
 
 /* Rewrite virtual reg operands to physical */
-static void rw_ops(amd_module_t *A, const mfunc_t *F)
+void rw_ops(amd_module_t *A, const mfunc_t *F)
 {
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
         const mblock_t *MB = &A->mblocks[F->first_block + bi];
@@ -268,12 +571,30 @@ static void rw_ops(amd_module_t *A, const mfunc_t *F)
 
             for (uint8_t k = 0; k < total; k++) {
                 moperand_t *op = &mi->operands[k];
-                if (op->kind == MOP_VREG_S) {
-                    op->kind = MOP_SGPR;
-                    op->reg_num = A->reg_map[op->reg_num];
-                } else if (op->kind == MOP_VREG_V) {
-                    op->kind = MOP_VGPR;
-                    op->reg_num = A->reg_map[op->reg_num];
+                if (op->kind == MOP_VREG_S || op->kind == MOP_VREG_V) {
+                    uint16_t vr = op->reg_num;
+                    /* Use reg_file[] as the authority — operand kind
+                     * can disagree after SMEM→VALU hazard promotion
+                     * (vreg promoted to VGPR file but still referenced
+                     * as MOP_VREG_S at some use sites). */
+                    if (A->reg_file[vr])
+                        op->kind = MOP_VGPR;
+                    else
+                        op->kind = MOP_SGPR;
+                    uint16_t phys = A->reg_map[vr];
+                    if (phys == 0xFFFF) {
+                        /* Spilled vreg: encode slot index with bit 15
+                         * so the spill resolution pass can find it.
+                         * Without this the 0xFFFF passes straight through
+                         * and the verifier rightfully complains. */
+                        for (uint32_t si = 0; si < ra_nspill; si++) {
+                            if (ra_spills[si].vreg == vr) {
+                                phys = (uint16_t)(0x8000u | si);
+                                break;
+                            }
+                        }
+                    }
+                    op->reg_num = phys;
                 }
             }
 
@@ -296,7 +617,7 @@ static void rw_ops(amd_module_t *A, const mfunc_t *F)
    These appear when regalloc assigns the same phys reg to both sides
    of a copy. Harmless but noisy — like a postman delivering a letter
    back to the sender. */
-static void dce_copy(amd_module_t *A, const mfunc_t *F)
+void dce_copy(amd_module_t *A, const mfunc_t *F)
 {
     for (uint32_t bi = 0; bi < F->num_blocks; bi++) {
         const mblock_t *MB = &A->mblocks[F->first_block + bi];
@@ -314,40 +635,11 @@ static void dce_copy(amd_module_t *A, const mfunc_t *F)
                 mi->num_uses = 0;
                 continue;
             }
-
-            if ((mi->op == AMD_V_MOV_B32 || mi->op == AMD_S_MOV_B32 ||
-                 mi->op == AMD_PSEUDO_COPY) &&
-                mi->num_defs == 1 && ii + 1 < MB->num_insts) {
-                const minst_t *next = &A->minsts[MB->first_inst + ii + 1];
-                uint16_t dst_reg = mi->operands[0].reg_num;
-                uint8_t  dst_kind = mi->operands[0].kind;
-
-                int next_uses = 0;
-                for (uint8_t u = next->num_defs;
-                     u < next->num_defs + next->num_uses && u < MINST_MAX_OPS; u++) {
-                    if (next->operands[u].kind == dst_kind &&
-                        next->operands[u].reg_num == dst_reg)
-                        next_uses = 1;
-                }
-
-                int next_defs = 0;
-                for (uint8_t d = 0; d < next->num_defs && d < MINST_MAX_OPS; d++) {
-                    if (next->operands[d].kind == dst_kind &&
-                        next->operands[d].reg_num == dst_reg)
-                        next_defs = 1;
-                }
-
-                if (next_defs && !next_uses) {
-                    mi->op = AMD_PSEUDO_DEF;
-                    mi->num_defs = 0;
-                    mi->num_uses = 0;
-                }
-            }
         }
     }
 }
 
-static void fin_regs(const amd_module_t *A, mfunc_t *F)
+void fin_regs(const amd_module_t *A, mfunc_t *F)
 {
     /* Minimum 1 SGPR/VGPR for the descriptor */
     if (F->num_sgprs == 0) F->num_sgprs = 1;
@@ -387,16 +679,19 @@ static void ra_lin(amd_module_t *A, uint32_t mf_idx)
     uint16_t sgpr_start = F->is_kernel ? F->first_alloc_sgpr : 0;
     if (sgpr_start < AMD_KERN_MIN_RESERVED && F->is_kernel)
         sgpr_start = AMD_KERN_MIN_RESERVED;
-    for (uint16_t r = AMD_MAX_SGPRS; r-- > sgpr_start; )
+    for (uint16_t r = AMD_MAX_SGPRS; r-- > sgpr_start; ) {
+        if (r == RA_RELAY_S || r == RA_RELAY_S2) continue; /* reserved for spill relays */
         RA.sgpr_free[RA.num_sgpr_free++] = (uint8_t)r;
-
-    /* CDNA flat scratch reserves v250:v251 as addr staging pair */
-    int cdna_scr = (A->target <= AMD_TARGET_GFX942 && F->scratch_bytes > 0);
-    for (uint16_t r = AMD_MAX_VGPRS; r-- > 0; ) {
-        if (cdna_scr && (r == AMD_VGPR_SCR_LO || r == AMD_VGPR_SCR_HI))
-            continue;
-        RA.vgpr_free[RA.num_vgpr_free++] = (uint8_t)r;
     }
+
+    /* VGPR pool: v0..v249 on both targets.  v250-v252 reserved
+     * for spill relays.  GFX942's AccVGPRs are MFMA-only — the
+     * 8-bit encoding fields in VOP/FLAT literally can't see them.
+     * We tried.  The hardware was unimpressed. */
+    for (uint16_t r = RA_VGPR_CEIL; r-- > 0; )
+        RA.vgpr_free[RA.num_vgpr_free++] = (uint8_t)r;
+
+    ra_nspill = 0;
 
     compute_live_intervals(A, F);
 
@@ -434,26 +729,58 @@ static void ra_lin(amd_module_t *A, uint32_t mf_idx)
                 }
             }
             if (farthest > iv->end && RA.num_active > 0) {
-                /* Spill the farthest, give its reg to us */
+                /* Evict the farthest — commandeer its register.
+                 * The evicted vreg gets a scratch slot and will be
+                 * loaded/stored via relay VGPRs at every use/def.
+                 * Expensive, but better than two values sharing
+                 * one register like flatmates sharing one toothbrush. */
                 uint32_t sv = RA.active[farthest_idx];
                 phys = RA.intervals[sv].phys;
                 RA.intervals[sv].spilled = 1;
                 RA.intervals[sv].phys = 0xFFFF;
-                /* Remove from active */
+                A->reg_map[sv] = 0xFFFF;
+                if (ra_nspill < RA_MAX_SPILL) {
+                    ra_spills[ra_nspill].vreg = (uint16_t)sv;
+                    ra_spills[ra_nspill].off = (uint16_t)(F->scratch_bytes +
+                                               ra_nspill * 4u);
+                    ra_nspill++;
+                }
                 RA.active[farthest_idx] = RA.active[--RA.num_active];
             } else {
-                /* Spill ourselves */
+                /* Spill ourselves — no register, straight to scratch.
+                 * The compiler equivalent of being told the hotel is
+                 * full and you'll be sleeping in the car park. */
                 iv->spilled = 1;
-                phys = 0; /* fallback */
+                phys = 0xFFFF;
+                if (ra_nspill < RA_MAX_SPILL) {
+                    ra_spills[ra_nspill].vreg = (uint16_t)v;
+                    ra_spills[ra_nspill].off = (uint16_t)(F->scratch_bytes +
+                                               ra_nspill * 4u);
+                    ra_nspill++;
+                }
             }
         }
 
         iv->phys = phys;
         A->reg_map[v] = phys;
 
-        /* Add to active */
-        if (RA.num_active < AMD_MAX_VREGS)
+        /* Add to active — but NOT self-spilled intervals.  Their
+         * phys=0 "fallback" is a lie, and expire_old would free
+         * register 0 back to the pool when it shouldn't.  That
+         * corrupts the free list and eventually overflows the
+         * vgpr_free[256] buffer.  Ask me how I know. */
+        if (!iv->spilled && RA.num_active < AMD_MAX_VREGS)
             RA.active[RA.num_active++] = v;
+    }
+
+    if (ra_nspill > 0) {
+        uint32_t vs = 0, ss = 0;
+        for (uint32_t si = 0; si < ra_nspill; si++) {
+            if (RA.intervals[ra_spills[si].vreg].file == 0) ss++;
+            else vs++;
+        }
+        fprintf(stderr, "  regalloc: %u spills (%uV %uS)\n",
+                ra_nspill, vs, ss);
     }
 
     /* Record usage for kernel descriptor.
@@ -465,13 +792,327 @@ static void ra_lin(amd_module_t *A, uint32_t mf_idx)
         F->num_sgprs = F->first_alloc_sgpr;
     F->num_vgprs = RA.max_vgpr;
 
-    /* CDNA flat scratch: v250:v251 are physical, not regalloc'd */
-    if (cdna_scr && F->num_vgprs < AMD_VGPR_SCR_HI + 1)
-        F->num_vgprs = AMD_VGPR_SCR_HI + 1;
-
+    /* Match old regalloc_function order exactly:
+     * 1. min SGPR/VGPR + launch_bounds
+     * 2. rw_ops (virtual→physical)
+     * 3. DCE (self-copy only)
+     * 4. spill resolution */
     fin_regs(A, F);
+
+    /* Rewrite virtual→physical BEFORE spill resolution.
+     * Spill resolution scans for 0x8000-encoded reg_nums to find
+     * spilled operands, and reads physical SGPRs from scratch ops
+     * to find scr_sgpr.  Without this, everything is still virtual
+     * and the spill code sees nothing to resolve. */
     rw_ops(A, F);
+
+    /* Dead copy elimination BEFORE spill resolution — matches old
+     * regalloc_function order.  Kill self-copies so spill resolution
+     * doesn't waste time inserting load/store plumbing around no-ops. */
     dce_copy(A, F);
+
+    /* ---- Spill Resolution ----
+     * When the register file runs dry, evicted values get parked in
+     * scratch memory.  Now we walk the instruction stream and insert
+     * the actual load/store plumbing -- scratch_load before every use,
+     * scratch_store after every def.  The relay VGPRs (v250-v252) are
+     * the middlemen: values hop from scratch to relay to instruction
+     * and back.
+     *
+     * This is the register allocator's overflow car park at the
+     * airport: slow, far from the terminal, but at least your car
+     * doesn't get towed.  Without this, two values share one register
+     * and corrupt each other silently.  We know because k_eff read
+     * 0.000 for three days while n_mat quietly aliased to zero. */
+    if (ra_nspill > 0) {
+        /* Find the scratch frame-pointer SGPR by scanning for an
+         * existing scratch op.  If we're spilling, we have scratch. */
+        uint16_t scr_sgpr = 0;
+        for (uint32_t bi = 0; bi < F->num_blocks && scr_sgpr == 0; bi++) {
+            mblock_t *MB = &A->mblocks[F->first_block + bi];
+            for (uint32_t ii = 0; ii < MB->num_insts; ii++) {
+                minst_t *mi = &A->minsts[MB->first_inst + ii];
+                if (mi->op == AMD_SCRATCH_LOAD_DWORD ||
+                    mi->op == AMD_SCRATCH_STORE_DWORD) {
+                    scr_sgpr = mi->operands[1].reg_num;
+                    break;
+                }
+            }
+        }
+
+        /* Account for spill area in scratch allocation */
+        F->scratch_bytes += ra_nspill * 4u;
+
+        /* Hoist scratch FP init to the very first instruction.
+         * The scheduler may have moved kernarg loads ahead of the
+         * original s_mov_b32 scrfp,0 — and spill ops around those
+         * early instructions would fire before the FP is set,
+         * sending scratch accesses to whatever address the CP
+         * left in the register.  We learned this the hard way:
+         * TEA pointed to a host address, which is the GPU's
+         * polite way of saying "that's not yours." */
+        if (scr_sgpr > 0) {
+            mblock_t *B0 = &A->mblocks[F->first_block];
+            uint32_t pos = B0->first_inst;
+            if (A->num_minsts + 1 < AMD_MAX_MINSTS) {
+                uint32_t tail = A->num_minsts - pos;
+                memmove(&A->minsts[pos + 1], &A->minsts[pos],
+                        tail * sizeof(minst_t));
+                A->num_minsts++;
+                B0->num_insts++;
+                for (uint32_t lb = F->first_block + 1;
+                     lb < F->first_block + F->num_blocks; lb++)
+                    A->mblocks[lb].first_inst++;
+                minst_t *fp = &A->minsts[pos];
+                memset(fp, 0, sizeof(minst_t));
+                fp->op = AMD_S_MOV_B32;
+                fp->num_defs = 1;
+                fp->num_uses = 1;
+                fp->operands[0].kind = MOP_SGPR;
+                fp->operands[0].reg_num = scr_sgpr;
+                fp->operands[1].kind = MOP_IMM;
+                fp->operands[1].imm = 0;
+            }
+        }
+
+        /* Process blocks backwards -- insertions shift later addresses,
+         * so going backwards means we never revisit shifted territory. */
+        for (int bi = (int)F->num_blocks - 1; bi >= 0; bi--) {
+            mblock_t *MB = &A->mblocks[F->first_block + (uint32_t)bi];
+
+            for (int ii = (int)MB->num_insts - 1; ii >= 0; ii--) {
+                uint32_t mi_idx = MB->first_inst + (uint32_t)ii;
+                minst_t *mi = &A->minsts[mi_idx];
+                if (mi->op == AMD_PSEUDO_DEF) continue;
+
+                uint8_t total = mi->num_defs + mi->num_uses;
+                if (total > MINST_MAX_OPS) total = MINST_MAX_OPS;
+
+                /* Detect spilled operands (bit 15 set by rewrite).
+                 * VGPR source = 2 insns (load + wait).
+                 * SGPR source = 3 insns (load + wait + readfirstlane).
+                 * VGPR dest   = 1 insn  (store).
+                 * SGPR dest   = 2 insns (v_mov + store). */
+                uint32_t n_insert = 0;
+                int has_spill = 0;
+                for (uint8_t k = 0; k < total; k++) {
+                    if (!(mi->operands[k].reg_num & 0x8000u)) continue;
+                    if (mi->operands[k].kind != MOP_VGPR &&
+                        mi->operands[k].kind != MOP_SGPR) continue;
+                    has_spill = 1;
+                    int is_sgpr = (mi->operands[k].kind == MOP_SGPR);
+                    if (k < mi->num_defs)
+                        n_insert += is_sgpr ? 2u : 1u;
+                    else
+                        n_insert += is_sgpr ? 3u : 2u;
+                }
+                if (!has_spill) continue;
+
+                /* Account for the trailing s_waitcnt after dest stores.
+                 * n_post gets +1 later (line ~955), but n_insert feeds
+                 * the memmove — miss this and the waitcnt writes one
+                 * slot past the gap, overwriting the next instruction.
+                 * The off-by-one that ate six hours of debugging. */
+                {
+                    int has_dest_spill = 0;
+                    for (uint8_t k2 = 0; k2 < mi->num_defs; k2++) {
+                        if ((mi->operands[k2].reg_num & 0x8000u) &&
+                            (mi->operands[k2].kind == MOP_VGPR ||
+                             mi->operands[k2].kind == MOP_SGPR)) {
+                            has_dest_spill = 1;
+                            break;
+                        }
+                    }
+                    if (has_dest_spill) n_insert += 1;
+                }
+
+                uint32_t tail_start = mi_idx + 1;
+                uint32_t tail_len = A->num_minsts - tail_start;
+                if (A->num_minsts + n_insert >= AMD_MAX_MINSTS) continue;
+
+                memmove(&A->minsts[tail_start + n_insert],
+                        &A->minsts[tail_start],
+                        tail_len * sizeof(minst_t));
+                A->num_minsts += n_insert;
+                MB->num_insts += n_insert;
+
+                for (uint32_t later = F->first_block + (uint32_t)bi + 1;
+                     later < F->first_block + F->num_blocks; later++)
+                    A->mblocks[later].first_inst += n_insert;
+
+                mi = &A->minsts[mi_idx];
+
+                /* Assign relay VGPRs and remember who was scalar.
+                 * Scratch is VMEM — all loads land in VGPRs first.
+                 * Scalar operands then hop across the VGPR/SGPR border
+                 * via v_readfirstlane (sources) or v_mov (dests).
+                 * Two bus changes and a customs declaration, but at
+                 * least nothing gets silently aliased to zero. */
+                uint16_t relay[MINST_MAX_OPS];
+                uint16_t soff[MINST_MAX_OPS];
+                uint8_t  was_sgpr[MINST_MAX_OPS];
+                uint16_t sgpr_relay[MINST_MAX_OPS]; /* which SGPR relay */
+                uint8_t rn = 0;
+                uint8_t sgpr_rn = 0;  /* tracks SGPR relay assignment */
+                uint32_t n_pre = 0, n_post = 0;
+                for (uint8_t k = 0; k < total; k++) {
+                    relay[k] = 0xFFFF;
+                    soff[k] = 0;
+                    was_sgpr[k] = 0;
+                    sgpr_relay[k] = RA_RELAY_S;
+                    if ((mi->operands[k].kind == MOP_VGPR ||
+                         mi->operands[k].kind == MOP_SGPR) &&
+                        (mi->operands[k].reg_num & 0x8000u)) {
+                        uint16_t si = mi->operands[k].reg_num & 0x7FFFu;
+                        if (si < ra_nspill) soff[k] = ra_spills[si].off;
+                        was_sgpr[k] = (mi->operands[k].kind == MOP_SGPR);
+                        relay[k] = (uint16_t)(RA_RELAY_V0 +
+                                   (rn % RA_NUM_RELAY));
+                        rn++;
+                        if (rn > RA_NUM_RELAY)
+                            fprintf(stderr, "  WARN: %u spilled ops in one insn (op %u)\n", rn, mi->op);
+                        if (k < mi->num_defs) {
+                            /* Dest: instruction writes SGPR relay or
+                             * relay VGPR, then we store to scratch. */
+                            if (was_sgpr[k]) {
+                                sgpr_relay[k] = (sgpr_rn % 2) ? RA_RELAY_S2 : RA_RELAY_S;
+                                sgpr_rn++;
+                                mi->operands[k].kind = MOP_SGPR;
+                                mi->operands[k].reg_num = sgpr_relay[k];
+                                n_post += 2; /* v_mov + store */
+                            } else {
+                                mi->operands[k].kind = MOP_VGPR;
+                                mi->operands[k].reg_num = relay[k];
+                                n_post += 1; /* store */
+                            }
+                        } else {
+                            /* Source: load from scratch into relay VGPR,
+                             * then readfirstlane if the instruction
+                             * expects an SGPR. */
+                            if (was_sgpr[k]) {
+                                sgpr_relay[k] = (sgpr_rn % 2) ? RA_RELAY_S2 : RA_RELAY_S;
+                                sgpr_rn++;
+                                mi->operands[k].kind = MOP_SGPR;
+                                mi->operands[k].reg_num = sgpr_relay[k];
+                                n_pre += 3; /* load + wait + rfl */
+                            } else {
+                                mi->operands[k].kind = MOP_VGPR;
+                                mi->operands[k].reg_num = relay[k];
+                                n_pre += 2; /* load + wait */
+                            }
+                        }
+                    }
+                }
+                n_post++; /* waitcnt after stores */
+
+                /* Slide instruction right to make room for source loads.
+                 * Layout: [loads+waits+rfl] [instruction] [mov+stores] */
+                uint32_t inst_pos = mi_idx + n_pre;
+                if (n_pre > 0) {
+                    A->minsts[inst_pos] = A->minsts[mi_idx];
+                    mi = &A->minsts[inst_pos];
+                }
+
+                /* ---- Source loads ----
+                 * Each spilled source: scratch_load → s_waitcnt → (rfl).
+                 * The scratch→VGPR→SGPR journey: data climbs out of the
+                 * scratch cellar through the VGPR ground floor, then
+                 * takes the lift to the SGPR penthouse.  v_readfirstlane
+                 * is the lift — it copies lane 0 from the VGPR to an
+                 * SGPR, which is exactly what you want for a uniform
+                 * scalar value that got evicted during a register
+                 * shortage.  All lanes have the same value anyway. */
+                uint32_t lp = mi_idx;
+                for (uint8_t k = mi->num_defs; k < total; k++) {
+                    if (relay[k] == 0xFFFF) continue;
+
+                    minst_t *ld = &A->minsts[lp++];
+                    memset(ld, 0, sizeof(minst_t));
+                    ld->op = AMD_SCRATCH_LOAD_DWORD;
+                    ld->num_defs = 1;
+                    ld->num_uses = 2;
+                    ld->operands[0].kind = MOP_VGPR;
+                    ld->operands[0].reg_num = relay[k];
+                    ld->operands[1].kind = MOP_SGPR;
+                    ld->operands[1].reg_num = scr_sgpr;
+                    ld->operands[2].kind = MOP_IMM;
+                    ld->operands[2].imm = (int32_t)soff[k];
+
+                    minst_t *wt = &A->minsts[lp++];
+                    memset(wt, 0, sizeof(minst_t));
+                    wt->op = AMD_S_WAITCNT;
+                    wt->flags = AMD_WAIT_VMCNT0;
+
+                    /* SGPR source: one more hop.  readfirstlane ferries
+                     * lane 0 from the VGPR relay to the SGPR relay.
+                     * Two SGPR relays (s99/s98) prevent the second load
+                     * from clobbering the first. */
+                    if (was_sgpr[k]) {
+                        minst_t *rf = &A->minsts[lp++];
+                        memset(rf, 0, sizeof(minst_t));
+                        rf->op = AMD_V_READFIRSTLANE_B32;
+                        rf->num_defs = 1;
+                        rf->num_uses = 1;
+                        rf->operands[0].kind = MOP_SGPR;
+                        rf->operands[0].reg_num = sgpr_relay[k];
+                        rf->operands[1].kind = MOP_VGPR;
+                        rf->operands[1].reg_num = relay[k];
+                    }
+                }
+
+                /* ---- Dest stores ----
+                 * Each spilled dest: (v_mov for SGPR) → scratch_store.
+                 * SGPR dests write s99, then v_mov copies s99 into a
+                 * VGPR relay for the scratch_store.  This is the
+                 * reverse of the source journey — value descends from
+                 * the SGPR penthouse back down to the scratch cellar. */
+                uint32_t sp = inst_pos + 1;
+                for (uint8_t k = 0; k < mi->num_defs; k++) {
+                    if (relay[k] == 0xFFFF) continue;
+
+                    uint16_t store_vgpr = relay[k];
+
+                    if (was_sgpr[k]) {
+                        /* SGPR relay → VGPR relay so scratch_store can reach it */
+                        minst_t *mv = &A->minsts[sp++];
+                        memset(mv, 0, sizeof(minst_t));
+                        mv->op = AMD_V_MOV_B32;
+                        mv->num_defs = 1;
+                        mv->num_uses = 1;
+                        mv->operands[0].kind = MOP_VGPR;
+                        mv->operands[0].reg_num = relay[k];
+                        mv->operands[1].kind = MOP_SGPR;
+                        mv->operands[1].reg_num = sgpr_relay[k];
+                    }
+
+                    minst_t *st = &A->minsts[sp++];
+                    memset(st, 0, sizeof(minst_t));
+                    st->op = AMD_SCRATCH_STORE_DWORD;
+                    st->num_defs = 0;
+                    st->num_uses = 3;
+                    st->operands[0].kind = MOP_VGPR;
+                    st->operands[0].reg_num = store_vgpr;
+                    st->operands[1].kind = MOP_SGPR;
+                    st->operands[1].reg_num = scr_sgpr;
+                    st->operands[2].kind = MOP_IMM;
+                    st->operands[2].imm = (int32_t)soff[k];
+                }
+
+                /* Fence: wait for all dest stores to land before any
+                 * later instruction tries to reload from the same slot.
+                 * Without this, scratch_load races scratch_store and
+                 * the relay delivers last Tuesday's value. */
+                if (n_post > 1) {
+                    minst_t *wt2 = &A->minsts[sp++];
+                    memset(wt2, 0, sizeof(minst_t));
+                    wt2->op = AMD_S_WAITCNT;
+                    wt2->flags = AMD_WAIT_VMCNT0;
+                }
+            }
+        }
+    }
+
+    /* fin_regs already called before rw_ops (matching old order) */
 }
 
 /* ---- Graph Coloring Register Allocation ---- */
@@ -1328,12 +1969,16 @@ static void ra_gc(amd_module_t *A, uint32_t mf_idx)
 
 /* Global flag: set by --no-graphcolor to force linear scan */
 int amd_ra_lin = 0;
+/* SSA-based divergence-aware allocator */
+int amd_ra_ssa = 0;
 /* If non-zero, cap available VGPRs for regalloc (forces spills for testing) */
 int amd_max_vgpr = 0;
 
 static void ra_func(amd_module_t *A, uint32_t mf_idx)
 {
-    if (amd_ra_lin || A->vreg_count > RA_MAX_NODES) {
+    if (amd_ra_ssa) {
+        ra_ssa(A, mf_idx);
+    } else if (amd_ra_lin || A->vreg_count > RA_MAX_NODES) {
         ra_lin(A, mf_idx);
     } else {
         ra_gc(A, mf_idx);
@@ -1590,7 +2235,9 @@ static void emit_asm_function(amd_module_t *A, uint32_t mf_idx)
 
 void amdgpu_regalloc(amd_module_t *A)
 {
-    amdgpu_phi_elim(A);
+    /* SSA path does its own phi elimination post-allocation */
+    if (!amd_ra_ssa)
+        amdgpu_phi_elim(A);
     for (uint32_t fi = 0; fi < A->num_mfuncs; fi++)
         ra_func(A, fi);
 }
@@ -1634,6 +2281,19 @@ static void mp_fixarray(uint8_t *buf, uint32_t *pos, uint8_t count)
 {
     if (*pos >= MP_BUF_MAX) return;
     buf[(*pos)++] = (uint8_t)(0x90 | count);
+}
+
+/* array16 format for counts > 15 (fixarray only handles 0-15) */
+static void mp_array(uint8_t *buf, uint32_t *pos, uint32_t count)
+{
+    if (count <= 15) {
+        mp_fixarray(buf, pos, (uint8_t)count);
+    } else {
+        if (*pos + 3 > MP_BUF_MAX) return;
+        buf[(*pos)++] = 0xDC;
+        buf[(*pos)++] = (uint8_t)(count >> 8);
+        buf[(*pos)++] = (uint8_t)(count);
+    }
 }
 
 static void mp_fixstr(uint8_t *buf, uint32_t *pos, const char *s)
@@ -1813,7 +2473,6 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         if (num_kernels >= 64) break;
 
         mfunc_t *F = &A->mfuncs[fi];
-        int cdna = (A->target <= AMD_TARGET_GFX942);
 
         /* ---- KD → .rodata (64-byte aligned, CP microcode demands it) ---- */
         while (rodata_len % 64 != 0 && rodata_len < sizeof(rodata))
@@ -1827,30 +2486,30 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         kd.kernarg_size = F->kernarg_bytes;
         kd.kernel_code_entry_byte_offset = 0; /* patched after layout */
 
-        /* compute_pgm_rsrc1 — VGPR gran=8 (GFX90A+), SGPR gran=16 (GFX9).
+        /* compute_pgm_rsrc1 — VGPR gran=8 (GFX90A+).
+         * SGPR encoding gran=8 (ALL GFX9), alloc gran=16 from pool.
          * GFX10+ ignores the SGPR field entirely.
          * GFX9/CDNA: VCC, FLAT_SCRATCH, XNACK_MASK are carved from the
-         * RSRC1 SGPR allocation.  MI300X needs SGPR_BLOCKS >= 2 (i.e.
-         * >= 48 physical) or kernels with 12+ user SGPRs get Error 700.
-         * The +6 from the ISA manual is necessary but not sufficient —
-         * 48 is the empirically proven floor.  Don't fly with less. */
+         * RSRC1 SGPR allocation, from the top down.  The block count
+         * must cover user SGPRs + 6 (VCC=2, FLAT_SCRATCH=2, XNACK=2)
+         * or the CP silently aliases them with your live registers.
+         * That's how you get aperture faults from perfectly valid code. */
         uint32_t vgpr_blocks = (F->num_vgprs > 0)
             ? (uint32_t)((F->num_vgprs + 7) / 8 - 1) : 0;
-        uint32_t sgpr_gran = cdna ? 16u : 8u;
-        uint32_t total_sgprs = F->num_sgprs;
-        if (cdna && total_sgprs < 33) total_sgprs = 33;
+        /* GFX9 SGPR encoding granularity is 8, NOT 16.  The ALLOCATION
+         * granule from the physical pool is 16, but the RSRC1 field
+         * encodes in units of 8.  LLVM getSGPREncodingGranule() = 8.
+         * Using 16 here causes the hardware to see fewer SGPRs than
+         * we actually write, aliasing user regs with VCC/FLAT_SCRATCH. */
+        uint32_t sgpr_gran = 8u;
+        uint32_t total_sgprs = F->num_sgprs + F->imp_sgp;
         uint32_t sgpr_blocks = (total_sgprs > 0)
             ? (uint32_t)((total_sgprs + sgpr_gran - 1) / sgpr_gran - 1) : 0;
+        if (F->sgp_min && sgpr_blocks < F->sgp_min)
+            sgpr_blocks = F->sgp_min;
         kd.compute_pgm_rsrc1 = (vgpr_blocks & 0x3F) |
                                ((sgpr_blocks & 0xF) << 6) |
-                               (3u << 16) |   /* FLOAT_DENORM_MODE_32 = preserve all */
-                               (3u << 18) |   /* FLOAT_DENORM_MODE_16_64 = preserve all */
-                               (1u << 21) |   /* ENABLE_DX10_CLAMP */
-                               (1u << 23);    /* ENABLE_IEEE_MODE */
-        if (!cdna) {
-            kd.compute_pgm_rsrc1 |= (1u << 26) |  /* WGP_MODE (RDNA only) */
-                                    (1u << 27);    /* MEM_ORDERED (RDNA only) */
-        }
+                               F->r1_mode;
 
         /* compute_pgm_rsrc2 — [0] SCRATCH_EN, [5:1] USER_SGPR_COUNT,
            [7] TGID_X, [8] TGID_Y, [9] TGID_Z, [12:11] VGPR_WORKITEM_ID.
@@ -1869,7 +2528,7 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
         /* compute_pgm_rsrc3 — ACCUM_OFFSET for CDNA (GFX90A/GFX942).
          * Tells the HW where ArchVGPRs end and AccVGPRs begin.
          * GFX942 unified VGPRs: all are ArchVGPR, so offset = vgpr_blocks. */
-        if (cdna) {
+        if (F->exec_w) {
             uint32_t ao_gran = (A->target == AMD_TARGET_GFX942) ? 8u : 4u;
             uint32_t accum_off = (F->num_vgprs > 0)
                 ? (uint32_t)((F->num_vgprs + ao_gran - 1) / ao_gran - 1) : 0;
@@ -1878,9 +2537,10 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
 
         /* kernel_code_properties */
         kd.kernel_code_properties = (1u << 3);   /* ENABLE_SGPR_KERNARG_PTR */
-        /* CDNA flat scratch via src_private_base — does NOT need
-         * ENABLE_PRIVATE_SEGMENT. Runtime/CP sets up FLAT_SCRATCH
-         * from SCRATCH_EN + private_segment_fixed_size. */
+        /* Bit 0 = ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER — shifts SGPR
+         * layout on GFX9. SCRATCH_EN (RSRC2) + private_segment_fixed_size
+         * handle scratch allocation. Tested: bit 0 ON did not fix
+         * the y=1.0 scratch bug and may cause SGPR shift. */
 
         if (rodata_len + 64 <= sizeof(rodata)) {
             memcpy(rodata + rodata_len, &kd, 64);
@@ -2047,10 +2707,9 @@ int amdgpu_emit_elf(amd_module_t *A, const char *path)
                     BF = &A->bir->funcs[bfi]; break;
                 }
             uint32_t np = BF ? BF->num_params : 0;
-            if (np > 15) np = 15;
             /* 6 hidden args for block_count + group_size if needed */
             uint32_t n_hidden = F->needs_dispatch ? 6 : 0;
-            mp_fixarray(mp_buf, &mp_pos, (uint8_t)(np + n_hidden));
+            mp_array(mp_buf, &mp_pos, np + n_hidden);
             for (uint32_t pi = 0; pi < np; pi++) {
                 int is_ptr = 0;
                 uint32_t arg_sz = 8; /* default 8-byte aligned */

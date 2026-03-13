@@ -364,10 +364,22 @@ typedef struct {
     uint16_t is_kernel;        /* 1 for __global__ */
     uint16_t wavefront_size;   /* 32 */
     uint16_t first_alloc_sgpr; /* first SGPR available to regalloc (after param pairs) */
+    uint16_t bir_func;         /* BIR func index (for rplan BIR scan) */
     uint8_t  needs_dispatch;   /* 1 if kernel uses blockDim/gridDim (dispatch_ptr) */
     uint8_t  max_dim;          /* highest dim used: 0=x, 1=xy, 2=xyz */
     uint32_t launch_bounds_max; /* 0 = unconstrained. >0 = programmer's optimistic thread count */
     uint32_t launch_bounds_min; /* 0 = not set */
+
+    /* Resource plan — stamped by amd_rplan(), read by isel + emit.
+     * Target decisions made once.  No is_cdna() downstream.
+     * Like pre-flight checks: argue with the checklist, not the runway. */
+    uint8_t  exec_w;     /* 0=B32 (Wave32), 1=B64 (Wave64) */
+    uint8_t  smem_hz;    /* 1=SMEM→SALU hazard, promote to VALU */
+    uint8_t  scr_afs;    /* 1=architected flat scratch (no prologue) */
+    uint8_t  rp_pad;
+    uint16_t imp_sgp;    /* implicit system SGPRs (6 on CDNA, 0 on RDNA) */
+    uint16_t sgp_min;    /* min SGPR block count for KD */
+    uint32_t r1_mode;    /* RSRC1 static mode bits (IEEE, DX10, WGP, etc) */
 } mfunc_t;
 
 /* ---- Kernel Descriptor (64 bytes, AMD spec) ---- */
@@ -402,6 +414,7 @@ typedef struct {
     /* Chip-specific ELF metadata (set once by main, read by emit) */
     uint32_t    elf_mach;       /* e_flags value for this exact chip */
     char        chip_name[12];  /* "gfx1151" etc. */
+    uint8_t     snap_mode;      /* 1 = photograph the suspects on entry */
 
     minst_t     minsts[AMD_MAX_MINSTS];
     uint32_t    num_minsts;
@@ -419,11 +432,13 @@ typedef struct {
     uint32_t    vreg_count;
     uint16_t    reg_map[AMD_MAX_VREGS];    /* vreg -> phys reg */
     uint8_t     reg_file[AMD_MAX_VREGS];   /* 0=SGPR, 1=VGPR */
+    uint32_t    vr_divg[AMD_MAX_VREGS / 32]; /* 1=divergent per vreg */
 
     /* BIR value -> machine vreg mapping */
     uint32_t    val_vreg[BIR_MAX_INSTS];   /* BIR inst index -> vreg */
     uint8_t     val_file[BIR_MAX_INSTS];   /* 0=scalar, 1=vector */
     uint16_t    val_sbase[BIR_MAX_INSTS];  /* SGPR pair base for pointers, 0xFFFF=none */
+    int32_t     val_scroff[BIR_MAX_INSTS]; /* scratch byte offset, -1=dynamic */
 
     /* Instruction byte offsets (populated by encode_function) */
     uint32_t    inst_off[AMD_MAX_MINSTS];
@@ -446,6 +461,9 @@ typedef struct {
 
 /* ---- Public API ---- */
 
+/* Resource planning: stamp target decisions onto mfuncs (before isel) */
+void amd_rplan(amd_module_t *A);
+
 /* Compile BIR module to AMDGCN machine IR (divergence + isel) */
 int  amdgpu_compile(const bir_module_t *bir, amd_module_t *amd);
 
@@ -462,8 +480,29 @@ int  amdgpu_emit_elf(amd_module_t *amd, const char *path);
 /* Set to 1 to force linear scan instead of graph coloring */
 extern int amd_ra_lin;
 
+/* Set to 1 for divergence-aware SSA register allocation */
+extern int amd_ra_ssa;
+
 /* If non-zero, cap available VGPRs for regalloc (forces spills for testing) */
 extern int amd_max_vgpr;
+
+/* ---- Divergence Helpers ---- */
+
+static inline int vr_div(const amd_module_t *A, uint16_t vr)
+{ return (int)((A->vr_divg[vr / 32] >> (vr % 32)) & 1u); }
+
+static inline void vr_sdiv(amd_module_t *A, uint16_t vr)
+{ A->vr_divg[vr / 32] |= 1u << (vr % 32); }
+
+/* ---- Shared Helpers (emit.c, un-static for ra_ssa.c) ---- */
+
+uint16_t op_vreg(const moperand_t *op);
+void     rw_ops(amd_module_t *A, const mfunc_t *F);
+void     dce_copy(amd_module_t *A, const mfunc_t *F);
+void     fin_regs(const amd_module_t *A, mfunc_t *F);
+
+/* SSA register allocator (ra_ssa.c) */
+void ra_ssa(amd_module_t *A, uint32_t mf_idx);
 
 /* Encoding table (defined in amdgpu_emit.c) */
 extern const amd_enc_entry_t amd_enc_table[AMD_OP_COUNT];

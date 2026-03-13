@@ -14,7 +14,7 @@ LIBS    = -lm
 SOURCES = src/main.c \
           src/fe/bc_err.c src/fe/preproc.c src/fe/lexer.c src/fe/parser.c src/fe/sema.c \
           src/ir/bir.c src/ir/bir_print.c src/ir/bir_lower.c src/ir/bir_mem2reg.c src/ir/bir_cfold.c src/ir/bir_dce.c \
-          src/amdgpu/isel.c src/amdgpu/emit.c src/amdgpu/encode.c src/amdgpu/enc_tab.c src/amdgpu/sched.c src/amdgpu/verify.c \
+          src/amdgpu/amd_rplan.c src/amdgpu/isel.c src/amdgpu/emit.c src/amdgpu/ra_ssa.c src/amdgpu/encode.c src/amdgpu/enc_tab.c src/amdgpu/sched.c src/amdgpu/verify.c \
           src/tensix/isel.c src/tensix/emit.c src/tensix/coarsen.c src/tensix/datamov.c
 OBJECTS = $(SOURCES:.c=.o)
 TARGET  = barracuda
@@ -39,7 +39,7 @@ TSRC    = tests/tmain.c tests/tsmoke.c tests/tcomp.c tests/tenc.c \
           tests/tregalloc.c
 TOBJS   = $(TSRC:.c=.o)
 COBJS   = src/ir/bir.o src/ir/bir_print.o src/ir/bir_lower.o src/ir/bir_mem2reg.o src/ir/bir_cfold.o src/ir/bir_dce.o \
-          src/amdgpu/encode.o src/amdgpu/enc_tab.o src/amdgpu/isel.o src/amdgpu/emit.o src/amdgpu/sched.o src/amdgpu/verify.o \
+          src/amdgpu/amd_rplan.o src/amdgpu/encode.o src/amdgpu/enc_tab.o src/amdgpu/isel.o src/amdgpu/emit.o src/amdgpu/ra_ssa.o src/amdgpu/sched.o src/amdgpu/verify.o \
           src/fe/bc_err.o src/fe/lexer.o src/fe/parser.o src/fe/preproc.o src/fe/sema.o \
           src/runtime/bc_abend.o
 

@@ -157,11 +157,14 @@ static void vfy_bnds(const minst_t *mi, uint32_t idx, const char *mn)
     for (i = 0; i < total; i++) {
         uint8_t k = mi->operands[i].kind;
         uint16_t r = mi->operands[i].reg_num;
+        /* Skip spill-encoded operands (bit 15 = pending resolution) */
+        if (r & 0x8000u) continue;
         if (k == MOP_SGPR && r > 101) {
             vfy_err(idx, mn, "s%u out of bounds (max 101)", (unsigned)r);
         }
-        if (k == MOP_VGPR && r > 255) {
-            vfy_err(idx, mn, "v%u out of bounds (max 255)", (unsigned)r);
+        if (k == MOP_VGPR && r >= AMD_MAX_VGPRS) {
+            vfy_err(idx, mn, "v%u out of bounds (max %u)", (unsigned)r,
+                    (unsigned)(AMD_MAX_VGPRS - 1));
         }
     }
 }

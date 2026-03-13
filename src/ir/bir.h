@@ -136,7 +136,7 @@ typedef enum {
 
     /* Control flow */
     BIR_BR,                     /* ops[0] = block */
-    BIR_BR_COND,                /* ops[0] = cond, ops[1] = true block, ops[2] = false block */
+    BIR_BR_COND,                /* ops[0] = cond, [1] = true, [2] = false, [3] = merge */
     BIR_SWITCH,                 /* ops[0] = val, ops[1] = default block, rest in extra */
     BIR_RET,                    /* ops[0] = value (or num_operands=0 for void) */
     BIR_UNREACHABLE,
