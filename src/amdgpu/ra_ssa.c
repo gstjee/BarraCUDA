@@ -797,7 +797,7 @@ static uint32_t rs_aloc(amd_module_t *A, mfunc_t *F,
         const mblock_t *MB = &A->mblocks[F->first_block + b];
         if (MB->num_insts == 0) continue;
 
-        /* Initialize live set to live-out of this block */
+        /* Initialise live set to live-out of this block */
         memcpy(live, &rs_lout[(uint32_t)b * bv_words], bv_words * 4);
 
         /* Backward scan.  At each instruction we must:
@@ -1446,7 +1446,7 @@ void ra_ssa(amd_module_t *A, uint32_t mf_idx)
     /* Write reg_map for rw_ops */
     rs_wmap(A, nv);
 
-    /* Finalize: launch_bounds caps, minimum registers */
+    /* Finalise: launch_bounds caps, minimum registers */
     fin_regs(A, F);
 
     /* Rewrite virtual→physical operands */
