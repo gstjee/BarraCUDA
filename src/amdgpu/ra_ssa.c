@@ -385,8 +385,8 @@ static void rs_loop(uint16_t nb)
  * Getting this wrong means PHI sources appear live-in at the
  * def block instead of live-out at the pred block.  The register
  * allocator then thinks the value is needed earlier than it is,
- * and 200 perfectly good registers go to waste.  Ask LLVM — they
- * got this wrong twice in their SSA liveness (PR19462, PR33947). */
+ * and 200 perfectly good registers go to waste.  This is the single
+ * most common liveness bug in SSA compilers. */
 
 static void rs_live(const amd_module_t *A, const mfunc_t *F,
                     uint16_t nb, uint16_t nv)
