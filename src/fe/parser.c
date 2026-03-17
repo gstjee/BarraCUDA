@@ -921,6 +921,7 @@ static int starts_declaration(parser_t *P)
 static uint32_t parse_declaration(parser_t *P)
 {
     uint32_t decl_node;
+    uint32_t anon_def = 0;   /* stashed AST_STRUCT_DEF for anonymous inline decls */
     uint16_t quals = 0, cuda = 0;
 
     if (cur_type(P) == TOK_TEMPLATE) {
@@ -1021,7 +1022,8 @@ static uint32_t parse_declaration(parser_t *P)
          P->nodes[type_node].d.btype.kind == TYPE_CLASS ||
          P->nodes[type_node].d.btype.kind == TYPE_ENUM) &&
         cur_type(P) == TOK_LBRACE) {
-        int is_enum = (P->nodes[type_node].d.btype.kind == TYPE_ENUM);
+        int is_enum  = (P->nodes[type_node].d.btype.kind == TYPE_ENUM);
+        int is_union = (P->nodes[type_node].d.btype.kind == TYPE_UNION);
         uint32_t def = alloc_node(P, is_enum ? AST_ENUM_DEF : AST_STRUCT_DEF);
         P->nodes[def].qualifiers = quals;
         P->nodes[def].cuda_flags = cuda;
@@ -1060,8 +1062,56 @@ static uint32_t parse_declaration(parser_t *P)
             }
         }
         expect(P, TOK_RBRACE);
-        match(P, TOK_SEMI);
-        return def;
+
+        /* Anonymous struct/union with inline variable declaration?
+         *   struct { float f; int i; } cvt;
+         * Next token is an identifier (or *) → we need a variable,
+         * not just a bare type definition. Give the nameless struct
+         * a synthetic name so sema can find it, then build a fresh
+         * TYPE_STRUCT node for the var_decl (the original type_node
+         * already belongs to def — re-parenting would tangle the
+         * sibling chains like Christmas lights in February). */
+        if (!is_enum && (cur_type(P) == TOK_IDENT ||
+                         cur_type(P) == TOK_STAR)) {
+            if (P->anon_len + 16 < sizeof(P->anon_buf)) {
+                uint32_t aoff = P->anon_len;
+                int n = snprintf(P->anon_buf + aoff,
+                                 sizeof(P->anon_buf) - aoff,
+                                 "__a%u", P->anon_cnt++);
+                P->anon_len += (uint32_t)(n + 1);
+
+                /* Name the nameless struct inside def's type_node */
+                uint32_t sn = alloc_node(P, AST_IDENT);
+                P->nodes[sn].d.text.offset = BC_ANON_BASE + aoff;
+                P->nodes[sn].d.text.len = (uint16_t)n;
+                add_child(P, type_node, sn);
+
+                reg_tname(P, BC_ANON_BASE + aoff, (uint16_t)n);
+
+                /* Fresh TYPE_STRUCT referencing the synthetic name.
+                 * This one goes into the var_decl; def keeps the
+                 * original with all the member definitions. */
+                type_node = alloc_node(P, AST_TYPE_SPEC);
+                P->nodes[type_node].d.btype.kind =
+                    is_union ? TYPE_UNION : TYPE_STRUCT;
+                uint32_t ref = alloc_node(P, AST_IDENT);
+                P->nodes[ref].d.text.offset = BC_ANON_BASE + aoff;
+                P->nodes[ref].d.text.len = (uint16_t)n;
+                add_child(P, type_node, ref);
+
+                /* Stash def for injection into the var_decl as
+                 * child #3 (after type_node, name). check_var_decl
+                 * will spot it and call collect_struct_def before
+                 * resolve_typespec needs the struct registered. */
+                P->nodes[def].next_sibling = 0;
+                anon_def = def;
+            }
+            /* Fall through to variable declaration code.
+             * type_node is now a fresh reference, def rides along. */
+        } else {
+            match(P, TOK_SEMI);
+            return def;
+        }
     }
 
     int ptr_depth = 0;
@@ -1218,6 +1268,9 @@ static uint32_t parse_declaration(parser_t *P)
         P->nodes[decl_node].d.oper.flags = ptr_depth;
         add_child(P, decl_node, type_node);
         add_child(P, decl_node, name);
+        /* Inline struct/union def rides as child #3 — sema detects
+         * and registers it before resolving the type reference. */
+        if (anon_def) add_child(P, decl_node, anon_def);
         /* Register typedef name for cast disambiguation */
         if (quals & QUAL_TYPEDEF)
             reg_tname(P, P->nodes[name].d.text.offset,

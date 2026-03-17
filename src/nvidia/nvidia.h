@@ -1,0 +1,282 @@
+#ifndef BARRACUDA_NVIDIA_H
+#define BARRACUDA_NVIDIA_H
+
+#include "bir.h"
+
+/* NVIDIA PTX backend. The irony of an open-source CUDA compiler targeting
+ * NVIDIA hardware is not lost on us. Think of it as returning a library
+ * book — to a library that charges admission and checks your bag. */
+
+#define BC_ERR_NVIDIA  -8
+
+/* ---- PTX Opcodes ---- */
+/* Tags for the text emitter, not real machine opcodes. PTX is already
+ * a text IR — we're generating text from an IR to feed to a JIT that
+ * generates the actual machine code. It's turtles all the way down. */
+
+typedef enum {
+    /* Integer arithmetic */
+    NV_ADD_U32 = 0,  NV_ADD_U64,  NV_ADD_S32,
+    NV_SUB_U32,      NV_SUB_S32,  NV_SUB_S64,
+    NV_MUL_LO_U32,   NV_MUL_LO_S32,  NV_MUL_LO_U64,
+    NV_MUL_HI_U32,   NV_MUL_HI_S32,
+    NV_MAD_LO_U64,   /* mad.lo.u64 for GEP */
+    NV_DIV_U32,       NV_DIV_S32,
+    NV_REM_U32,       NV_REM_S32,
+    NV_NEG_S32,
+
+    /* FP arithmetic */
+    NV_ADD_F32,  NV_ADD_F64,
+    NV_SUB_F32,  NV_SUB_F64,
+    NV_MUL_F32,  NV_MUL_F64,
+    NV_DIV_F32,  NV_DIV_F64,
+    NV_FMA_F32,  NV_FMA_F64,
+    NV_NEG_F32,  NV_NEG_F64,
+    NV_ABS_F32,  NV_ABS_F64,
+
+    /* Logic / shift */
+    NV_AND_B32,  NV_AND_B64,
+    NV_OR_B32,   NV_OR_B64,
+    NV_XOR_B32,  NV_XOR_B64,
+    NV_NOT_B32,  NV_NOT_B64,
+    NV_SHL_B32,  NV_SHL_B64,
+    NV_SHR_U32,  NV_SHR_S32,  NV_SHR_U64,
+
+    /* Comparison — setp */
+    NV_SETP_EQ_U32,  NV_SETP_NE_U32,
+    NV_SETP_LT_U32,  NV_SETP_LE_U32,
+    NV_SETP_GT_U32,  NV_SETP_GE_U32,
+    NV_SETP_LT_S32,  NV_SETP_LE_S32,
+    NV_SETP_GT_S32,  NV_SETP_GE_S32,
+    NV_SETP_EQ_F32,  NV_SETP_NE_F32,
+    NV_SETP_LT_F32,  NV_SETP_LE_F32,
+    NV_SETP_GT_F32,  NV_SETP_GE_F32,
+    NV_SETP_EQ_F64,  NV_SETP_NE_F64,
+    NV_SETP_LT_F64,  NV_SETP_LE_F64,
+    NV_SETP_GT_F64,  NV_SETP_GE_F64,
+    NV_SETP_EQ_U64,  NV_SETP_NE_U64,
+
+    /* Select / predicated move */
+    NV_SELP_U32,  NV_SELP_U64,
+    NV_SELP_F32,  NV_SELP_F64,
+
+    /* Moves */
+    NV_MOV_U32,  NV_MOV_U64,
+    NV_MOV_F32,  NV_MOV_F64,
+    NV_MOV_PRED,
+
+    /* Conversions */
+    NV_CVT_U32_F32,  NV_CVT_S32_F32,  /* fptosi/fptoui */
+    NV_CVT_F32_U32,  NV_CVT_F32_S32,  /* uitofp/sitofp */
+    NV_CVT_F32_F64,  NV_CVT_F64_F32,  /* fptrunc/fpext */
+    NV_CVT_U64_U32,  NV_CVT_S64_S32,  /* zext/sext to 64 */
+    NV_CVT_U32_U64,                    /* trunc 64->32 */
+    NV_CVT_U64_F64,  NV_CVT_S64_F64,  /* fp64->int64 */
+    NV_CVT_F64_U64,  NV_CVT_F64_S64,  /* int64->fp64 */
+    NV_CVT_F32_F16,  NV_CVT_F16_F32,  /* half conversions */
+
+    /* Loads / stores — global */
+    NV_LD_GLB_U32,  NV_LD_GLB_U64,
+    NV_LD_GLB_F32,  NV_LD_GLB_F64,
+    NV_LD_GLB_U8,   NV_LD_GLB_U16,
+    NV_ST_GLB_U32,  NV_ST_GLB_U64,
+    NV_ST_GLB_F32,  NV_ST_GLB_F64,
+    NV_ST_GLB_U8,   NV_ST_GLB_U16,
+
+    /* Loads / stores — shared */
+    NV_LD_SHR_U32,  NV_LD_SHR_F32,
+    NV_ST_SHR_U32,  NV_ST_SHR_F32,
+
+    /* Loads / stores — local (scratch / alloca) */
+    NV_LD_LOC_U32,  NV_LD_LOC_U64,
+    NV_LD_LOC_F32,
+    NV_ST_LOC_U32,  NV_ST_LOC_U64,
+    NV_ST_LOC_F32,
+
+    /* Parameter loads */
+    NV_LD_PARAM_U32,  NV_LD_PARAM_U64,
+    NV_LD_PARAM_F32,  NV_LD_PARAM_F64,
+
+    /* Atomics — global */
+    NV_ATOM_ADD_U32,  NV_ATOM_ADD_F32,
+    NV_ATOM_MIN_U32,  NV_ATOM_MAX_U32,
+    NV_ATOM_AND_B32,  NV_ATOM_OR_B32,  NV_ATOM_XOR_B32,
+    NV_ATOM_XCHG_B32, NV_ATOM_CAS_B32,
+
+    /* Branches */
+    NV_BRA,           /* bra $label */
+    NV_BRA_PRED,      /* @%p bra $label */
+
+    /* Barriers */
+    NV_BAR_SYNC,      /* bar.sync 0 */
+
+    /* Warp ops */
+    NV_SHFL_IDX,      /* shfl.sync.idx.b32 */
+    NV_SHFL_UP,       /* shfl.sync.up.b32 */
+    NV_SHFL_DOWN,     /* shfl.sync.down.b32 */
+    NV_SHFL_XOR,      /* shfl.sync.bfly.b32 */
+    NV_VOTE_BALLOT,   /* vote.sync.ballot.b32 */
+    NV_VOTE_ANY,      /* vote.sync.any.pred */
+    NV_VOTE_ALL,      /* vote.sync.all.pred */
+
+    /* Math builtins */
+    NV_SQRT_F32,      /* sqrt.approx.f32 */
+    NV_SQRT_F64,      /* sqrt.rn.f64 */
+    NV_RSQ_F32,       /* rsqrt.approx.f32 */
+    NV_RCP_F32,       /* rcp.approx.f32 */
+    NV_SIN_F32,       /* sin.approx.f32 */
+    NV_COS_F32,       /* cos.approx.f32 */
+    NV_EX2_F32,       /* ex2.approx.f32 */
+    NV_LG2_F32,       /* lg2.approx.f32 */
+    NV_FLOOR_F32,     /* cvt.rmi.f32.f32 (floor) */
+    NV_CEIL_F32,      /* cvt.rpi.f32.f32 (ceil) */
+    NV_TRUNC_F32,     /* cvt.rzi.f32.f32 (trunc) */
+    NV_ROUND_F32,     /* cvt.rni.f32.f32 (round nearest) */
+    NV_MIN_F32,       /* min.f32 */
+    NV_MAX_F32,       /* max.f32 */
+    NV_MIN_U32,       /* min.u32 */
+    NV_MAX_U32,       /* max.u32 */
+    NV_MIN_S32,       /* min.s32 */
+    NV_MAX_S32,       /* max.s32 */
+
+    /* Pseudo-ops */
+    NV_RET,           /* ret; */
+    NV_EXIT,          /* exit; */
+    NV_MOV_F64_LIT,   /* mov.f64 %fd, 0dXXXX — ops[0]=dst, ops[1].imm=hi32, ops[2].imm=lo32 */
+    NV_LEA_LOCAL,     /* mov.u64 %rd, __local+off — ops[0]=dst, ops[1].imm=byte offset */
+
+    NV_OP_COUNT
+} nv_ptx_op_t;
+
+/* ---- Register File Codes ---- */
+
+typedef enum {
+    NV_RF_U32  = 0,   /* %r<N>  — 32-bit integer */
+    NV_RF_U64  = 1,   /* %rd<N> — 64-bit integer */
+    NV_RF_F32  = 2,   /* %f<N>  — 32-bit float */
+    NV_RF_F64  = 3,   /* %fd<N> — 64-bit float */
+    NV_RF_PRED = 4,   /* %p<N>  — predicate */
+    NV_RF_U16  = 5,   /* %rh<N> — 16-bit integer */
+    NV_RF_F16  = 6,   /* %h<N>  — 16-bit float */
+    NV_RF_COUNT
+} nv_rfile_t;
+
+/* ---- Machine Operand ---- */
+
+typedef enum {
+    NV_MOP_NONE = 0,
+    NV_MOP_REG,        /* virtual register */
+    NV_MOP_IMM,        /* 32-bit immediate */
+    NV_MOP_IMM64,      /* 64-bit immediate (stored in imm64) */
+    NV_MOP_LABEL,      /* block label index */
+    NV_MOP_SPEC,       /* special register (tid, ctaid, ntid) */
+} nv_mop_t;
+
+/* Special register IDs — kept flat, not an enum, so
+ * we can pack them into the imm field. */
+#define NV_SPEC_TID_X     0
+#define NV_SPEC_TID_Y     1
+#define NV_SPEC_TID_Z     2
+#define NV_SPEC_CTAID_X   3
+#define NV_SPEC_CTAID_Y   4
+#define NV_SPEC_CTAID_Z   5
+#define NV_SPEC_NTID_X    6
+#define NV_SPEC_NTID_Y    7
+#define NV_SPEC_NTID_Z    8
+#define NV_SPEC_NCTAID_X  9
+#define NV_SPEC_NCTAID_Y  10
+#define NV_SPEC_NCTAID_Z  11
+
+typedef struct {
+    uint8_t  kind;       /* nv_mop_t */
+    uint8_t  rfile;      /* nv_rfile_t */
+    uint16_t reg_num;
+    int32_t  imm;
+} nv_opnd_t;
+
+/* ---- Machine Instruction ---- */
+
+#define NV_MAX_OPS  6
+
+typedef struct {
+    uint16_t  op;        /* nv_ptx_op_t */
+    uint8_t   num_defs;
+    uint8_t   num_uses;
+    nv_opnd_t ops[NV_MAX_OPS];
+    uint16_t  flags;
+    uint16_t  pad;
+} nv_minst_t;
+
+/* ---- Machine Block / Function ---- */
+
+typedef struct {
+    uint32_t first_inst;
+    uint32_t num_insts;
+    uint32_t bir_block;
+} nv_mblk_t;
+
+/* Per-function param descriptor for PTX .param declarations */
+#define NV_MAX_PARAMS  32
+
+typedef struct {
+    uint32_t name;       /* string table offset */
+    uint8_t  rfile;      /* NV_RF_U32/U64/F32/F64 */
+    uint8_t  pad[3];
+} nv_param_t;
+
+typedef struct {
+    uint32_t    name;        /* string table offset */
+    uint32_t    first_blk;
+    uint16_t    num_blks;
+    uint16_t    is_kern;
+    uint32_t    num_params;
+    nv_param_t  params[NV_MAX_PARAMS];
+    uint32_t    lds_bytes;   /* shared memory size */
+    uint32_t    lcl_bytes;   /* local (stack) memory per thread */
+    uint32_t    launch_max;  /* launch_bounds max threads */
+    uint32_t    launch_min;  /* launch_bounds min blocks */
+    uint32_t    bir_func;
+    uint16_t    rc[NV_RF_COUNT];  /* per-rfile vreg high-water */
+} nv_mfunc_t;
+
+/* ---- Module ---- */
+
+#define NV_MAX_MINST  (1 << 18)   /* 262144 */
+#define NV_MAX_MBLK   (1 << 16)   /* 65536 */
+#define NV_MAX_MFUNC  (1 << 12)   /* 4096 */
+#define NV_MAX_OUT    (2 * 1024 * 1024)  /* 2 MB output buffer */
+
+typedef struct {
+    const bir_module_t *bir;
+
+    nv_minst_t  minsts[NV_MAX_MINST];
+    uint32_t    num_minst;
+
+    nv_mblk_t   mblks[NV_MAX_MBLK];
+    uint32_t    num_mblk;
+
+    nv_mfunc_t  mfuncs[NV_MAX_MFUNC];
+    uint32_t    num_mfunc;
+
+    /* Virtual register counters — one per register file */
+    uint16_t    rc[NV_RF_COUNT];
+
+    /* BIR inst index → vreg number + rfile */
+    uint16_t    val_vreg[BIR_MAX_INSTS];
+    uint8_t     val_rfile[BIR_MAX_INSTS];
+
+    /* Block-hit instrumentation (diagnostic) */
+    uint8_t     bkhit;      /* emit atom.add at each block label */
+    uint8_t     bk_pad[3];
+
+    /* Output text buffer */
+    char        out_buf[NV_MAX_OUT];
+    uint32_t    out_len;
+} nv_module_t;
+
+/* ---- Public API ---- */
+
+int  nv_compile(const bir_module_t *bir, nv_module_t *nv);
+int  nv_emit_ptx(nv_module_t *nv, const char *path);
+
+#endif /* BARRACUDA_NVIDIA_H */

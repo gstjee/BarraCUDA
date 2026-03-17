@@ -10,6 +10,7 @@
 #include "sched.h"
 #include "verify.h"
 #include "tensix.h"
+#include "nvidia.h"
 #include <stdlib.h>
 
 static char       source_buf[BC_MAX_SOURCE];
@@ -83,7 +84,8 @@ static void usage(const char *prog)
         "  --ssa-ra         Divergence-aware SSA register allocation\n"
         "  --max-vgprs N    Cap VGPR count for regalloc (forces spills)\n"
         "  --tensix      Compile to TT-Metalium C++ (Tensix SFPU)\n"
-        "  -o <file>     Output file (for --amdgpu-bin, --tensix)\n"
+        "  --nvidia-ptx  Compile to NVIDIA PTX (sm_89)\n"
+        "  -o <file>     Output file (for --amdgpu-bin, --tensix, --nvidia-ptx)\n"
         "  --lang <file> Load translated error messages\n"
         "  --help        Show this message\n"
         "\n", prog);
@@ -102,6 +104,8 @@ int main(int argc, char *argv[])
     int mode_amdgpu = 0;
     int mode_amdgpu_bin = 0;
     int mode_tensix = 0;
+    int mode_nvidia = 0;
+    int nv_bkhit = 0;
     int no_mem2reg = 0;
     int no_cfold = 0;
     int no_dce = 0;
@@ -181,6 +185,10 @@ int main(int argc, char *argv[])
             { amd_target = AMD_TARGET_GFX1200; amd_elfm = 0x4e; amd_chip = "gfx1201"; }
         else if (strcmp(argv[i], "--tensix") == 0)
             mode_tensix = 1;
+        else if (strcmp(argv[i], "--nvidia-ptx") == 0)
+            mode_nvidia = 1;
+        else if (strcmp(argv[i], "--bkhit") == 0)
+            nv_bkhit = 1;
         else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc)
             lang_file = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
@@ -231,7 +239,7 @@ int main(int argc, char *argv[])
     }
 
     if (!mode_pp && !mode_lex && !mode_parse && !mode_sema && !mode_ir &&
-        !mode_amdgpu && !mode_amdgpu_bin && !mode_tensix)
+        !mode_amdgpu && !mode_amdgpu_bin && !mode_tensix && !mode_nvidia)
         mode_parse = 1;
 
     /* Load translation file before any diagnostics fire */
@@ -308,7 +316,7 @@ int main(int argc, char *argv[])
     }
 
     if (mode_parse || mode_sema || mode_ir || mode_amdgpu || mode_amdgpu_bin ||
-        mode_tensix) {
+        mode_tensix || mode_nvidia) {
         parser_t P;
         parser_init(&P, token_buf, L.num_tokens, lex_src,
                     node_buf, BC_MAX_NODES);
@@ -331,7 +339,7 @@ int main(int argc, char *argv[])
         /* Semantic analysis */
         sema_ctx_t *sema_ctx = NULL;
         if ((mode_sema || mode_ir || mode_amdgpu || mode_amdgpu_bin ||
-             mode_tensix) && P.num_errors == 0)
+             mode_tensix || mode_nvidia) && P.num_errors == 0)
         {
             sema_ctx = (sema_ctx_t *)malloc(sizeof(sema_ctx_t));
             if (!sema_ctx) {
@@ -359,8 +367,8 @@ int main(int argc, char *argv[])
             }
         }
 
-        if ((mode_ir || mode_amdgpu || mode_amdgpu_bin || mode_tensix) &&
-            P.num_errors == 0) {
+        if ((mode_ir || mode_amdgpu || mode_amdgpu_bin || mode_tensix ||
+             mode_nvidia) && P.num_errors == 0) {
             bc_error_t lower_errs[BC_MAX_ERRORS];
             int num_lower_errs = 0;
             bir_module = (bir_module_t *)malloc(sizeof(bir_module_t));
@@ -486,6 +494,25 @@ int main(int argc, char *argv[])
                         rc = trc;
                     }
                     free(ttm);
+                }
+
+                if (mode_nvidia) {
+                    nv_module_t *nvm = (nv_module_t *)malloc(sizeof(nv_module_t));
+                    if (!nvm) {
+                        fprintf(stderr, "error: failed to allocate NVIDIA module\n");
+                        free(bir_module);
+                        return 1;
+                    }
+                    int nrc = nv_compile(bir_module, nvm);
+                    if (nrc == BC_OK) {
+                        nvm->bkhit = (uint8_t)nv_bkhit;
+                        nv_emit_ptx(nvm,
+                            output_file ? output_file : "a.ptx");
+                    } else {
+                        fprintf(stderr, "error: NVIDIA PTX compilation failed\n");
+                        rc = nrc;
+                    }
+                    free(nvm);
                 }
             }
             free(bir_module);

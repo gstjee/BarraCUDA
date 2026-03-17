@@ -1,6 +1,6 @@
 # BarraCUDA
 
-An open-source CUDA C++ compiler written from scratch in C99 that takes `.cu` files and compiles them to AMD GPU machine code and Tenstorrent Tensix C++, with more architectures planned. No LLVM, no dependencies, and no permission asked.
+An open-source CUDA C++ compiler written from scratch in C99 that takes `.cu` files and compiles them to AMD GPU machine code, NVIDIA PTX, and Tenstorrent Tensix C++, with more architectures planned. No LLVM, no dependencies, and no permission asked.
 
 This is what happens when you look at NVIDIA's walled garden and think "how hard can it be?" The answer is: quite hard, actually, but I did it anyway.
 
@@ -8,36 +8,38 @@ See [Changelog](#changelog) for recent updates.
 
 ## What It Does
 
-Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compiles them to AMD RDNA 2/3/4 binaries or Tenstorrent Tensix Metalium C++. 
+Takes CUDA C source code, the same `.cu` files you'd feed to `nvcc`, and compiles them to AMD RDNA 2/3/4 binaries, NVIDIA PTX, or Tenstorrent Tensix Metalium C++.
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     BarraCUDA Pipeline                       │
-├──────────────────────────────────────────────────────────────┤
-│  Source (.cu)                                                │
-│       ↓                                                      │
-│  Preprocessor → #include, #define, macros, conditionals      │
-│       ↓                                                      │
-│  Lexer → Tokens                                              │
-│       ↓                                                      │
-│  Parser (Recursive Descent) → AST                            │
-│       ↓                                                      │
-│  Semantic Analysis → Type checking, scope resolution         │
-│       ↓                                                      │
-│  BIR (BarraCUDA IR) → SSA form, typed instructions           │
-│       ↓                                                      │
-│  mem2reg → Promotes allocas to SSA registers                 │
-│       ↓                                                      │
-│  Instruction Selection                                       │
-│       ├──────────────────────┬───────────────────────┤       │
-│       ↓ AMD                  ↓ Tenstorrent           │       │
-│  VGPR/SGPR regalloc    Tensix SFPU isel              │       │
-│       ↓                      ↓                       │       │
-│  GFX10/11/12 encoding  Metalium C++ emission         │       │
-│       ↓                      ↓                       │       │
-│  .hsaco ELF            compute/reader/writer/host    │       │
-│       ↓                      ↓                       │       │
-│  Your kernel runs on silicon you own                 │       |
-└──────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                          BarraCUDA Pipeline                              │
+├───────────────────────────────────────────────────────────────────────────┤
+│  Source (.cu)                                                            │
+│       ↓                                                                  │
+│  Preprocessor → #include, #define, macros, conditionals                  │
+│       ↓                                                                  │
+│  Lexer → Tokens                                                          │
+│       ↓                                                                  │
+│  Parser (Recursive Descent) → AST                                        │
+│       ↓                                                                  │
+│  Semantic Analysis → Type checking, scope resolution                     │
+│       ↓                                                                  │
+│  BIR (BarraCUDA IR) → SSA form, typed instructions                       │
+│       ↓                                                                  │
+│  mem2reg → Promotes allocas to SSA registers                             │
+│       ↓                                                                  │
+│  Instruction Selection                                                   │
+│       ├──────────────────┬──────────────────┬────────────────────┤       │
+│       ↓ AMD              ↓ NVIDIA            ↓ Tenstorrent       │       │
+│  VGPR/SGPR regalloc  PTX isel + emit    Tensix SFPU isel        │       │
+│       ↓                  ↓                   ↓                   │       │
+│  GFX9/10/11/12       .ptx text          Metalium C++             │       │
+│  binary encoding     (driver JIT)       compute/reader/writer    │       │
+│       ↓                  ↓                   ↓                   │       │
+│  .hsaco ELF          Runs on NVIDIA     Runs on Tenstorrent      │       │
+│       ↓              hardware            hardware                │       │
+│  Runs on AMD                                                     │       │
+│  hardware                                                        │       │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 
@@ -68,6 +70,9 @@ make
 
 # Compile for RDNA 4
 ./barracuda --amdgpu-bin --gfx1200 kernel.cu -o kernel.hsaco
+
+# Compile to NVIDIA PTX
+./barracuda --nvidia-ptx kernel.cu -o kernel.ptx
 
 # Compile to Tenstorrent Metalium C++
 ./barracuda --tensix kernel.cu -o kernel_compute.cpp
@@ -100,16 +105,16 @@ gcc -std=c99 -O2 -I src/runtime \
 ./launch_saxpy test.hsaco
 ```
 
-Requires Linux with ROCm installed. See `examples/launch_saxpy.c` for a complete example. **Not yet tested on real hardware** — if you have an AMD GPU, we'd love a test report ([#39](https://github.com/Zaneham/BarraCUDA/issues/39)).
+Requires Linux with ROCm installed. See `examples/launch_saxpy.c` for a complete example.
 
 ## What Works
 
- The following CUDA features compile to working GFX10/GFX11/GFX12 machine code and Tensix Metalium C++:
+ The following CUDA features compile to working GFX9/GFX10/GFX11/GFX12 machine code, NVIDIA PTX, and Tensix Metalium C++:
 
 ### Core Language
 - `__global__`, `__device__`, `__host__` function qualifiers
 - `threadIdx`, `blockIdx`, `blockDim`, `gridDim` builtins
-- Structs, enums, typedefs, namespaces
+- Structs (named + anonymous inline), enums, typedefs, namespaces
 - Pointers, arrays, pointer arithmetic
 - All C control flow: `if`/`else`, `for`, `while`, `do-while`, `switch`/`case`, `goto`/`label`
 - Short-circuit `&&` and `||`
@@ -157,6 +162,15 @@ wrote vector_add.hsaco (528 bytes code, 1 kernels)
 No LLVM required :-) 
 
 
+## Validated on Hardware
+
+BarraCUDA-compiled kernels have been tested and produce correct results on real silicon:
+
+- **AMD MI300X (CDNA3, GFX942)** — 8/8 test kernels passing. Monte Carlo neutron transport producing correct physics (k_eff = 0.995, matching reference).
+- **AMD RDNA3 (GFX1100)** — Full test suite passing via RDNA3 emulator CI.
+- **NVIDIA RTX 4060 Ti** — PTX backend, loaded via CUDA Driver API, JIT-compiled by NVIDIA driver. Monte Carlo neutron transport benchmark produces correct results with 3.8x speedup over single-thread CPU. No NVCC involved anywhere in the pipeline.
+- **Tenstorrent Blackhole** — Compiles to valid Metalium C++. Hardware validation pending dev kit access.
+
 ## What Doesn't Work (Yet)
 
 Being honest about limitations is important. Here's what's missing:
@@ -202,8 +216,9 @@ The generated code works but isn't winning any benchmarks. Done so far: instruct
 
 The IR (BIR) is target-independent. The backend is cleanly separated. Adding a new target means writing a new `isel` + `emit` pair.
 
+- **NVIDIA PTX** - Done. Compiles CUDA to PTX, validated on RTX 4060 Ti. `--nvidia-ptx`
 - **Tenstorrent Tensix** - Done. Compiles CUDA to TT-Metalium C++ for Blackhole. `--tensix`
-- **Intel Arc** - Xe architecture. Would give BarraCUDA coverage across all three major GPU vendors.
+- **Intel Arc** - Xe architecture. Would give BarraCUDA coverage across all four major GPU vendors.
 - **RISC-V Vector Extension** - For when GPUs are too mainstream and you want to run CUDA on a softcore.
 
 
@@ -215,7 +230,9 @@ The HLASM-style short identifiers (`ra_gc`, `mk_hash`, `enc_vop3`) are culturall
 
 ## Changelog
 
-**2026-03-14** — Divergence-aware SSA register allocator (`--ssa-ra`). Eliminates all 186 VGPR spills on a 654-line Monte Carlo transport kernel — scratch traffic drops 78%, total instructions drop 28%. Exploits the 64:1 cost asymmetry between divergent and uniform VGPR spills on Wave64 hardware: uniform values spill via `v_readfirstlane` at 4 bytes each, divergent values stay in registers where they belong. Based on the divergence analysis of Sampaio et al. (2013).
+**2026-03-18** — NVIDIA PTX backend (`--nvidia-ptx`). Compiles CUDA to PTX text, loaded via CUDA Driver API and JIT-compiled by the NVIDIA driver. Validated on RTX 4060 Ti running a Monte Carlo neutron transport benchmark with correct physics results. No NVCC, no proprietary toolchain. Also: anonymous struct/union support in parser, sema, and lowerer (`struct { float f; int i; } cvt;` pattern).
+
+**2026-03-14** — Divergence-aware SSA register allocator (`--ssa-ra`). Eliminates all 186 VGPR spills on a 654-line Monte Carlo transport kernel — scratch traffic drops 78%, total instructions drop 28%. Exploits the 64:1 cost asymmetry between divergent and uniform VGPR spills on Wave64 hardware: uniform values spill via `v_readfirstlane` at 4 bytes each, divergent values stay in registers where they belong. Based on the divergence analysis of Sampaio et al. (2013). ~1,300 lines of C99, all static memory, no malloc.
 
 **2026-03-09** — Post-isel verification pass (`bc_vfy`). The encoder used to trust isel to produce valid machine instructions. It shouldn't have. `bc_vfy` runs twice (post-isel, post-RA) and catches 5 classes of encoding violation before the binary leaves the compiler. Its first run immediately found 7 isel bugs across GFX10 and GFX942 — every one a silent miscompile that would fault on hardware with "Reason: Unknown." Fixed them all. Also: `bc_abend` runtime crash diagnostics, because if IBM could do post-mortem dumps in 1964, we can do it for GPUs in 2026.
 

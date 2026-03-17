@@ -15,6 +15,7 @@
 
 #include "bc_runtime.h"
 #include "bc_abend.h"
+#include "../fe/bc_err.h"
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
@@ -36,6 +37,11 @@ static const struct { uint16_t code; const char *name; const char *desc; } ab_co
 
 const char *ab_mstr(uint16_t code)
 {
+    /* Delegate to bc_err.c's ab_afmt() which checks translations first,
+     * then compiled-in defaults. Our local ab_codes[] is the fallback
+     * for codes that bc_err.c doesn't know about — belt and braces. */
+    const char *xlat = ab_afmt(code);
+    if (xlat) return xlat;
     for (int i = 0; ab_codes[i].name; i++)
         if (ab_codes[i].code == code) return ab_codes[i].desc;
     return "UNKNOWN FAULT";

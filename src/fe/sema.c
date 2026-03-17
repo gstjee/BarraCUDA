@@ -25,12 +25,21 @@ static uint32_t child_at(const sema_ctx_t *S, uint32_t node, int n)
     return c;
 }
 
+/* Resolve a text offset — normally into src, but synthetic names
+ * (anonymous struct/union) live in the parser's anon_buf. */
+static const char *txt_ptr(const sema_ctx_t *S, uint32_t off)
+{
+    if (off >= BC_ANON_BASE)
+        return S->P->anon_buf + (off - BC_ANON_BASE);
+    return S->src + off;
+}
+
 static void get_text(const sema_ctx_t *S, uint32_t node, char *buf, int sz)
 {
     const ast_node_t *n = ND(S, node);
     int len = (int)n->d.text.len;
     if (len >= sz) len = sz - 1;
-    memcpy(buf, S->src + n->d.text.offset, (size_t)len);
+    memcpy(buf, txt_ptr(S, n->d.text.offset), (size_t)len);
     buf[len] = '\0';
 }
 
@@ -39,7 +48,7 @@ static int text_eq(const sema_ctx_t *S, uint32_t node, const char *s)
     const ast_node_t *n = ND(S, node);
     int len = (int)n->d.text.len;
     return (int)strlen(s) == len
-        && memcmp(S->src + n->d.text.offset, s, (size_t)len) == 0;
+        && memcmp(txt_ptr(S, n->d.text.offset), s, (size_t)len) == 0;
 }
 
 /* ---- Error Reporting ---- */
@@ -488,6 +497,7 @@ static uint32_t resolve_typespec(sema_ctx_t *S, uint32_t node, int ptr_depth)
 static uint32_t check_expr(sema_ctx_t *S, uint32_t node);
 static void     check_stmt(sema_ctx_t *S, uint32_t node);
 static void     check_block_stmts(sema_ctx_t *S, uint32_t node);
+static void     collect_struct_def(sema_ctx_t *S, uint32_t node);
 
 /* ---- Annotate Helper ---- */
 
@@ -1151,6 +1161,13 @@ static void check_var_decl(sema_ctx_t *S, uint32_t node)
     uint32_t name_n = child_at(S, node, 1);
     if (!name_n || ND(S, name_n)->type != AST_IDENT) return;
 
+    /* Anonymous struct/union embedded by parser? Register it now,
+     * before resolve_typespec goes looking for the name. Like
+     * filing the birth certificate before enrolling the kid. */
+    uint32_t peek = ND(S, name_n)->next_sibling;
+    if (peek && ND(S, peek)->type == AST_STRUCT_DEF)
+        collect_struct_def(S, peek);
+
     char name[128];
     get_text(S, name_n, name, sizeof(name));
 
@@ -1159,6 +1176,9 @@ static void check_var_decl(sema_ctx_t *S, uint32_t node)
     /* Parser stores bracket-dimension count in d.oper.op */
     int pdims = n->d.oper.op;
     uint32_t next = ND(S, name_n)->next_sibling;
+    /* Skip embedded struct_def (handled above) */
+    if (next && ND(S, next)->type == AST_STRUCT_DEF)
+        next = ND(S, next)->next_sibling;
     if (pdims > 0 && next && ND(S, next)->type == AST_INT_LIT) {
         int64_t count = parse_int_value(S->src + ND(S, next)->d.text.offset,
                                         (int)ND(S, next)->d.text.len);

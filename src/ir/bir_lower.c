@@ -126,12 +126,19 @@ static uint32_t child_at(const lower_t *L, uint32_t node, int n)
     return c;
 }
 
+static const char *lw_tptr(const lower_t *L, uint32_t off)
+{
+    if (off >= BC_ANON_BASE)
+        return L->P->anon_buf + (off - BC_ANON_BASE);
+    return L->src + off;
+}
+
 static void get_text(const lower_t *L, uint32_t node, char *buf, int sz)
 {
     const ast_node_t *n = ND(L, node);
     int len = (int)n->d.text.len;
     if (len >= sz) len = sz - 1;
-    memcpy(buf, L->src + n->d.text.offset, (size_t)len);
+    memcpy(buf, lw_tptr(L, n->d.text.offset), (size_t)len);
     buf[len] = '\0';
 }
 
@@ -140,7 +147,7 @@ static int text_eq(const lower_t *L, uint32_t node, const char *s)
     const ast_node_t *n = ND(L, node);
     int len = (int)n->d.text.len;
     return (int)strlen(s) == len
-        && memcmp(L->src + n->d.text.offset, s, (size_t)len) == 0;
+        && memcmp(lw_tptr(L, n->d.text.offset), s, (size_t)len) == 0;
 }
 
 static void lower_error(lower_t *L, uint32_t node, bc_eid_t eid, ...)
@@ -647,6 +654,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node);
 static uint32_t lower_lvalue(lower_t *L, uint32_t node);
 static void     lower_stmt(lower_t *L, uint32_t node);
 static void     lower_block_stmts(lower_t *L, uint32_t node);
+static void     collect_struct(lower_t *L, uint32_t node);
 static void     lower_func_body(lower_t *L, uint32_t func_def,
                                 uint16_t cuda_flags, const char *name_override);
 
@@ -2064,6 +2072,11 @@ static void lower_var_decl(lower_t *L, uint32_t node)
     uint32_t name_n = child_at(L, node, 1);
     if (!name_n || ND(L, name_n)->type != AST_IDENT) return;
 
+    /* Embedded anonymous struct/union def? Register before resolve. */
+    uint32_t andef = ND(L, name_n)->next_sibling;
+    if (andef && ND(L, andef)->type == AST_STRUCT_DEF)
+        collect_struct(L, andef);
+
     char name[128];
     get_text(L, name_n, name, sizeof(name));
 
@@ -2073,6 +2086,9 @@ static void lower_var_decl(lower_t *L, uint32_t node)
      * Parser stores the bracket-dimension count in d.oper.op so we don't
      * accidentally eat `int step = 4096` as `int step[4096]`. */
     uint32_t next = ND(L, name_n)->next_sibling;
+    /* Skip embedded anonymous struct_def (sema already registered it) */
+    if (next && ND(L, next)->type == AST_STRUCT_DEF)
+        next = ND(L, next)->next_sibling;
     int is_array = 0;
     uint32_t dims[8];
     int ndim = 0;
@@ -2150,8 +2166,10 @@ static void lower_var_decl(lower_t *L, uint32_t node)
     uint32_t alloca = emit(L, BIR_ALLOCA, ptr_t, 0, 0);
     add_sym(L, name, alloca, elem_t, 1);
 
-    /* Initializer: skip type and name, skip array sizes, find init expr */
+    /* Initializer: skip type and name, skip struct_def, find init expr */
     uint32_t init_n = ND(L, name_n)->next_sibling;
+    if (init_n && ND(L, init_n)->type == AST_STRUCT_DEF)
+        init_n = ND(L, init_n)->next_sibling;
     if (init_n && ND(L, init_n)->type == AST_INIT_LIST) {
         /* Struct initializer: Vec3 v = {1.0f, 2.0f, 3.0f}; */
         struct_def_t *sd = NULL;
