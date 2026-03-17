@@ -248,7 +248,7 @@ static void ab_dump_hdr(void)
     int n = ab_snap(A, obuf, (int)sizeof(obuf));
     CHECK(n > 0);
     CHECK(strstr(obuf, "ABEND G0C4") != NULL);
-    CHECK(strstr(obuf, "MEMORY ACCESS FAULT") != NULL);
+    CHECK(strstr(obuf, "memory access violation") != NULL);
     CHECK(strstr(obuf, "test_kern") != NULL);
     CHECK(strstr(obuf, "gfx1100") != NULL);
     CHECK(strstr(obuf, "END OF DUMP") != NULL);
