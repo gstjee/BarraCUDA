@@ -66,13 +66,15 @@ typedef enum {
     NV_MOV_PRED,
 
     /* Conversions */
-    NV_CVT_U32_F32,  NV_CVT_S32_F32,  /* fptosi/fptoui */
+    NV_CVT_U32_F32,  NV_CVT_S32_F32,  /* fptosi/fptoui (f32 src) */
+    NV_CVT_U32_F64,  NV_CVT_S32_F64,  /* fptosi/fptoui (f64 src) */
     NV_CVT_F32_U32,  NV_CVT_F32_S32,  /* uitofp/sitofp */
     NV_CVT_F32_F64,  NV_CVT_F64_F32,  /* fptrunc/fpext */
     NV_CVT_U64_U32,  NV_CVT_S64_S32,  /* zext/sext to 64 */
     NV_CVT_U32_U64,                    /* trunc 64->32 */
     NV_CVT_U64_F64,  NV_CVT_S64_F64,  /* fp64->int64 */
     NV_CVT_F64_U64,  NV_CVT_F64_S64,  /* int64->fp64 */
+    NV_CVT_F64_U32,  NV_CVT_F64_S32,  /* int32->fp64 */
     NV_CVT_F32_F16,  NV_CVT_F16_F32,  /* half conversions */
 
     /* Loads / stores — global */
@@ -89,9 +91,9 @@ typedef enum {
 
     /* Loads / stores — local (scratch / alloca) */
     NV_LD_LOC_U32,  NV_LD_LOC_U64,
-    NV_LD_LOC_F32,
+    NV_LD_LOC_F32,  NV_LD_LOC_F64,
     NV_ST_LOC_U32,  NV_ST_LOC_U64,
-    NV_ST_LOC_F32,
+    NV_ST_LOC_F32,  NV_ST_LOC_F64,
 
     /* Parameter loads */
     NV_LD_PARAM_U32,  NV_LD_PARAM_U64,
@@ -126,7 +128,7 @@ typedef enum {
     NV_RCP_F32,       /* rcp.approx.f32 */
     NV_SIN_F32,       /* sin.approx.f32 */
     NV_COS_F32,       /* cos.approx.f32 */
-    NV_EX2_F32,       /* ex2.approx.f32 */
+    NV_EX2_F32,       /* ex2.approx.f32 (no f64 in PTX) */
     NV_LG2_F32,       /* lg2.approx.f32 */
     NV_FLOOR_F32,     /* cvt.rmi.f32.f32 (floor) */
     NV_CEIL_F32,      /* cvt.rpi.f32.f32 (ceil) */

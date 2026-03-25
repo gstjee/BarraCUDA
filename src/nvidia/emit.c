@@ -470,7 +470,11 @@ static void em_inst(nv_module_t *nv, const nv_minst_t *I)
     case NV_MOV_F64:
         nv_apnd(nv, "mov.f64 ");
         em_opnd(nv, &I->ops[0]); nv_apnd(nv, ", ");
-        em_opnd(nv, &I->ops[1]);
+        /* PTX f64 immediates need 0dXXXX hex format, not bare int */
+        if (I->ops[1].kind == NV_MOP_IMM && I->ops[1].imm == 0)
+            nv_apnd(nv, "0d0000000000000000");
+        else
+            em_opnd(nv, &I->ops[1]);
         break;
     case NV_MOV_PRED:
         nv_apnd(nv, "mov.pred ");
@@ -486,6 +490,16 @@ static void em_inst(nv_module_t *nv, const nv_minst_t *I)
         break;
     case NV_CVT_S32_F32:
         nv_apnd(nv, "cvt.rzi.s32.f32 ");
+        em_opnd(nv, &I->ops[0]); nv_apnd(nv, ", ");
+        em_opnd(nv, &I->ops[1]);
+        break;
+    case NV_CVT_S32_F64:
+        nv_apnd(nv, "cvt.rzi.s32.f64 ");
+        em_opnd(nv, &I->ops[0]); nv_apnd(nv, ", ");
+        em_opnd(nv, &I->ops[1]);
+        break;
+    case NV_CVT_U32_F64:
+        nv_apnd(nv, "cvt.rzi.u32.f64 ");
         em_opnd(nv, &I->ops[0]); nv_apnd(nv, ", ");
         em_opnd(nv, &I->ops[1]);
         break;
@@ -541,6 +555,16 @@ static void em_inst(nv_module_t *nv, const nv_minst_t *I)
         break;
     case NV_CVT_F64_S64:
         nv_apnd(nv, "cvt.rn.f64.s64 ");
+        em_opnd(nv, &I->ops[0]); nv_apnd(nv, ", ");
+        em_opnd(nv, &I->ops[1]);
+        break;
+    case NV_CVT_F64_S32:
+        nv_apnd(nv, "cvt.rn.f64.s32 ");
+        em_opnd(nv, &I->ops[0]); nv_apnd(nv, ", ");
+        em_opnd(nv, &I->ops[1]);
+        break;
+    case NV_CVT_F64_U32:
+        nv_apnd(nv, "cvt.rn.f64.u32 ");
         em_opnd(nv, &I->ops[0]); nv_apnd(nv, ", ");
         em_opnd(nv, &I->ops[1]);
         break;
@@ -610,11 +634,13 @@ static void em_inst(nv_module_t *nv, const nv_minst_t *I)
     }
 
     /* ---- Loads/Stores: Local ---- */
-    case NV_LD_LOC_U32: case NV_LD_LOC_U64: case NV_LD_LOC_F32: {
+    case NV_LD_LOC_U32: case NV_LD_LOC_U64:
+    case NV_LD_LOC_F32: case NV_LD_LOC_F64: {
         const char *tsuf;
         switch (I->op) {
         case NV_LD_LOC_U64: tsuf = ".u64"; break;
         case NV_LD_LOC_F32: tsuf = ".f32"; break;
+        case NV_LD_LOC_F64: tsuf = ".f64"; break;
         default:            tsuf = ".u32"; break;
         }
         nv_apnd(nv, "ld.local%s ", tsuf);
@@ -622,11 +648,13 @@ static void em_inst(nv_module_t *nv, const nv_minst_t *I)
         em_opnd(nv, &I->ops[1]); nv_apnd(nv, "]");
         break;
     }
-    case NV_ST_LOC_U32: case NV_ST_LOC_U64: case NV_ST_LOC_F32: {
+    case NV_ST_LOC_U32: case NV_ST_LOC_U64:
+    case NV_ST_LOC_F32: case NV_ST_LOC_F64: {
         const char *tsuf;
         switch (I->op) {
         case NV_ST_LOC_U64: tsuf = ".u64"; break;
         case NV_ST_LOC_F32: tsuf = ".f32"; break;
+        case NV_ST_LOC_F64: tsuf = ".f64"; break;
         default:            tsuf = ".u32"; break;
         }
         nv_apnd(nv, "st.local%s [", tsuf);

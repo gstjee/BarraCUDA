@@ -522,6 +522,37 @@ static int is_float_type(const lower_t *L, uint32_t t)
     return k == BIR_TYPE_FLOAT || k == BIR_TYPE_BFLOAT;
 }
 
+/* Implicit type coercion: insert conversion if val's type != dst.
+ * Handles int->float, float->float (width change), int widening.
+ * Used by binary ops to promote operands (C usual arithmetic). */
+static uint32_t coerce_to(lower_t *L, uint32_t val, uint32_t dst_t,
+                          int src_unsigned)
+{
+    uint32_t src_t = ref_type(L, val);
+    if (src_t == dst_t) return val;
+    if (src_t >= L->M->num_types || dst_t >= L->M->num_types) return val;
+
+    int sf = is_float_type(L, src_t), df = is_float_type(L, dst_t);
+    uint16_t cop;
+    if (sf && df) {
+        cop = (L->M->types[dst_t].width > L->M->types[src_t].width)
+              ? BIR_FPEXT : BIR_FPTRUNC;
+    } else if (!sf && df) {
+        cop = src_unsigned ? BIR_UITOFP : BIR_SITOFP;
+    } else if (sf && !df) {
+        cop = src_unsigned ? BIR_FPTOUI : BIR_FPTOSI;
+    } else {
+        int sw = L->M->types[src_t].width;
+        int dw = L->M->types[dst_t].width;
+        if (dw > sw)      cop = src_unsigned ? BIR_ZEXT : BIR_SEXT;
+        else if (dw < sw) cop = BIR_TRUNC;
+        else              return val; /* same width int — no conversion */
+    }
+    uint32_t inst = emit(L, cop, dst_t, 1, 0);
+    set_op(L, inst, 0, val);
+    return BIR_MAKE_VAL(inst);
+}
+
 static int is_ptr_type(const lower_t *L, uint32_t t)
 {
     return t < L->M->num_types && L->M->types[t].kind == BIR_TYPE_PTR;
@@ -1084,13 +1115,39 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 }
             }
 
-            int fp       = is_float_type(L, lt);
+            uint32_t rt  = ref_type(L, rhs);
+            /* Usual arithmetic conversion: promote both operands
+             * to the wider/float type. C says int*double → double,
+             * not int*double → garbage. Without this, backends get
+             * mixed-type ops (mul.u32 with an f64 register) and
+             * the PTX JIT has strong opinions about that. */
+            uint32_t res_t = lt;
+            int lf = is_float_type(L, lt), rf = is_float_type(L, rt);
+            if (lf && !rf) {
+                rhs = coerce_to(L, rhs, lt, node_is_unsigned(L, rhs_n));
+                res_t = lt;
+            } else if (!lf && rf) {
+                lhs = coerce_to(L, lhs, rt, node_is_unsigned(L, lhs_n));
+                res_t = rt;
+            } else if (lf && rf) {
+                /* Both float: promote narrower to wider */
+                if (lt < L->M->num_types && rt < L->M->num_types
+                    && L->M->types[rt].width > L->M->types[lt].width) {
+                    lhs = coerce_to(L, lhs, rt, 0);
+                    res_t = rt;
+                } else if (lt < L->M->num_types && rt < L->M->num_types
+                           && L->M->types[lt].width > L->M->types[rt].width) {
+                    rhs = coerce_to(L, rhs, lt, 0);
+                    res_t = lt;
+                }
+            }
+            int fp       = is_float_type(L, res_t);
             int opc      = bin_op_code(op, fp, node_is_unsigned(L, node));
             if (opc < 0) {
                 lower_error(L, node, BC_E102);
                 return lhs;
             }
-            uint32_t inst = emit(L, (uint16_t)opc, lt, 2, 0);
+            uint32_t inst = emit(L, (uint16_t)opc, res_t, 2, 0);
             set_op(L, inst, 0, lhs);
             set_op(L, inst, 1, rhs);
             return BIR_MAKE_VAL(inst);
@@ -1522,7 +1579,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
         /* ---- Math builtins: unary ---- */
         {
             static const struct { const char *n; uint16_t op; } mt1[] = {
-                {"sqrtf",BIR_SQRT},{"__fsqrt_rn",BIR_SQRT},
+                {"sqrtf",BIR_SQRT},{"sqrt",BIR_SQRT},{"__fsqrt_rn",BIR_SQRT},
                 {"rsqrtf",BIR_RSQ},{"__frsqrt_rn",BIR_RSQ},
                 {"__frcp_rn",BIR_RCP},
                 {"exp2f",BIR_EXP2},{"log2f",BIR_LOG2},{"__log2f",BIR_LOG2},
@@ -1530,7 +1587,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
                 {"floorf",BIR_FLOOR},{"ceilf",BIR_CEIL},
                 {"truncf",BIR_FTRUNC},{"roundf",BIR_RNDNE},{"rintf",BIR_RNDNE},
             };
-            for (int mi = 0; mi < 15; mi++) {
+            for (int mi = 0; mi < 16; mi++) {
                 if (strcmp(cname, mt1[mi].n) != 0) continue;
                 uint32_t an = ND(L, callee_n)->next_sibling;
                 uint32_t v = lower_expr(L, an);
