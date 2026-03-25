@@ -560,10 +560,20 @@ static void is_cvt(uint32_t idx, const bir_inst_t *I)
 
     uint16_t op;
     switch (I->op) {
-    case BIR_FPTOSI:  op = NV_CVT_S32_F32; break;
-    case BIR_FPTOUI:  op = NV_CVT_U32_F32; break;
-    case BIR_SITOFP:  op = NV_CVT_F32_S32; break;
-    case BIR_UITOFP:  op = NV_CVT_F32_U32; break;
+    case BIR_FPTOSI: {
+        uint32_t si0 = BIR_VAL_INDEX(I->operands[0]);
+        uint8_t srf = (si0 < S.bir->num_insts) ? bir_rfile(S.bir->insts[si0].type) : NV_RF_F32;
+        op = (srf == NV_RF_F64) ? NV_CVT_S32_F64 : NV_CVT_S32_F32;
+        break;
+    }
+    case BIR_FPTOUI: {
+        uint32_t si0 = BIR_VAL_INDEX(I->operands[0]);
+        uint8_t srf = (si0 < S.bir->num_insts) ? bir_rfile(S.bir->insts[si0].type) : NV_RF_F32;
+        op = (srf == NV_RF_F64) ? NV_CVT_U32_F64 : NV_CVT_U32_F32;
+        break;
+    }
+    case BIR_SITOFP:  op = (bir_rfile(I->type) == NV_RF_F64) ? NV_CVT_F64_S32 : NV_CVT_F32_S32; break;
+    case BIR_UITOFP:  op = (bir_rfile(I->type) == NV_RF_F64) ? NV_CVT_F64_U32 : NV_CVT_F32_U32; break;
     case BIR_FPTRUNC: op = NV_CVT_F32_F64; break;
     case BIR_FPEXT:   op = NV_CVT_F64_F32; break;
     case BIR_ZEXT:    op = NV_CVT_U64_U32; break;
@@ -610,7 +620,8 @@ static void is_load(uint32_t idx, const bir_inst_t *I)
         op = (drf == NV_RF_F32) ? NV_LD_SHR_F32 : NV_LD_SHR_U32;
         break;
     case BIR_AS_PRIVATE:
-        op = (drf == NV_RF_F32) ? NV_LD_LOC_F32 :
+        op = (drf == NV_RF_F64) ? NV_LD_LOC_F64 :
+             (drf == NV_RF_F32) ? NV_LD_LOC_F32 :
              (drf == NV_RF_U64) ? NV_LD_LOC_U64 : NV_LD_LOC_U32;
         break;
     default: /* global */
@@ -659,7 +670,8 @@ static void is_store(const bir_inst_t *I)
         op = (vrf == NV_RF_F32) ? NV_ST_SHR_F32 : NV_ST_SHR_U32;
         break;
     case BIR_AS_PRIVATE:
-        op = (vrf == NV_RF_F32) ? NV_ST_LOC_F32 :
+        op = (vrf == NV_RF_F64) ? NV_ST_LOC_F64 :
+             (vrf == NV_RF_F32) ? NV_ST_LOC_F32 :
              (vrf == NV_RF_U64) ? NV_ST_LOC_U64 : NV_ST_LOC_U32;
         break;
     default:
@@ -1034,9 +1046,9 @@ static void is_math(uint32_t idx, const bir_inst_t *I)
         op = (I->op == BIR_SIN) ? NV_SIN_F32 : NV_COS_F32;
         break;
     }
-    case BIR_EXP2:   op = NV_EX2_F32;   break;
+    case BIR_EXP2:   op = NV_EX2_F32; break; /* PTX ex2 is f32 only */
     case BIR_LOG2:   op = NV_LG2_F32;   break;
-    case BIR_FABS:   op = NV_ABS_F32;   break;
+    case BIR_FABS:   op = (rf == NV_RF_F64) ? NV_ABS_F64 : NV_ABS_F32; break;
     case BIR_FLOOR:  op = NV_FLOOR_F32; break;
     case BIR_CEIL:   op = NV_CEIL_F32;  break;
     case BIR_FTRUNC: op = NV_TRUNC_F32; break;
