@@ -581,6 +581,20 @@ static int node_is_unsigned(const lower_t *L, uint32_t ast_node)
         || k == STYPE_UINT || k == STYPE_ULONG || k == STYPE_ULLONG;
 }
 
+/* Width of an int-lit as typed by sema. Fallback 32 when sema was
+   skipped, so --ast / --ir without --sema still lower sensibly. */
+static int ilit_w(const lower_t *L, uint32_t ast_node)
+{
+    if (!L->sema || !ast_node || ast_node >= BC_MAX_NODES) return 32;
+    uint32_t st = L->sema->node_types[ast_node];
+    if (!st || st >= L->sema->num_types) return 32;
+    uint8_t k = L->sema->types[st].kind;
+    if (k == STYPE_LONG  || k == STYPE_ULONG
+     || k == STYPE_LLONG || k == STYPE_ULLONG)
+        return 64;
+    return 32;
+}
+
 /* ---- Literal Parsing ---- */
 
 static int64_t parse_int_text(const char *s, int len)
@@ -734,7 +748,7 @@ static uint32_t lower_expr(lower_t *L, uint32_t node)
     case AST_INT_LIT: {
         int64_t val = parse_int_text(L->src + n->d.text.offset,
                                      (int)n->d.text.len);
-        uint32_t t = bir_type_int(L->M, 32);
+        uint32_t t = bir_type_int(L->M, ilit_w(L, node));
         return BIR_MAKE_CONST(bir_const_int(L->M, t, val));
     }
 
